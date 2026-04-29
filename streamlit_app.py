@@ -2,16 +2,13 @@
 """
 Battery Data Analysis Streamlit dashboard.
 
-This file is intentionally UI-focused. It reuses the fitting/read/plot helpers
-from eis_web_app.py, so the EIS fitting logic can stay unchanged.
+This version only depends on files you already have in the repo:
+    - eis_fit.py
+    - eis_fit_batch.py can stay untouched for now
+    - requirements.txt
+    - streamlit_app.py
 
-Expected repo layout:
-    battery-data-analysis/
-    ├── streamlit_app.py              # this file, after renaming
-    ├── eis_web_app.py                # EIS core logic/helper functions
-    ├── requirements.txt
-    └── ...
-
+It imports the fitting logic from eis_fit.py and keeps Streamlit UI code here.
 Run locally:
     streamlit run streamlit_app.py
 """
@@ -19,70 +16,150 @@ Run locally:
 from __future__ import annotations
 
 import io
+import tempfile
 import zipfile
+from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
+import matplotlib.pyplot as plt
 import streamlit as st
 
-# Reuse the existing EIS logic. Keep this file in the same repo/folder.
-from eis_web_app import (
+# Use the files that actually exist in your repo.
+from eis_fit import (
     PARAM_ORDER,
-    FitResultBundle,
-    low_freq_zoom_figure,
-    make_fit_bundle,
-    make_zip_download,
-    nyquist_figure,
+    arc_metrics,
+    circuit_z,
+    fit_eis,
     pack_params,
-    read_uploaded_eis,
-    read_zfit_xml_bytes,
+    read_biologic_mpr_eis,
+    read_csv_eis,
+    read_zfit_xml,
 )
 
 
 # -----------------------------------------------------------------------------
-# General UI helpers
+# Data containers and wrappers around eis_fit.py
+# -----------------------------------------------------------------------------
+
+
+@dataclass
+class FitResultBundle:
+    name: str
+    weight: str
+    p0: np.ndarray
+    p_fit: np.ndarray
+    result: object
+    curve_df: pd.DataFrame
+    params_df: pd.DataFrame
+    arc_df: pd.DataFrame
+    fusion_df: pd.DataFrame
+
+
+def _write_uploaded_to_temp(uploaded_file, suffix: str | None = None) -> Path:
+    suffix = suffix or Path(uploaded_file.name).suffix
+    with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+        tmp.write(uploaded_file.getvalue())
+        return Path(tmp.name)
+
+
+def read_uploaded_eis(uploaded_file) -> pd.DataFrame:
+    """Read an uploaded .mpr/.csv/.txt by reusing path-based readers in eis_fit.py."""
+    suffix = Path(uploaded_file.name).suffix.lower()
+    tmp_path = _write_uploaded_to_temp(uploaded_file, suffix=suffix)
+    try:
+        if suffix == ".mpr":
+            return read_biologic_mpr_eis(tmp_path)
+        return read_csv_eis(tmp_path)
+    finally:
+        try:
+            tmp_path.unlink(missing_ok=True)
+        except Exception:
+            pass
+
+
+def read_zfit_xml_uploaded(xml_file) -> dict[str, float]:
+    if xml_file is None:
+        return {}
+    tmp_path = _write_uploaded_to_temp(xml_file, suffix=".xml")
+    try:
+        return read_zfit_xml(tmp_path)
+    finally:
+        try:
+            tmp_path.unlink(missing_ok=True)
+        except Exception:
+            pass
+
+
+def make_fit_bundle(name: str, df: pd.DataFrame, p0: np.ndarray, weight: str) -> FitResultBundle:
+    p_fit, result = fit_eis(df, p0, weight=weight)
+    z_fit = circuit_z(p_fit, df["freq_hz"].to_numpy(float))
+
+    curve_df = df.copy()
+    curve_df["fit_z_real_ohm"] = np.real(z_fit)
+    curve_df["fit_z_imag_ohm"] = np.imag(z_fit)
+    curve_df["fit_minus_z_imag_ohm"] = -np.imag(z_fit)
+    curve_df["residual_real_ohm"] = curve_df["fit_z_real_ohm"] - curve_df["z_real_ohm"]
+    curve_df["residual_minus_imag_ohm"] = curve_df["fit_minus_z_imag_ohm"] - curve_df["minus_z_imag_ohm"]
+
+    params_df = pd.DataFrame({"parameter": PARAM_ORDER, "initial": p0, "fit": p_fit})
+    params_df.loc[len(params_df)] = ["cost", np.nan, getattr(result, "cost", np.nan)]
+    params_df.loc[len(params_df)] = ["nfev", np.nan, getattr(result, "nfev", np.nan)]
+
+    fmin = float(df["freq_hz"].min())
+    fmax = float(df["freq_hz"].max())
+    arc_df, fusion_df = arc_metrics(p_fit, fmin, fmax)
+
+    return FitResultBundle(
+        name=name,
+        weight=weight,
+        p0=p0,
+        p_fit=p_fit,
+        result=result,
+        curve_df=curve_df,
+        params_df=params_df,
+        arc_df=arc_df,
+        fusion_df=fusion_df,
+    )
+
+
+# -----------------------------------------------------------------------------
+# Summary and plotting helpers
 # -----------------------------------------------------------------------------
 
 
 def _fmt_num(x: float, unit: str = "", sig: int = 3) -> str:
-    """Compact number formatting for metric cards and summary tables."""
     try:
         if x is None or not np.isfinite(float(x)):
             return "—"
         x = float(x)
     except Exception:
         return "—"
-    suffix = f" {unit}" if unit else ""
-    return f"{x:.{sig}g}{suffix}"
+    return f"{x:.{sig}g}{(' ' + unit) if unit else ''}"
 
 
-def _fit_quality_summary(bundle: FitResultBundle, low_freq_cutoff: float) -> dict[str, float | str | bool]:
-    """Return concise fit-quality descriptors used by single and batch pages."""
+def fit_quality_summary(bundle: FitResultBundle, low_freq_cutoff: float) -> dict[str, object]:
     df = bundle.curve_df
     re = df["residual_real_ohm"].to_numpy(float)
     im = df["residual_minus_imag_ohm"].to_numpy(float)
     rmse_z = float(np.sqrt(np.nanmean(re**2 + im**2)))
-    rmse_im = float(np.sqrt(np.nanmean(im**2)))
 
     low = df[df["freq_hz"] <= float(low_freq_cutoff)]
     if len(low):
         low_bias = float(low["residual_minus_imag_ohm"].mean())
         low_max_abs = float(low["residual_minus_imag_ohm"].abs().max())
-        low_n = int(len(low))
+        low_points = int(len(low))
     else:
         low_bias = np.nan
         low_max_abs = np.nan
-        low_n = 0
+        low_points = 0
 
     fit_params = dict(zip(bundle.params_df["parameter"], bundle.params_df["fit"]))
-    arc_df = bundle.arc_df.copy()
-    fusion_df = bundle.fusion_df.copy()
+    arc_df = bundle.arc_df
+    fusion_df = bundle.fusion_df
 
-    # The final right intercept is a compact estimate of the fitted total real-axis span.
-    total_right = float(arc_df["right_intercept_ohm"].iloc[-1]) if len(arc_df) else np.nan
-    total_diameter = float(arc_df["diameter_ohm"].sum()) if len(arc_df) else np.nan
-
+    right_intercept = float(arc_df["right_intercept_ohm"].iloc[-1]) if len(arc_df) else np.nan
     arc3 = arc_df[arc_df["arc"] == 3]
     arc3_height = float(arc3["max_height_minus_im_ohm"].iloc[0]) if len(arc3) else np.nan
     arc3_depression = float(arc3["depression_ratio_height_over_radius"].iloc[0]) if len(arc3) else np.nan
@@ -94,23 +171,25 @@ def _fit_quality_summary(bundle: FitResultBundle, low_freq_cutoff: float) -> dic
         else np.nan
     )
 
+    note = "OK"
+    if np.isfinite(low_bias) and np.isfinite(arc3_height):
+        threshold = max(5.0, 0.05 * max(1.0, abs(arc3_height)))
+        if abs(low_bias) > threshold:
+            note = "fit high at low frequency" if low_bias > 0 else "fit low at low frequency"
+
     s4 = float(fit_params.get("s4", np.nan))
     a4 = float(fit_params.get("a4", np.nan))
-    low_note = "OK"
-    if np.isfinite(low_bias) and abs(low_bias) > max(5.0, 0.05 * max(1.0, arc3_height)):
-        low_note = "fit high at low-f" if low_bias > 0 else "fit low at low-f"
     if np.isfinite(s4) and abs(s4) < 1e-8:
-        low_note = "Warburg inactive / arc 3 effective"
+        note = "Warburg inactive; arc 3 is effective"
     if np.isfinite(a4) and (a4 > 0.995 or a4 < 0.055):
-        low_note = "a4 near bound; check arc 3"
+        note = "a4 near bound; check arc 3"
 
     return {
         "success": bool(getattr(bundle.result, "success", False)),
         "cost": float(getattr(bundle.result, "cost", np.nan)),
         "nfev": int(getattr(bundle.result, "nfev", -1)),
         "rmse_z_ohm": rmse_z,
-        "rmse_minus_imag_ohm": rmse_im,
-        "low_f_points": low_n,
+        "low_f_points": low_points,
         "low_f_bias_ohm": low_bias,
         "low_f_max_abs_ohm": low_max_abs,
         "R1_ohm": float(fit_params.get("R1", np.nan)),
@@ -119,22 +198,16 @@ def _fit_quality_summary(bundle: FitResultBundle, low_freq_cutoff: float) -> dic
         "R4_ohm": float(fit_params.get("R4", np.nan)),
         "s4": s4,
         "a4": a4,
-        "total_diameter_ohm": total_diameter,
-        "right_intercept_final_ohm": total_right,
+        "right_intercept_final_ohm": right_intercept,
         "arc3_height_ohm": arc3_height,
         "arc3_depression_ratio": arc3_depression,
         "fusion_2_3": fusion23_val,
-        "low_f_note": low_note,
+        "note": note,
     }
 
 
-def _summary_row(
-    file_name: str,
-    df: pd.DataFrame,
-    bundle: FitResultBundle,
-    low_freq_cutoff: float,
-) -> dict[str, object]:
-    q = _fit_quality_summary(bundle, low_freq_cutoff)
+def summary_row(file_name: str, df: pd.DataFrame, bundle: FitResultBundle, low_freq_cutoff: float) -> dict[str, object]:
+    q = fit_quality_summary(bundle, low_freq_cutoff)
     return {
         "file": file_name,
         "weight": bundle.weight,
@@ -153,13 +226,12 @@ def _summary_row(
         "arc3_height_ohm": q["arc3_height_ohm"],
         "arc3_depression": q["arc3_depression_ratio"],
         "fusion_2_3": q["fusion_2_3"],
-        "note": q["low_f_note"],
+        "note": q["note"],
     }
 
 
-def _display_metric_strip(bundle: FitResultBundle, df: pd.DataFrame, low_freq_cutoff: float) -> None:
-    """Small, information-dense row of important fit results."""
-    q = _fit_quality_summary(bundle, low_freq_cutoff)
+def display_metric_strip(bundle: FitResultBundle, df: pd.DataFrame, low_freq_cutoff: float) -> None:
+    q = fit_quality_summary(bundle, low_freq_cutoff)
     c1, c2, c3, c4, c5, c6 = st.columns(6)
     c1.metric("Points", f"{len(df)}")
     c2.metric("Freq. range", f"{_fmt_num(df['freq_hz'].min())}–{_fmt_num(df['freq_hz'].max())} Hz")
@@ -168,17 +240,13 @@ def _display_metric_strip(bundle: FitResultBundle, df: pd.DataFrame, low_freq_cu
     c5.metric("Final intercept", _fmt_num(q["right_intercept_final_ohm"], "Ω"))
     c6.metric("Arc 2–3 fusion", _fmt_num(q["fusion_2_3"]))
 
-    note = q["low_f_note"]
-    if note != "OK":
-        st.warning(f"Low-frequency check: {note}")
+    if q["note"] != "OK":
+        st.warning(f"Low-frequency check: {q['note']}")
     else:
-        st.success("Fit completed. No major low-frequency warning from the compact checks.")
+        st.success("Fit completed. No major low-frequency warning from compact checks.")
 
 
-def _format_summary_table(df: pd.DataFrame) -> pd.DataFrame:
-    """Return a compact, rounded table for screen display only."""
-    if df.empty:
-        return df
+def format_summary_table(df: pd.DataFrame) -> pd.DataFrame:
     out = df.copy()
     for col in out.columns:
         if out[col].dtype.kind in "f":
@@ -186,19 +254,97 @@ def _format_summary_table(df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
-def _read_xml_params_from_sidebar(xml_file) -> dict[str, float]:
-    if xml_file is None:
-        return {}
-    try:
-        xml_params = read_zfit_xml_bytes(xml_file.getvalue())
-        st.sidebar.success(f"Loaded {len(xml_params)} XML initial parameters.")
-        return xml_params
-    except Exception as exc:
-        st.sidebar.warning(f"Could not read XML: {exc}")
-        return {}
+def make_nyquist_figure(df: pd.DataFrame, bundles: list[FitResultBundle], show_low_freq_labels: bool = False):
+    fig, ax = plt.subplots(figsize=(6.8, 5.2))
+    ax.scatter(df["z_real_ohm"], df["minus_z_imag_ohm"], s=24, label="data")
+    for b in bundles:
+        ax.plot(b.curve_df["fit_z_real_ohm"], b.curve_df["fit_minus_z_imag_ohm"], label=f"fit: {b.weight}")
+
+    if show_low_freq_labels:
+        low = df.nsmallest(min(8, len(df)), "freq_hz")
+        for _, row in low.iterrows():
+            ax.annotate(f"{row['freq_hz']:.2g} Hz", (row["z_real_ohm"], row["minus_z_imag_ohm"]), fontsize=8)
+
+    ax.set_title("Nyquist plot")
+    ax.set_xlabel("Z' / Ω")
+    ax.set_ylabel("-Z'' / Ω")
+    ax.axis("equal")
+    ax.legend(loc="best")
+    fig.tight_layout()
+    return fig
 
 
-def _initial_parameter_editor(xml_params: dict[str, float], key_prefix: str) -> np.ndarray:
+def make_low_freq_figure(df: pd.DataFrame, bundles: list[FitResultBundle], cutoff_hz: float):
+    mask = df["freq_hz"] <= float(cutoff_hz)
+    fig, ax = plt.subplots(figsize=(6.8, 4.8))
+    ax.scatter(df.loc[mask, "z_real_ohm"], df.loc[mask, "minus_z_imag_ohm"], s=28, label="data")
+    for b in bundles:
+        cdf = b.curve_df[b.curve_df["freq_hz"] <= float(cutoff_hz)]
+        ax.plot(cdf["fit_z_real_ohm"], cdf["fit_minus_z_imag_ohm"], label=f"fit: {b.weight}")
+    ax.set_title(f"Low-frequency zoom: f ≤ {cutoff_hz:g} Hz")
+    ax.set_xlabel("Z' / Ω")
+    ax.set_ylabel("-Z'' / Ω")
+    ax.axis("equal")
+    ax.legend(loc="best")
+    fig.tight_layout()
+    return fig
+
+
+def make_zip_download(bundles: list[FitResultBundle]) -> bytes:
+    mem = io.BytesIO()
+    with zipfile.ZipFile(mem, mode="w", compression=zipfile.ZIP_DEFLATED) as zf:
+        for b in bundles:
+            stem = Path(b.name).stem.replace(" ", "_") + f"_{b.weight}"
+            zf.writestr(f"{stem}_fit_params.csv", b.params_df.to_csv(index=False))
+            zf.writestr(f"{stem}_arc_metrics.csv", b.arc_df.to_csv(index=False))
+            zf.writestr(f"{stem}_fusion_metrics.csv", b.fusion_df.to_csv(index=False))
+            zf.writestr(f"{stem}_fit_curve.csv", b.curve_df.to_csv(index=False))
+    return mem.getvalue()
+
+
+# -----------------------------------------------------------------------------
+# Sidebar widgets
+# -----------------------------------------------------------------------------
+
+
+def sidebar_fit_options(key_prefix: str):
+    st.sidebar.header("Fit options")
+    weight = st.sidebar.selectbox(
+        "Primary weighting",
+        ["unit", "sqrt_modulus", "modulus"],
+        index=0,
+        key=f"{key_prefix}_weight",
+    )
+    compare_weights = st.sidebar.checkbox(
+        "Compare all three weightings",
+        value=False,
+        key=f"{key_prefix}_compare_weights",
+    )
+    show_low_freq_labels = st.sidebar.checkbox(
+        "Label lowest-frequency points",
+        value=False,
+        key=f"{key_prefix}_labels",
+    )
+    low_freq_cutoff = st.sidebar.number_input(
+        "Low-frequency cutoff / Hz",
+        min_value=1e-9,
+        max_value=1e9,
+        value=0.1,
+        format="%.6g",
+        key=f"{key_prefix}_low_cutoff",
+    )
+    return weight, compare_weights, show_low_freq_labels, float(low_freq_cutoff)
+
+
+def sidebar_initial_params(xml_file, key_prefix: str) -> np.ndarray:
+    xml_params = {}
+    if xml_file is not None:
+        try:
+            xml_params = read_zfit_xml_uploaded(xml_file)
+            st.sidebar.success(f"Loaded {len(xml_params)} XML initial parameters.")
+        except Exception as exc:
+            st.sidebar.warning(f"Could not read XML: {exc}")
+
     st.sidebar.header("Initial parameters")
     default_p0 = pack_params(xml_params)
     editable = pd.DataFrame({"parameter": PARAM_ORDER, "initial_value": default_p0})
@@ -216,57 +362,18 @@ def _initial_parameter_editor(xml_params: dict[str, float], key_prefix: str) -> 
         return default_p0
 
 
-def _weights_to_run(primary_weight: str, compare_weights: bool) -> list[str]:
+def weights_to_run(primary_weight: str, compare_weights: bool) -> list[str]:
     return ["unit", "sqrt_modulus", "modulus"] if compare_weights else [primary_weight]
 
 
-def _primary_bundle(bundles: list[FitResultBundle], primary_weight: str) -> FitResultBundle:
-    return next((b for b in bundles if b.weight == primary_weight), bundles[0])
-
-
-def _downloads_for_bundle(bundle: FitResultBundle, file_stem: str) -> None:
-    c1, c2, c3, c4 = st.columns(4)
-    c1.download_button(
-        "Fit curve CSV",
-        bundle.curve_df.to_csv(index=False),
-        file_name=f"{file_stem}_{bundle.weight}_fit_curve.csv",
-        mime="text/csv",
-        use_container_width=True,
-    )
-    c2.download_button(
-        "Fit params CSV",
-        bundle.params_df.to_csv(index=False),
-        file_name=f"{file_stem}_{bundle.weight}_fit_params.csv",
-        mime="text/csv",
-        use_container_width=True,
-    )
-    c3.download_button(
-        "Arc metrics CSV",
-        bundle.arc_df.to_csv(index=False),
-        file_name=f"{file_stem}_{bundle.weight}_arc_metrics.csv",
-        mime="text/csv",
-        use_container_width=True,
-    )
-    c4.download_button(
-        "Fusion CSV",
-        bundle.fusion_df.to_csv(index=False),
-        file_name=f"{file_stem}_{bundle.weight}_fusion_metrics.csv",
-        mime="text/csv",
-        use_container_width=True,
-    )
-
-
 # -----------------------------------------------------------------------------
-# EIS single-file page
+# Pages
 # -----------------------------------------------------------------------------
 
 
 def render_eis_fit_page() -> None:
     st.title("EIS Fit")
-    st.caption(
-        "Single-file Nyquist fitting with compact preview. Current model: "
-        "`R1 + Q2/R2 + Q3/R3 + Q4/(R4 + W4)`."
-    )
+    st.caption("Single-file EIS fitting using the model in `eis_fit.py`: R1 + Q2/R2 + Q3/R3 + Q4/(R4 + W4).")
 
     with st.sidebar:
         st.header("Input")
@@ -277,170 +384,95 @@ def render_eis_fit_page() -> None:
             key="single_data_file",
         )
         xml_file = st.file_uploader(
-            "Optional EC-Lab ZFit XML",
+            "Optional EC-Lab ZFit XML for initial values",
             type=["xml"],
             accept_multiple_files=False,
             key="single_xml_file",
         )
-
-        st.header("Fit options")
-        primary_weight = st.selectbox(
-            "Primary weighting",
-            ["unit", "sqrt_modulus", "modulus"],
-            index=0,
-            key="single_primary_weight",
-        )
-        compare_weights = st.checkbox("Compare all three weightings", value=True, key="single_compare_weights")
-        max_nfev = st.number_input(
-            "Max function evaluations",
-            min_value=1000,
-            max_value=200000,
-            value=50000,
-            step=5000,
-            key="single_max_nfev",
-        )
-        show_low_freq_labels = st.checkbox(
-            "Label lowest-frequency points",
-            value=False,
-            key="single_low_f_labels",
-        )
-        low_freq_cutoff = st.number_input(
-            "Low-frequency check cutoff / Hz",
-            min_value=1e-6,
-            max_value=1e6,
-            value=0.1,
-            format="%.6g",
-            key="single_low_f_cutoff",
-        )
-
-        xml_params = _read_xml_params_from_sidebar(xml_file)
-        p0 = _initial_parameter_editor(xml_params, "single")
+        weight, compare_weights, show_low_freq_labels, low_freq_cutoff = sidebar_fit_options("single")
+        p0 = sidebar_initial_params(xml_file, "single")
 
     if data_file is None:
         st.info("Upload one `.mpr`, `.csv`, or `.txt` EIS file to start.")
-        with st.expander("What this page reports", expanded=True):
-            st.markdown(
-                """
-                - **Nyquist fit** and optional **low-frequency zoom**
-                - Compact fit-quality cards: RMSE, low-frequency bias, final intercept, arc fusion
-                - Full fit parameters, arc descriptors, fusion descriptors, and downloadable CSV outputs
-                - No residual plot by default, to keep the preview focused
-                """
-            )
+        st.markdown(
+            """
+            **Current model**
+
+            `R1 + Q2/R2 + Q3/R3 + Q4/(R4 + W4)`
+
+            The third arc should be treated as an effective low-frequency descriptor when the Warburg term is weak or poorly constrained.
+            """
+        )
         return
 
     try:
         df = read_uploaded_eis(data_file).sort_values("freq_hz", ascending=False).reset_index(drop=True)
     except Exception as exc:
-        st.error(f"Could not read {data_file.name}: {exc}")
+        st.error(f"Could not read `{data_file.name}`: {exc}")
         return
 
-    weights = _weights_to_run(primary_weight, compare_weights)
+    weights = weights_to_run(weight, compare_weights)
     bundles: list[FitResultBundle] = []
     with st.spinner(f"Fitting {data_file.name}..."):
         for w in weights:
             try:
-                bundles.append(make_fit_bundle(data_file.name, df, p0, w, int(max_nfev)))
+                bundles.append(make_fit_bundle(data_file.name, df, p0, w))
             except Exception as exc:
                 st.error(f"Fit failed with weight={w}: {exc}")
 
     if not bundles:
         return
 
-    primary = _primary_bundle(bundles, primary_weight)
-    file_stem = Path(data_file.name).stem.replace(" ", "_")
+    primary = next((b for b in bundles if b.weight == weight), bundles[0])
+    display_metric_strip(primary, df, low_freq_cutoff)
 
-    st.subheader(data_file.name)
-    _display_metric_strip(primary, df, float(low_freq_cutoff))
+    tab_plot, tab_params, tab_metrics, tab_data = st.tabs(["Preview", "Fit parameters", "Arc/fusion metrics", "Data & downloads"])
 
-    tab_overview, tab_params, tab_metrics, tab_data, tab_downloads = st.tabs(
-        ["Overview", "Parameters", "Arc/fusion", "Data", "Downloads"]
-    )
-
-    with tab_overview:
-        st.plotly_chart(
-            nyquist_figure(df, bundles, show_low_freq_labels=show_low_freq_labels),
-            use_container_width=True,
-        )
-        with st.expander("Low-frequency zoom", expanded=False):
-            st.plotly_chart(
-                low_freq_zoom_figure(df, bundles, float(low_freq_cutoff)),
-                use_container_width=True,
-            )
+    with tab_plot:
+        c1, c2 = st.columns([1.25, 1.0])
+        with c1:
+            st.pyplot(make_nyquist_figure(df, bundles, show_low_freq_labels), clear_figure=True)
+        with c2:
+            st.pyplot(make_low_freq_figure(df, bundles, low_freq_cutoff), clear_figure=True)
 
     with tab_params:
-        st.caption("Primary table is shown first. Other weightings are available below if comparison is enabled.")
-        st.markdown(f"**Primary weight = `{primary.weight}`**")
-        st.dataframe(primary.params_df, use_container_width=True, hide_index=True)
-        if len(bundles) > 1:
-            with st.expander("Other weighting results", expanded=False):
-                for b in bundles:
-                    if b is primary:
-                        continue
-                    st.markdown(f"**weight = `{b.weight}`**")
-                    st.dataframe(b.params_df, use_container_width=True, hide_index=True)
+        selected_weight = st.selectbox("Select weighting", [b.weight for b in bundles], index=[b.weight for b in bundles].index(primary.weight))
+        b = next(x for x in bundles if x.weight == selected_weight)
+        st.dataframe(b.params_df, use_container_width=True)
 
     with tab_metrics:
+        selected_weight = st.selectbox("Select weighting for metrics", [b.weight for b in bundles], index=[b.weight for b in bundles].index(primary.weight))
+        b = next(x for x in bundles if x.weight == selected_weight)
         c1, c2 = st.columns(2)
         with c1:
             st.caption("Arc geometry descriptors")
-            st.dataframe(primary.arc_df, use_container_width=True, hide_index=True)
+            st.dataframe(b.arc_df, use_container_width=True)
         with c2:
             st.caption("Fusion descriptors")
-            st.dataframe(primary.fusion_df, use_container_width=True, hide_index=True)
+            st.dataframe(b.fusion_df, use_container_width=True)
 
     with tab_data:
-        preview_cols = [
-            "freq_hz",
-            "z_real_ohm",
-            "minus_z_imag_ohm",
-            "fit_z_real_ohm",
-            "fit_minus_z_imag_ohm",
-        ]
-        st.dataframe(primary.curve_df[preview_cols], use_container_width=True, hide_index=True)
-
-    with tab_downloads:
-        _downloads_for_bundle(primary, file_stem)
-        if len(bundles) > 1:
+        st.dataframe(primary.curve_df, use_container_width=True)
+        c1, c2 = st.columns(2)
+        with c1:
             st.download_button(
-                "Download all weighting outputs as ZIP",
-                make_zip_download(bundles),
-                file_name=f"{file_stem}_all_weightings.zip",
-                mime="application/zip",
-                use_container_width=True,
+                "Download primary fit curve CSV",
+                data=primary.curve_df.to_csv(index=False),
+                file_name=f"{Path(data_file.name).stem}_{primary.weight}_fit_curve.csv",
+                mime="text/csv",
             )
-
-
-# -----------------------------------------------------------------------------
-# EIS batch page
-# -----------------------------------------------------------------------------
-
-
-def _make_batch_zip(
-    summary_df: pd.DataFrame,
-    bundles_by_file: dict[str, list[FitResultBundle]],
-) -> bytes:
-    """Create a single ZIP with summary table plus all per-file outputs."""
-    mem = io.BytesIO()
-    with zipfile.ZipFile(mem, mode="w", compression=zipfile.ZIP_DEFLATED) as zf:
-        zf.writestr("batch_summary.csv", summary_df.to_csv(index=False))
-        for file_name, bundles in bundles_by_file.items():
-            safe_stem = Path(file_name).stem.replace(" ", "_")
-            for b in bundles:
-                stem = f"{safe_stem}_{b.weight}"
-                zf.writestr(f"{stem}_fit_params.csv", b.params_df.to_csv(index=False))
-                zf.writestr(f"{stem}_arc_metrics.csv", b.arc_df.to_csv(index=False))
-                zf.writestr(f"{stem}_fusion_metrics.csv", b.fusion_df.to_csv(index=False))
-                zf.writestr(f"{stem}_fit_curve.csv", b.curve_df.to_csv(index=False))
-    return mem.getvalue()
+        with c2:
+            st.download_button(
+                "Download all outputs ZIP",
+                data=make_zip_download(bundles),
+                file_name=f"{Path(data_file.name).stem}_eis_fit_outputs.zip",
+                mime="application/zip",
+            )
 
 
 def render_eis_fit_batch_page() -> None:
     st.title("EIS Fit Batch")
-    st.caption(
-        "Batch fitting for multiple uploaded EIS files. The preview is summarized first; "
-        "select one file for detailed Nyquist and parameter inspection."
-    )
+    st.caption("Upload multiple EIS files. The page fits each file and shows a compact summary first, then lets you preview one selected file.")
 
     with st.sidebar:
         st.header("Input")
@@ -451,245 +483,134 @@ def render_eis_fit_batch_page() -> None:
             key="batch_data_files",
         )
         xml_file = st.file_uploader(
-            "Optional EC-Lab ZFit XML",
+            "Optional EC-Lab ZFit XML for initial values",
             type=["xml"],
             accept_multiple_files=False,
             key="batch_xml_file",
         )
-
-        st.header("Fit options")
-        primary_weight = st.selectbox(
-            "Primary weighting",
-            ["unit", "sqrt_modulus", "modulus"],
-            index=0,
-            key="batch_primary_weight",
-        )
-        compare_weights = st.checkbox(
-            "Run all three weightings",
-            value=False,
-            key="batch_compare_weights",
-            help="For many files, primary weighting only is faster and keeps the summary table cleaner.",
-        )
-        show_all_weights_in_summary = st.checkbox(
-            "Show all weightings in summary",
-            value=False,
-            key="batch_show_all_weights_summary",
-            disabled=not compare_weights,
-        )
-        max_nfev = st.number_input(
-            "Max function evaluations",
-            min_value=1000,
-            max_value=200000,
-            value=50000,
-            step=5000,
-            key="batch_max_nfev",
-        )
-        show_low_freq_labels = st.checkbox(
-            "Label lowest-frequency points in preview",
-            value=False,
-            key="batch_low_f_labels",
-        )
-        low_freq_cutoff = st.number_input(
-            "Low-frequency check cutoff / Hz",
-            min_value=1e-6,
-            max_value=1e6,
-            value=0.1,
-            format="%.6g",
-            key="batch_low_f_cutoff",
-        )
-
-        xml_params = _read_xml_params_from_sidebar(xml_file)
-        p0 = _initial_parameter_editor(xml_params, "batch")
+        weight, compare_weights, show_low_freq_labels, low_freq_cutoff = sidebar_fit_options("batch")
+        p0 = sidebar_initial_params(xml_file, "batch")
 
     if not data_files:
         st.info("Upload multiple `.mpr`, `.csv`, or `.txt` files to run batch fitting.")
-        st.markdown(
-            """
-            **Batch page layout**
-            1. Upload many EIS files from the browser.
-            2. Fit all files with the selected model and weighting.
-            3. Review one compact summary table.
-            4. Choose one file for detailed plot/parameter preview.
-            5. Download the full batch output as a ZIP.
-            """
-        )
         return
 
-    weights = _weights_to_run(primary_weight, compare_weights)
-    dfs_by_file: dict[str, pd.DataFrame] = {}
-    bundles_by_file: dict[str, list[FitResultBundle]] = {}
+    weights = weights_to_run(weight, compare_weights)
+    all_bundles: list[FitResultBundle] = []
+    data_by_name: dict[str, pd.DataFrame] = {}
+    bundles_by_name: dict[str, list[FitResultBundle]] = {}
     summary_rows: list[dict[str, object]] = []
-    errors: list[str] = []
 
-    progress = st.progress(0.0, text="Preparing batch fitting...")
-    total_jobs = max(1, len(data_files) * len(weights))
-    done_jobs = 0
+    progress = st.progress(0)
+    status = st.empty()
 
-    for uploaded in data_files:
-        file_name = uploaded.name
+    for i, uploaded in enumerate(data_files, start=1):
+        status.write(f"Fitting {uploaded.name} ({i}/{len(data_files)})...")
         try:
             df = read_uploaded_eis(uploaded).sort_values("freq_hz", ascending=False).reset_index(drop=True)
-            dfs_by_file[file_name] = df
+            data_by_name[uploaded.name] = df
+            file_bundles: list[FitResultBundle] = []
+            for w in weights:
+                b = make_fit_bundle(uploaded.name, df, p0, w)
+                file_bundles.append(b)
+                all_bundles.append(b)
+                summary_rows.append(summary_row(uploaded.name, df, b, low_freq_cutoff))
+            bundles_by_name[uploaded.name] = file_bundles
         except Exception as exc:
-            errors.append(f"{file_name}: read failed — {exc}")
-            done_jobs += len(weights)
-            progress.progress(min(done_jobs / total_jobs, 1.0), text=f"Skipped {file_name}")
-            continue
+            summary_rows.append(
+                {
+                    "file": uploaded.name,
+                    "weight": ",".join(weights),
+                    "success": False,
+                    "points": np.nan,
+                    "f_min_Hz": np.nan,
+                    "f_max_Hz": np.nan,
+                    "RMSE_Z_ohm": np.nan,
+                    "low_f_bias_ohm": np.nan,
+                    "low_f_max_abs_ohm": np.nan,
+                    "R1_ohm": np.nan,
+                    "R2_ohm": np.nan,
+                    "R3_ohm": np.nan,
+                    "R4_ohm": np.nan,
+                    "R_total_span_ohm": np.nan,
+                    "arc3_height_ohm": np.nan,
+                    "arc3_depression": np.nan,
+                    "fusion_2_3": np.nan,
+                    "note": f"read/fit failed: {exc}",
+                }
+            )
+        progress.progress(i / len(data_files))
 
-        bundles: list[FitResultBundle] = []
-        for w in weights:
-            try:
-                b = make_fit_bundle(file_name, df, p0, w, int(max_nfev))
-                bundles.append(b)
-                if show_all_weights_in_summary or w == primary_weight:
-                    summary_rows.append(_summary_row(file_name, df, b, float(low_freq_cutoff)))
-            except Exception as exc:
-                errors.append(f"{file_name}, weight={w}: fit failed — {exc}")
-            finally:
-                done_jobs += 1
-                progress.progress(min(done_jobs / total_jobs, 1.0), text=f"Fitted {done_jobs}/{total_jobs} jobs")
-
-        if bundles:
-            bundles_by_file[file_name] = bundles
-
+    status.empty()
     progress.empty()
 
-    if errors:
-        with st.expander(f"Warnings / failed files ({len(errors)})", expanded=True):
-            for msg in errors:
-                st.warning(msg)
-
-    if not summary_rows:
-        st.error("No successful fits to display.")
-        return
-
     summary_df = pd.DataFrame(summary_rows)
-
     st.subheader("Batch summary")
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Files uploaded", str(len(data_files)))
-    c2.metric("Successful files", str(len(bundles_by_file)))
-    c3.metric("Summary rows", str(len(summary_df)))
-    c4.metric("Primary weight", primary_weight)
+    st.dataframe(format_summary_table(summary_df), use_container_width=True)
 
-    concise_cols = [
-        "file",
-        "weight",
-        "success",
-        "points",
-        "f_min_Hz",
-        "f_max_Hz",
-        "RMSE_Z_ohm",
-        "low_f_bias_ohm",
-        "R_total_span_ohm",
-        "arc3_height_ohm",
-        "fusion_2_3",
-        "note",
-    ]
-    st.dataframe(
-        _format_summary_table(summary_df[concise_cols]),
-        use_container_width=True,
-        hide_index=True,
-    )
+    c1, c2 = st.columns(2)
+    with c1:
+        st.download_button(
+            "Download batch summary CSV",
+            data=summary_df.to_csv(index=False),
+            file_name="eis_batch_summary.csv",
+            mime="text/csv",
+        )
+    with c2:
+        if all_bundles:
+            st.download_button(
+                "Download all fit outputs ZIP",
+                data=make_zip_download(all_bundles),
+                file_name="eis_batch_fit_outputs.zip",
+                mime="application/zip",
+            )
 
-    st.download_button(
-        "Download batch summary CSV",
-        summary_df.to_csv(index=False),
-        file_name="eis_batch_summary.csv",
-        mime="text/csv",
-        use_container_width=True,
-    )
+    if not bundles_by_name:
+        return
 
     st.divider()
     st.subheader("Detailed preview")
+    selected_file = st.selectbox("Select file to preview", list(bundles_by_name.keys()))
+    file_bundles = bundles_by_name[selected_file]
+    df = data_by_name[selected_file]
+    primary = next((b for b in file_bundles if b.weight == weight), file_bundles[0])
+    display_metric_strip(primary, df, low_freq_cutoff)
 
-    selectable_files = list(bundles_by_file.keys())
-    selected_file = st.selectbox("Choose one file to preview", selectable_files, key="batch_preview_file")
-    df = dfs_by_file[selected_file]
-    bundles = bundles_by_file[selected_file]
-    primary = _primary_bundle(bundles, primary_weight)
-
-    _display_metric_strip(primary, df, float(low_freq_cutoff))
-
-    tab_plot, tab_params, tab_metrics, tab_data, tab_downloads = st.tabs(
-        ["Plot", "Parameters", "Arc/fusion", "Data", "Downloads"]
-    )
-
+    tab_plot, tab_params, tab_metrics, tab_data = st.tabs(["Preview", "Fit parameters", "Arc/fusion metrics", "Data"])
     with tab_plot:
-        st.plotly_chart(
-            nyquist_figure(df, bundles, show_low_freq_labels=show_low_freq_labels),
-            use_container_width=True,
-        )
-        with st.expander("Low-frequency zoom", expanded=False):
-            st.plotly_chart(
-                low_freq_zoom_figure(df, bundles, float(low_freq_cutoff)),
-                use_container_width=True,
-            )
+        c1, c2 = st.columns([1.25, 1.0])
+        with c1:
+            st.pyplot(make_nyquist_figure(df, file_bundles, show_low_freq_labels), clear_figure=True)
+        with c2:
+            st.pyplot(make_low_freq_figure(df, file_bundles, low_freq_cutoff), clear_figure=True)
 
     with tab_params:
-        st.markdown(f"**Primary weight = `{primary.weight}`**")
-        st.dataframe(primary.params_df, use_container_width=True, hide_index=True)
-        if len(bundles) > 1:
-            with st.expander("Other weighting results", expanded=False):
-                for b in bundles:
-                    if b is primary:
-                        continue
-                    st.markdown(f"**weight = `{b.weight}`**")
-                    st.dataframe(b.params_df, use_container_width=True, hide_index=True)
+        selected_weight = st.selectbox("Select weighting", [b.weight for b in file_bundles], key="batch_preview_params_weight")
+        b = next(x for x in file_bundles if x.weight == selected_weight)
+        st.dataframe(b.params_df, use_container_width=True)
 
     with tab_metrics:
+        selected_weight = st.selectbox("Select weighting for metrics", [b.weight for b in file_bundles], key="batch_preview_metrics_weight")
+        b = next(x for x in file_bundles if x.weight == selected_weight)
         c1, c2 = st.columns(2)
         with c1:
             st.caption("Arc geometry descriptors")
-            st.dataframe(primary.arc_df, use_container_width=True, hide_index=True)
+            st.dataframe(b.arc_df, use_container_width=True)
         with c2:
             st.caption("Fusion descriptors")
-            st.dataframe(primary.fusion_df, use_container_width=True, hide_index=True)
+            st.dataframe(b.fusion_df, use_container_width=True)
 
     with tab_data:
-        preview_cols = [
-            "freq_hz",
-            "z_real_ohm",
-            "minus_z_imag_ohm",
-            "fit_z_real_ohm",
-            "fit_minus_z_imag_ohm",
-        ]
-        st.dataframe(primary.curve_df[preview_cols], use_container_width=True, hide_index=True)
-
-    with tab_downloads:
-        file_stem = Path(selected_file).stem.replace(" ", "_")
-        _downloads_for_bundle(primary, file_stem)
-        st.download_button(
-            "Download full batch outputs as ZIP",
-            _make_batch_zip(summary_df, bundles_by_file),
-            file_name="eis_batch_outputs.zip",
-            mime="application/zip",
-            use_container_width=True,
-        )
+        st.dataframe(primary.curve_df, use_container_width=True)
 
 
-# -----------------------------------------------------------------------------
-# App entry point
-# -----------------------------------------------------------------------------
-
-
-def render_placeholder_page(title: str, description: str) -> None:
+def render_placeholder_page(title: str) -> None:
     st.title(title)
-    st.info(description)
-    st.markdown(
-        """
-        This page is reserved for a future module. The dashboard structure is already ready:
-        add a new `render_..._page()` function and connect it in the sidebar selector.
-        """
-    )
+    st.info("This module can be added later without changing the EIS fitting logic.")
 
 
 def main() -> None:
-    st.set_page_config(
-        page_title="Battery Data Analysis",
-        page_icon="🔋",
-        layout="wide",
-    )
+    st.set_page_config(page_title="Battery Data Analysis", page_icon="🔋", layout="wide")
 
     st.sidebar.title("🔋 Battery Data Analysis")
     tool = st.sidebar.selectbox(
@@ -701,7 +622,6 @@ def main() -> None:
             "Stripping Overpotential",
             "dQ/dV Analysis",
         ],
-        index=0,
     )
 
     if tool == "EIS Fit":
@@ -709,11 +629,11 @@ def main() -> None:
     elif tool == "EIS Fit Batch":
         render_eis_fit_batch_page()
     elif tool == "Cycling Analysis":
-        render_placeholder_page("Cycling Analysis", "Cycling capacity/CE/voltage profile analysis will be added here.")
+        render_placeholder_page("Cycling Analysis")
     elif tool == "Stripping Overpotential":
-        render_placeholder_page("Stripping Overpotential", "Li/Na stripping overpotential analysis will be added here.")
+        render_placeholder_page("Stripping Overpotential")
     elif tool == "dQ/dV Analysis":
-        render_placeholder_page("dQ/dV Analysis", "Differential capacity analysis will be added here.")
+        render_placeholder_page("dQ/dV Analysis")
 
 
 if __name__ == "__main__":
