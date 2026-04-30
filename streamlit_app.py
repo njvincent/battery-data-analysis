@@ -20,6 +20,7 @@ import re
 import io
 import tempfile
 import zipfile
+import hashlib
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -792,6 +793,351 @@ def read_one_capacity_file(
     return out
 
 
+
+def read_one_capacity_file_silent(
+    file_path: Path,
+    sample_name: str,
+    root_dir: Path,
+    sheet_name: str,
+    capacity_col: str,
+    efficiency_col: str,
+    skip_initial_rows: int,
+    min_capacity_retention: float | None,
+) -> tuple[pd.DataFrame | None, str | None]:
+    """
+    Pure reader for one cycling Excel file.
+
+    This is the same parsing logic as read_one_capacity_file, but it returns an
+    error string instead of writing Streamlit warnings. It is useful for cached
+    previews and file-selection diagnostics.
+    """
+    try:
+        df = pd.read_excel(file_path, sheet_name=sheet_name)
+    except Exception as exc:
+        return None, f"Could not read file: {exc}"
+
+    missing_cols = [col for col in [capacity_col, efficiency_col] if col not in df.columns]
+    if missing_cols:
+        return None, f"Missing columns: {missing_cols}"
+
+    cycle_col = detect_cycle_column(df)
+    data = df.iloc[int(skip_initial_rows):].copy()
+
+    capacity = pd.to_numeric(data[capacity_col], errors="coerce")
+    efficiency = pd.to_numeric(data[efficiency_col], errors="coerce")
+
+    if cycle_col is not None:
+        cycle_index = pd.to_numeric(data[cycle_col], errors="coerce")
+    else:
+        cycle_index = pd.Series(np.arange(len(data)), index=data.index)
+
+    valid_mask = capacity.notna() & efficiency.notna() & cycle_index.notna()
+
+    capacity = capacity[valid_mask].reset_index(drop=True)
+    efficiency = efficiency[valid_mask].reset_index(drop=True)
+    cycle_index = cycle_index[valid_mask].reset_index(drop=True)
+
+    if len(capacity) == 0:
+        return None, "No valid numeric data."
+
+    initial_capacity = capacity.iloc[0]
+    if pd.isna(initial_capacity) or initial_capacity == 0:
+        return None, "Invalid initial capacity."
+
+    capacity_retention = capacity / initial_capacity * 100
+
+    out = pd.DataFrame(
+        {
+            "sample": sample_name,
+            "source_file": file_path.name,
+            "relative_path": str(file_path.relative_to(root_dir)),
+            "cycle_index": cycle_index,
+            "discharge_capacity_mAh": capacity,
+            "capacity_retention_percent": capacity_retention,
+            "coulombic_efficiency_percent": efficiency,
+        }
+    )
+
+    if min_capacity_retention is not None:
+        out = out[out["capacity_retention_percent"] >= float(min_capacity_retention)].reset_index(drop=True)
+
+    if out.empty:
+        return None, "No data after filtering."
+
+    return out, None
+
+
+@st.cache_data(show_spinner=False)
+def cached_read_capacity_file(
+    file_path_str: str,
+    sample_name: str,
+    root_dir_str: str,
+    sheet_name: str,
+    capacity_col: str,
+    efficiency_col: str,
+    skip_initial_rows: int,
+    min_capacity_retention: float | None,
+    file_size: int,
+    file_mtime: float,
+) -> tuple[pd.DataFrame | None, str | None]:
+    """
+    Cached one-file reader.
+
+    file_size and file_mtime are intentionally included in the cache key, so if
+    an Excel file changes on disk the preview cache is invalidated automatically.
+    """
+    _ = file_size, file_mtime
+    return read_one_capacity_file_silent(
+        file_path=Path(file_path_str),
+        sample_name=sample_name,
+        root_dir=Path(root_dir_str),
+        sheet_name=sheet_name,
+        capacity_col=capacity_col,
+        efficiency_col=efficiency_col,
+        skip_initial_rows=int(skip_initial_rows),
+        min_capacity_retention=min_capacity_retention,
+    )
+
+
+def load_cached_capacity_file(
+    file_path: Path,
+    sample_name: str,
+    root_dir: Path,
+    sheet_name: str,
+    capacity_col: str,
+    efficiency_col: str,
+    skip_initial_rows: int,
+    min_retention: float | None,
+) -> tuple[pd.DataFrame | None, str | None]:
+    stat = file_path.stat()
+    return cached_read_capacity_file(
+        file_path_str=str(file_path),
+        sample_name=sample_name,
+        root_dir_str=str(root_dir),
+        sheet_name=sheet_name,
+        capacity_col=capacity_col,
+        efficiency_col=efficiency_col,
+        skip_initial_rows=int(skip_initial_rows),
+        min_capacity_retention=min_retention,
+        file_size=int(stat.st_size),
+        file_mtime=float(stat.st_mtime),
+    )
+
+
+def stable_key_part(text: str) -> str:
+    return hashlib.sha1(str(text).encode("utf-8")).hexdigest()[:12]
+
+
+def cycling_file_include_key(sample_name: str, relative_path: str) -> str:
+    return f"cycling_include_{stable_key_part(sample_name)}_{stable_key_part(relative_path)}"
+
+
+def capacity_file_records(sample_name: str, sample_dir: Path, root_dir: Path) -> list[dict[str, object]]:
+    """Fast file index: list Excel files without reading them."""
+    records = []
+    for file_path in find_capacity_excel_files(sample_dir):
+        relative_path = str(file_path.relative_to(root_dir))
+        records.append(
+            {
+                "sample": sample_name,
+                "source_file": file_path.name,
+                "relative_path": relative_path,
+                "path": file_path,
+            }
+        )
+    return records
+
+
+def selected_relative_paths_for_sample(
+    sample_name: str,
+    sample_dir: Path,
+    root_dir: Path,
+    manual_selection: bool,
+) -> list[str] | None:
+    """
+    Return selected relative paths for one sample.
+
+    None means use all files. A list means use exactly those files.
+
+    Saved selections are treated as the source of truth. This prevents final
+    processing from falling back to all files after the user has reviewed and
+    saved a sample. If a sample has not been saved yet, the live checkbox state
+    is used as a fallback.
+    """
+    if not manual_selection:
+        return None
+
+    ensure_cycling_selection_store()
+    records = capacity_file_records(sample_name, sample_dir, root_dir)
+    saved = st.session_state["cycling_saved_selection"].get(sample_name)
+
+    selected = []
+    for record in records:
+        rel = str(record["relative_path"])
+        if saved is not None:
+            include = bool(saved.get(rel, True))
+        else:
+            key = cycling_file_include_key(sample_name, rel)
+            include = bool(st.session_state.get(key, True))
+
+        if include:
+            selected.append(rel)
+
+    return selected
+
+
+def ensure_cycling_selection_store() -> None:
+    """Ensure the persistent selection containers exist in Streamlit session state."""
+    if "cycling_saved_selection" not in st.session_state:
+        st.session_state["cycling_saved_selection"] = {}
+
+
+def save_selection_for_sample(sample_name: str, file_records: list[dict[str, object]]) -> None:
+    """
+    Save the current checkbox values for one sample.
+
+    The saved copy is separate from the live checkbox state, so users can switch
+    between samples and still restore or confirm earlier choices.
+    """
+    ensure_cycling_selection_store()
+    saved = {}
+
+    for record in file_records:
+        rel = str(record["relative_path"])
+        key = cycling_file_include_key(sample_name, rel)
+        saved[rel] = bool(st.session_state.get(key, True))
+
+    st.session_state["cycling_saved_selection"][sample_name] = saved
+
+
+def restore_saved_selection_for_sample(sample_name: str, file_records: list[dict[str, object]]) -> bool:
+    """Restore saved checkbox values for one sample. Returns True if restored."""
+    ensure_cycling_selection_store()
+    saved = st.session_state["cycling_saved_selection"].get(sample_name)
+
+    if not saved:
+        return False
+
+    for record in file_records:
+        rel = str(record["relative_path"])
+        key = cycling_file_include_key(sample_name, rel)
+        st.session_state[key] = bool(saved.get(rel, True))
+
+    return True
+
+
+def saved_selection_summary(sample_name: str, file_records: list[dict[str, object]]) -> str:
+    """Return a compact saved-selection status string for one sample."""
+    ensure_cycling_selection_store()
+    saved = st.session_state["cycling_saved_selection"].get(sample_name)
+
+    if not saved:
+        return "No saved selection yet."
+
+    total = len(file_records)
+    selected = sum(bool(saved.get(str(record["relative_path"]), True)) for record in file_records)
+    return f"Saved: {selected} / {total} files included."
+
+def save_current_cycling_selection_and_advance(
+    current_sample: str,
+    selected_samples: list[str],
+    folder_map: dict[str, Path],
+    root_dir: Path,
+) -> None:
+    """Save the current sample selection and advance the review flow.
+
+    The button at the bottom of the file-preview page uses this as a callback.
+    It saves only the sample the user just reviewed. If more selected samples
+    remain, the app opens the next sample for review. If the current sample is
+    the last selected sample, the app moves to the style-preview step.
+    """
+    ensure_cycling_selection_store()
+
+    if current_sample not in selected_samples:
+        return
+
+    records = capacity_file_records(current_sample, folder_map[current_sample], root_dir)
+    save_selection_for_sample(current_sample, records)
+
+    current_index = selected_samples.index(current_sample)
+    if current_index < len(selected_samples) - 1:
+        st.session_state["cycling_inspect_sample"] = selected_samples[current_index + 1]
+        st.session_state["cycling_workflow_step"] = "1. Data preview & file selection"
+    else:
+        st.session_state["cycling_workflow_step"] = "2. Style preview"
+
+
+def set_cycling_workflow_step(step: str) -> None:
+    """Set the cycling workflow step from a button callback."""
+    st.session_state["cycling_workflow_step"] = step
+
+
+def selected_relative_paths_for_sample_saved_first(
+    sample_name: str,
+    sample_dir: Path,
+    root_dir: Path,
+    manual_selection: bool,
+) -> list[str] | None:
+    """Return selected file paths, preferring saved selections over live checkbox values.
+
+    None means all files are allowed. A list means use exactly those root-relative
+    paths. Invalid files should already have been saved as False during preview.
+    """
+    if not manual_selection:
+        return None
+
+    ensure_cycling_selection_store()
+    records = capacity_file_records(sample_name, sample_dir, root_dir)
+    saved = st.session_state["cycling_saved_selection"].get(sample_name)
+
+    selected: list[str] = []
+    for record in records:
+        rel = str(record["relative_path"])
+        key = cycling_file_include_key(sample_name, rel)
+        if saved is not None:
+            include = bool(saved.get(rel, False))
+        else:
+            include = bool(st.session_state.get(key, True))
+        if include:
+            selected.append(rel)
+
+    return selected
+
+
+
+def capacity_file_summary_row(
+    file_df: pd.DataFrame | None,
+    record: dict[str, object],
+    selected: bool,
+    error: str | None = None,
+) -> dict[str, object]:
+    if file_df is None or file_df.empty:
+        return {
+            "include": selected,
+            "file": record["source_file"],
+            "relative_path": record["relative_path"],
+            "points": 0,
+            "max_cycle": np.nan,
+            "final_retention_%": np.nan,
+            "min_retention_%": np.nan,
+            "mean_CE_%": np.nan,
+            "status": error or "not loaded",
+        }
+
+    ordered = file_df.sort_values("cycle_index")
+    return {
+        "include": selected,
+        "file": record["source_file"],
+        "relative_path": record["relative_path"],
+        "points": int(len(file_df)),
+        "max_cycle": float(ordered["cycle_index"].max()),
+        "final_retention_%": float(ordered["capacity_retention_percent"].iloc[-1]),
+        "min_retention_%": float(ordered["capacity_retention_percent"].min()),
+        "mean_CE_%": float(ordered["coulombic_efficiency_percent"].mean()),
+        "status": "OK",
+    }
+
+
 def load_capacity_sample_plot_data(
     sample_name: str,
     sample_dir: Path,
@@ -802,20 +1148,31 @@ def load_capacity_sample_plot_data(
     skip_initial_rows: int,
     min_retention: float | None,
     top_n_value: int | None,
+    selected_relative_paths: list[str] | None = None,
 ) -> tuple[pd.DataFrame | None, int]:
     """
-    Load and optionally filter all Excel cycling files for one sample.
-    Returns (plot_df, number_of_excel_files_found).
+    Load and optionally filter Excel cycling files for one sample.
+
+    selected_relative_paths:
+        None -> use all detected files.
+        list -> use only files whose root-relative paths are in the list.
     """
     excel_files = find_capacity_excel_files(sample_dir)
+    excel_file_count = len(excel_files)
 
     if not excel_files:
         return None, 0
 
-    sample_dfs = []
+    if selected_relative_paths is not None:
+        selected_set = set(selected_relative_paths)
+        excel_files = [p for p in excel_files if str(p.relative_to(root_dir)) in selected_set]
 
+    if not excel_files:
+        return None, excel_file_count
+
+    sample_dfs = []
     for file_path in excel_files:
-        one_df = read_one_capacity_file(
+        one_df, error = load_cached_capacity_file(
             file_path=file_path,
             sample_name=sample_name,
             root_dir=root_dir,
@@ -823,31 +1180,32 @@ def load_capacity_sample_plot_data(
             capacity_col=capacity_col,
             efficiency_col=efficiency_col,
             skip_initial_rows=int(skip_initial_rows),
-            min_capacity_retention=min_retention,
+            min_retention=min_retention,
         )
 
         if one_df is not None:
             sample_dfs.append(one_df)
+        elif error:
+            st.warning(f"Skipping `{file_path.name}`: {error}")
 
     if not sample_dfs:
-        return None, len(excel_files)
+        return None, excel_file_count
 
     plot_df = pd.concat(sample_dfs, ignore_index=True)
 
     if top_n_value is not None:
         scores = (
-            plot_df.groupby("source_file")["capacity_retention_percent"]
+            plot_df.groupby("relative_path")["capacity_retention_percent"]
             .sum()
             .sort_values(ascending=False)
         )
-        keep_files = scores.head(top_n_value).index
-        plot_df = plot_df[plot_df["source_file"].isin(keep_files)].copy()
+        keep_paths = scores.head(top_n_value).index
+        plot_df = plot_df[plot_df["relative_path"].isin(keep_paths)].copy()
 
     if plot_df.empty:
-        return None, len(excel_files)
+        return None, excel_file_count
 
-    return plot_df, len(excel_files)
-
+    return plot_df, excel_file_count
 
 def capacity_auto_x_limit(max_cycle: float) -> int:
     """
@@ -1129,6 +1487,188 @@ def make_capacity_figure(
     return fig
 
 
+
+
+def make_single_file_capacity_preview_figure(
+    file_df: pd.DataFrame,
+    title: str,
+    color_hex: str,
+    axis_mode: str = "Fixed common range",
+    fixed_cap_y_min: float = 75.0,
+    fixed_cap_y_max: float = 110.0,
+    fixed_ce_y_min: float = 90.0,
+    fixed_ce_y_max: float = 100.5,
+    fig_width: float = 5.2,
+    fig_height: float = 3.25,
+):
+    """
+    Make a compact file-level cycling preview figure.
+
+    This figure is meant for quality control. It deliberately uses a fixed,
+    compact layout so that a long list of file previews looks aligned in
+    Streamlit.
+    """
+    plt.rcParams["font.family"] = "sans-serif"
+    plt.rcParams["font.sans-serif"] = ["Arial", "Helvetica", "DejaVu Sans"]
+    plt.rcParams["axes.unicode_minus"] = False
+
+    df = file_df.sort_values("cycle_index").copy()
+    color_rgb = hex_to_rgb_tuple(color_hex)
+
+    fig, ax1 = plt.subplots(figsize=(fig_width, fig_height))
+    ax2 = ax1.twinx()
+
+    # Keep the file-level preview visually consistent with the final
+    # sample-level figure: filled circles for capacity retention and open
+    # circles for coulombic efficiency. No connecting lines are drawn.
+    ax1.scatter(
+        df["cycle_index"],
+        df["capacity_retention_percent"],
+        color=color_rgb,
+        marker="o",
+        s=18,
+        alpha=1,
+        zorder=3,
+    )
+
+    ax2.scatter(
+        df["cycle_index"],
+        df["coulombic_efficiency_percent"],
+        facecolors="none",
+        edgecolors=color_rgb,
+        marker="o",
+        s=18,
+        linewidths=1.0,
+        alpha=1,
+        zorder=3,
+    )
+
+    max_cycle = float(df["cycle_index"].max()) if len(df) else 100.0
+    ax1.set_xlim(0, capacity_auto_x_limit(max_cycle))
+
+    if axis_mode == "Auto per file":
+        cap = df["capacity_retention_percent"].to_numpy(float)
+        ce = df["coulombic_efficiency_percent"].to_numpy(float)
+
+        cap_min = np.nanmin(cap) if len(cap) else fixed_cap_y_min
+        cap_max = np.nanmax(cap) if len(cap) else fixed_cap_y_max
+        ce_min = np.nanmin(ce) if len(ce) else fixed_ce_y_min
+        ce_max = np.nanmax(ce) if len(ce) else fixed_ce_y_max
+
+        cap_pad = max(1.5, 0.08 * max(1.0, cap_max - cap_min))
+        ce_pad = max(0.15, 0.12 * max(0.1, ce_max - ce_min))
+
+        ax1.set_ylim(
+            np.floor((cap_min - cap_pad) / 5) * 5,
+            np.ceil((cap_max + cap_pad) / 5) * 5,
+        )
+        ax2.set_ylim(
+            np.floor((ce_min - ce_pad) * 2) / 2,
+            np.ceil((ce_max + ce_pad) * 2) / 2,
+        )
+    else:
+        ax1.set_ylim(float(fixed_cap_y_min), float(fixed_cap_y_max))
+        ax2.set_ylim(float(fixed_ce_y_min), float(fixed_ce_y_max))
+
+    if str(title).strip():
+        ax1.set_title(shorten_label(title, 54), fontsize=10, pad=7)
+    ax1.set_xlabel("Cycle Index", fontsize=9, labelpad=4)
+    ax1.set_ylabel("Retention (%)", fontsize=9, labelpad=4)
+    ax2.set_ylabel("CE (%)", fontsize=9, labelpad=6)
+
+    for ax in [ax1, ax2]:
+        ax.tick_params(
+            axis="both",
+            which="major",
+            direction="in",
+            labelsize=8,
+            length=4,
+            width=1.0,
+            pad=3,
+        )
+        ax.tick_params(axis="both", which="minor", direction="in", length=2.5, width=0.8)
+        for spine in ax.spines.values():
+            spine.set_linewidth(1.0)
+
+    ax1.xaxis.set_minor_locator(AutoMinorLocator(5))
+    ax1.yaxis.set_minor_locator(AutoMinorLocator(4))
+    ax2.yaxis.set_minor_locator(AutoMinorLocator(2))
+
+    top_margin = 0.84 if str(title).strip() else 0.93
+    fig.subplots_adjust(left=0.13, right=0.84, bottom=0.18, top=top_margin)
+    return fig
+
+
+def render_file_preview_card(
+    record: dict[str, object],
+    file_df: pd.DataFrame | None,
+    error: str | None,
+    checkbox_key: str,
+    color_hex: str,
+    preview_axis_mode: str,
+    cap_y_min: float = 75.0,
+    cap_y_max: float = 110.0,
+    ce_y_min: float = 90.0,
+    ce_y_max: float = 100.5,
+) -> None:
+    """
+    Render a compact file-level preview card.
+
+    The card intentionally shows only the information needed for file selection:
+    the cycle plot, cycle life, initial CE, and average CE. Two cards can be
+    placed in one row by the caller.
+    """
+    rel = str(record["relative_path"])
+    file_stem = Path(rel).stem
+
+    # A bordered container keeps each file visually separated while preserving
+    # a compact two-column layout.
+    try:
+        card_ctx = st.container(border=True)
+    except TypeError:
+        card_ctx = st.container()
+
+    with card_ctx:
+        st.checkbox(
+            shorten_label(file_stem, 52),
+            key=checkbox_key,
+            help=rel,
+        )
+
+        if file_df is not None and not file_df.empty:
+            fig = make_single_file_capacity_preview_figure(
+                file_df=file_df,
+                title="",
+                color_hex=color_hex,
+                axis_mode=preview_axis_mode,
+                fixed_cap_y_min=cap_y_min,
+                fixed_cap_y_max=cap_y_max,
+                fixed_ce_y_min=ce_y_min,
+                fixed_ce_y_max=ce_y_max,
+                fig_width=4.75,
+                fig_height=2.75,
+            )
+            st.pyplot(fig, clear_figure=True)
+            plt.close(fig)
+
+            ordered = file_df.sort_values("cycle_index")
+            metric_cols = st.columns(3)
+            metric_cols[0].metric(
+                "Cycle life",
+                _fmt_num(ordered["cycle_index"].max()),
+            )
+            metric_cols[1].metric(
+                "Initial CE",
+                _fmt_num(ordered["coulombic_efficiency_percent"].iloc[0], "%"),
+            )
+            metric_cols[2].metric(
+                "Average CE",
+                _fmt_num(ordered["coulombic_efficiency_percent"].mean(), "%"),
+            )
+        else:
+            st.warning(error or "No valid preview data.")
+
+
 def render_cycling_analysis_page() -> None:
     st.title("Cycling Analysis")
     st.caption("Batch capacity retention and coulombic efficiency plotting.")
@@ -1202,15 +1742,15 @@ def render_cycling_analysis_page() -> None:
         )
 
         top_n_enabled = st.checkbox(
-            "Only plot top N files per sample",
+            "Only plot top N included files per sample",
             value=False,
-            help="Files are ranked by the sum of capacity retention.",
+            help="Applied after manual file selection. Files are ranked by the sum of capacity retention.",
         )
 
         top_n = st.number_input(
             "Top N files",
             min_value=1,
-            max_value=20,
+            max_value=50,
             value=3,
             step=1,
             disabled=not top_n_enabled,
@@ -1243,267 +1783,493 @@ def render_cycling_analysis_page() -> None:
 
     sample_names = [folder.name for folder in sample_folders]
     folder_map = {folder.name: folder for folder in sample_folders}
-
-    st.subheader("Customize and preview")
-    st.caption("The preview updates automatically when you change settings on the left.")
-
-    controls_col, preview_col = st.columns([1.0, 1.85], gap="large")
-
-    with controls_col:
-        st.markdown("### Samples")
-
-        selected_samples = st.multiselect(
-            "Samples to process",
-            options=sample_names,
-            default=sample_names,
-        )
-
-        if not selected_samples:
-            st.warning("Select at least one sample.")
-            return
-
-        preview_sample = st.selectbox(
-            "Preview sample",
-            options=selected_samples,
-            help="Only this sample is loaded for the real-data preview. The final processing step still processes all selected samples.",
-        )
-
-        preview_mode = st.radio(
-            "Preview data source",
-            ["Fast placeholder", "Real selected sample"],
-            index=0,
-            horizontal=True,
-            help=(
-                "Fast placeholder updates immediately and is best for layout/style. "
-                "Real selected sample reads Excel files and can be slower."
-            ),
-        )
-
-        st.markdown("### Plot text")
-
-        plot_title = st.text_input(
-            "Plot title",
-            value="{sample}",
-            help='Use "{sample}" to insert the sample folder name.',
-        )
-
-        x_label = st.text_input("X-axis label", value="Cycle Index")
-        cap_y_label = st.text_input("Left Y-axis label", value="Capacity Retention (%)")
-        ce_y_label = st.text_input("Right Y-axis label", value="Coulombic Efficiency (%)")
-
-        st.markdown("### Legend")
-
-        show_legend = st.checkbox("Show legend", value=True)
-
-        legend_position = st.selectbox(
-            "Legend position",
-            ["Top", "Right", "Inside", "Hide"],
-            index=0,
-            disabled=not show_legend,
-            help="Top is the default because it does not squeeze the plot horizontally.",
-        )
-
-        legend_title = st.text_input(
-            "Legend title",
-            value="Files",
-            disabled=not show_legend or legend_position == "Hide",
-        )
-
-        legend_label_max_len = st.slider(
-            "Max legend label length",
-            min_value=8,
-            max_value=60,
-            value=24,
-            step=1,
-            disabled=not show_legend or legend_position == "Hide",
-            help="Long file names are shortened only in the legend. Output CSV still keeps full source_file names.",
-        )
-
-        legend_columns = st.slider(
-            "Legend columns",
-            min_value=1,
-            max_value=6,
-            value=3,
-            step=1,
-            disabled=not show_legend or legend_position != "Top",
-        )
-
-        st.markdown("### Axis ranges")
-
-        auto_x_range = st.checkbox("Auto X-axis range", value=True)
-
-        x_min = st.number_input(
-            "X min",
-            value=0.0,
-            step=10.0,
-            disabled=auto_x_range,
-        )
-
-        x_max = st.number_input(
-            "X max",
-            value=500.0,
-            step=10.0,
-            disabled=auto_x_range,
-        )
-
-        cap_y_min = st.number_input("Capacity retention Y min", value=75.0, step=1.0)
-        cap_y_max = st.number_input("Capacity retention Y max", value=110.0, step=1.0)
-
-        ce_y_min = st.number_input("Coulombic efficiency Y min", value=90.0, step=0.5)
-        ce_y_max = st.number_input("Coulombic efficiency Y max", value=100.5, step=0.5)
-
-        st.markdown("### Style")
-
-        palette_name = st.selectbox(
-            "Default color palette",
-            [
-                "Set2 + Dark2 + tab20",
-                "Set2",
-                "Dark2",
-                "tab10",
-                "tab20",
-                "tab20 + tab20b",
-            ],
-            index=0,
-        )
-
-        default_colors = palette_to_hex_colors(palette_name, len(sample_names))
-        default_color_map = {
-            sample: default_colors[i]
-            for i, sample in enumerate(sample_names)
-        }
-
-        marker_size = st.slider(
-            "Marker size",
-            min_value=20,
-            max_value=200,
-            value=80,
-            step=5,
-        )
-
-        fig_width = st.number_input(
-            "Figure width",
-            min_value=4.0,
-            max_value=20.0,
-            value=9.5,
-            step=0.5,
-            help="The default is wider than before to leave room for axis labels and top legends.",
-        )
-
-        fig_height = st.number_input(
-            "Figure height",
-            min_value=3.0,
-            max_value=15.0,
-            value=5.8,
-            step=0.5,
-        )
-
-        dpi = st.number_input(
-            "Saved figure DPI",
-            min_value=72,
-            max_value=600,
-            value=300,
-            step=50,
-        )
-
-        st.markdown("### Sample colors")
-
-        sample_colors = {}
-        with st.expander("Edit sample colors", expanded=True):
-            for i, sample in enumerate(selected_samples, start=1):
-                sample_colors[sample] = st.color_picker(
-                    compact_widget_label("Color", i, sample),
-                    value=default_color_map[sample],
-                    key=f"cycling_color_{safe_filename(sample)}",
-                    help=f"Full sample name: {sample}",
-                )
-
-        run = st.button("Process and save all selected samples", type="primary")
+    default_colors = palette_to_hex_colors("Set2 + Dark2 + tab20", len(sample_names))
+    default_color_map = {sample: default_colors[i] for i, sample in enumerate(sample_names)}
 
     min_retention = float(min_capacity_retention) if use_retention_filter else None
     top_n_value = int(top_n) if top_n_enabled else None
 
-    with preview_col:
-        st.markdown("### Live preview")
+    st.subheader("Cycling workflow")
+    workflow_options = [
+        "1. Data preview & file selection",
+        "2. Style preview",
+        "3. Final output",
+    ]
+    if st.session_state.get("cycling_workflow_step") not in workflow_options:
+        st.session_state["cycling_workflow_step"] = workflow_options[0]
 
-        preview_is_placeholder = preview_mode == "Fast placeholder"
+    workflow_view = st.radio(
+        "Choose workflow step",
+        workflow_options,
+        horizontal=True,
+        key="cycling_workflow_step",
+        help="Review files sample-by-sample, tune figure style, then generate final outputs.",
+    )
 
-        if preview_is_placeholder:
-            preview_df = make_capacity_placeholder_plot_data(
-                sample_name=preview_sample,
-                n_files=int(top_n_value or 3),
-                max_cycle=int(x_max if not auto_x_range else 500),
+    selected_samples = st.multiselect(
+        "Samples to process",
+        options=sample_names,
+        default=sample_names,
+        help="Each selected sample will produce one final figure.",
+    )
+
+    if not selected_samples:
+        st.warning("Select at least one sample.")
+        return
+
+    manual_selection = st.checkbox(
+        "Manually choose files within each sample",
+        value=True,
+        help="When enabled, only checked Excel files are used in final plots.",
+    )
+
+    ensure_cycling_selection_store()
+
+    if st.session_state.get("cycling_inspect_sample") not in selected_samples:
+        st.session_state["cycling_inspect_sample"] = selected_samples[0]
+
+    # Initialize checkbox values once. If a saved selection exists for a sample,
+    # use it as the initial value; otherwise include every file until we learn a
+    # file is unreadable/invalid, in which case the preview step changes it to False.
+    for sample in selected_samples:
+        saved_for_sample = st.session_state["cycling_saved_selection"].get(sample, {})
+        for record in capacity_file_records(sample, folder_map[sample], root_dir):
+            rel = str(record["relative_path"])
+            key = cycling_file_include_key(sample, rel)
+            if key not in st.session_state:
+                st.session_state[key] = bool(saved_for_sample.get(rel, True))
+
+    # Defaults for plot styling. The widgets in Style preview write to these keys;
+    # Final output reads from the same keys, so output can be a separate step.
+    style_defaults = {
+        "cycling_plot_title": "{sample}",
+        "cycling_x_label": "Cycle Index",
+        "cycling_cap_y_label": "Capacity Retention (%)",
+        "cycling_ce_y_label": "Coulombic Efficiency (%)",
+        "cycling_show_legend": True,
+        "cycling_legend_position": "Top",
+        "cycling_legend_title": "Files",
+        "cycling_legend_label_max_len": 24,
+        "cycling_legend_columns": 3,
+        "cycling_auto_x_range": True,
+        "cycling_x_min": 0.0,
+        "cycling_x_max": 500.0,
+        "cycling_cap_y_min": 75.0,
+        "cycling_cap_y_max": 110.0,
+        "cycling_ce_y_min": 90.0,
+        "cycling_ce_y_max": 100.5,
+        "cycling_palette_name": "Set2 + Dark2 + tab20",
+        "cycling_marker_size": 80,
+        "cycling_fig_width": 9.5,
+        "cycling_fig_height": 5.8,
+        "cycling_dpi": 300,
+    }
+    for key, value in style_defaults.items():
+        st.session_state.setdefault(key, value)
+
+    def current_style_values() -> dict[str, object]:
+        return {
+            "plot_title": st.session_state.get("cycling_plot_title", "{sample}"),
+            "x_label": st.session_state.get("cycling_x_label", "Cycle Index"),
+            "cap_y_label": st.session_state.get("cycling_cap_y_label", "Capacity Retention (%)"),
+            "ce_y_label": st.session_state.get("cycling_ce_y_label", "Coulombic Efficiency (%)"),
+            "show_legend": bool(st.session_state.get("cycling_show_legend", True)),
+            "legend_position": st.session_state.get("cycling_legend_position", "Top"),
+            "legend_title": st.session_state.get("cycling_legend_title", "Files"),
+            "legend_label_max_len": int(st.session_state.get("cycling_legend_label_max_len", 24)),
+            "legend_columns": int(st.session_state.get("cycling_legend_columns", 3)),
+            "auto_x_range": bool(st.session_state.get("cycling_auto_x_range", True)),
+            "x_min": float(st.session_state.get("cycling_x_min", 0.0)),
+            "x_max": float(st.session_state.get("cycling_x_max", 500.0)),
+            "cap_y_min": float(st.session_state.get("cycling_cap_y_min", 75.0)),
+            "cap_y_max": float(st.session_state.get("cycling_cap_y_max", 110.0)),
+            "ce_y_min": float(st.session_state.get("cycling_ce_y_min", 90.0)),
+            "ce_y_max": float(st.session_state.get("cycling_ce_y_max", 100.5)),
+            "palette_name": st.session_state.get("cycling_palette_name", "Set2 + Dark2 + tab20"),
+            "marker_size": int(st.session_state.get("cycling_marker_size", 80)),
+            "fig_width": float(st.session_state.get("cycling_fig_width", 9.5)),
+            "fig_height": float(st.session_state.get("cycling_fig_height", 5.8)),
+            "dpi": int(st.session_state.get("cycling_dpi", 300)),
+        }
+
+    def current_sample_colors(style: dict[str, object]) -> dict[str, str]:
+        colors = palette_to_hex_colors(str(style["palette_name"]), len(sample_names))
+        palette_color_map = {sample: colors[i] for i, sample in enumerate(sample_names)}
+        return {
+            sample: st.session_state.get(
+                f"cycling_color_{safe_filename(sample)}",
+                palette_color_map[sample],
             )
-            preview_file_count = preview_df["source_file"].nunique()
-            st.caption(
-                "Using lightweight placeholder data for instant style preview. "
-                "Switch to **Real selected sample** when you want to inspect actual Excel data."
-            )
+            for sample in selected_samples
+        }
+
+    def selected_paths_for_output(sample: str) -> list[str] | None:
+        return selected_relative_paths_for_sample_saved_first(
+            sample,
+            folder_map[sample],
+            root_dir,
+            manual_selection=manual_selection,
+        )
+
+    if workflow_view == "1. Data preview & file selection":
+        st.markdown("### Data preview & file selection")
+        st.caption(
+            "Each Excel file is shown as its own cycling plot. Valid files are shown first; unreadable or unusable files are moved to the end and unchecked by default. Save the current sample to continue to the next sample."
+        )
+
+        inspect_sample = st.selectbox(
+            "Sample to inspect",
+            options=selected_samples,
+            key="cycling_inspect_sample",
+            help="Review this sample's files. After saving, the app moves to the next selected sample.",
+        )
+
+        file_records = capacity_file_records(inspect_sample, folder_map[inspect_sample], root_dir)
+        if not file_records:
+            st.warning(f"No Excel files found for sample `{inspect_sample}`.")
+            return
+
+        control_col1, control_col2, control_col3 = st.columns([1.0, 1.0, 2.2])
+        with control_col1:
+            if st.button("Select all valid", use_container_width=True):
+                for record in file_records:
+                    rel = str(record["relative_path"])
+                    key = cycling_file_include_key(inspect_sample, rel)
+                    file_df, _ = load_cached_capacity_file(
+                        file_path=record["path"],
+                        sample_name=inspect_sample,
+                        root_dir=root_dir,
+                        sheet_name=sheet_name,
+                        capacity_col=capacity_col,
+                        efficiency_col=efficiency_col,
+                        skip_initial_rows=int(skip_initial_rows),
+                        min_retention=min_retention,
+                    )
+                    st.session_state[key] = file_df is not None
+                save_selection_for_sample(inspect_sample, file_records)
+                st.rerun()
+        with control_col2:
+            if st.button("Clear all", use_container_width=True):
+                for record in file_records:
+                    st.session_state[cycling_file_include_key(inspect_sample, str(record["relative_path"]))] = False
+                save_selection_for_sample(inspect_sample, file_records)
+                st.rerun()
+        with control_col3:
+            st.caption(saved_selection_summary(inspect_sample, file_records))
+
+        preview_axis_mode = "Fixed common range"
+        preview_min_retention = min_retention
+
+        if use_retention_filter:
+            st.caption(f"Current retention cutoff: {float(min_capacity_retention):g}%. The same cutoff is applied to file previews, final sample plots, and exported CSV files.")
         else:
-            with st.spinner(f"Loading preview data for {preview_sample}..."):
-                preview_df, preview_file_count = load_capacity_sample_plot_data(
-                    sample_name=preview_sample,
-                    sample_dir=folder_map[preview_sample],
+            st.caption("Retention cutoff is disabled. File previews, final sample plots, and exported CSV files will keep all valid points.")
+
+        loaded_entries: list[tuple[dict[str, object], pd.DataFrame | None, str | None]] = []
+        with st.spinner(f"Reading individual files for {inspect_sample}..."):
+            for record in file_records:
+                rel = str(record["relative_path"])
+                key = cycling_file_include_key(inspect_sample, rel)
+                file_df, error = load_cached_capacity_file(
+                    file_path=record["path"],
+                    sample_name=inspect_sample,
                     root_dir=root_dir,
                     sheet_name=sheet_name,
                     capacity_col=capacity_col,
                     efficiency_col=efficiency_col,
                     skip_initial_rows=int(skip_initial_rows),
-                    min_retention=min_retention,
-                    top_n_value=top_n_value,
+                    min_retention=preview_min_retention,
+                )
+                # Invalid/unusable files are always moved to the end and unchecked
+                # before their checkbox is rendered.
+                if file_df is None:
+                    st.session_state[key] = False
+                loaded_entries.append((record, file_df, error))
+
+        valid_entries = [entry for entry in loaded_entries if entry[1] is not None]
+        invalid_entries = [entry for entry in loaded_entries if entry[1] is None]
+        display_entries = valid_entries + invalid_entries
+
+        selected_count = sum(
+            bool(st.session_state.get(cycling_file_include_key(inspect_sample, str(r[0]["relative_path"])), True))
+            for r in display_entries
+        )
+        st.info(
+            f"{selected_count} / {len(file_records)} files currently selected for `{inspect_sample}`. "
+            f"Valid: {len(valid_entries)}; unavailable: {len(invalid_entries)}."
+        )
+
+        st.markdown("#### File previews and checklist")
+        st.caption("Each card shows the filtered preview used for decision-making: cycle plot, cycle life, initial CE, and average CE. Unavailable files are listed last and unchecked.")
+
+        file_cols = st.columns(2)
+        for i, (record, file_df, row_error) in enumerate(display_entries):
+            rel = str(record["relative_path"])
+            key = cycling_file_include_key(inspect_sample, rel)
+            with file_cols[i % 2]:
+                render_file_preview_card(
+                    record=record,
+                    file_df=file_df,
+                    error=row_error,
+                    checkbox_key=key,
+                    color_hex=default_color_map[inspect_sample],
+                    preview_axis_mode=preview_axis_mode,
+                    cap_y_min=75,
+                    cap_y_max=110,
+                    ce_y_min=90,
+                    ce_y_max=100.5,
                 )
 
-        if preview_file_count == 0:
-            st.warning(f"No Excel files found for preview sample `{preview_sample}`.")
-        elif preview_df is None:
-            st.warning(f"No valid cycling data found for preview sample `{preview_sample}`.")
+        st.divider()
+        current_sample_index = selected_samples.index(inspect_sample)
+        if current_sample_index < len(selected_samples) - 1:
+            next_sample = selected_samples[current_sample_index + 1]
+            save_button_label = f"Save this sample and continue to {shorten_label(next_sample, 28)}"
+            save_help = "Save the current file selection and open the next selected sample for review."
         else:
-            preview_fig = make_capacity_figure(
-                plot_df=preview_df,
-                sample_name=preview_sample,
-                color_hex=sample_colors[preview_sample],
-                plot_title=plot_title,
-                x_label=x_label,
-                cap_y_label=cap_y_label,
-                ce_y_label=ce_y_label,
-                legend_title=legend_title,
-                show_legend=show_legend,
-                legend_position=legend_position,
-                legend_label_max_len=int(legend_label_max_len),
-                legend_columns=int(legend_columns),
-                auto_x_range=auto_x_range,
-                x_min=float(x_min),
-                x_max=float(x_max),
-                cap_y_min=float(cap_y_min),
-                cap_y_max=float(cap_y_max),
-                ce_y_min=float(ce_y_min),
-                ce_y_max=float(ce_y_max),
-                marker_size=int(marker_size),
-                fig_width=float(fig_width),
-                fig_height=float(fig_height),
+            save_button_label = "Save this sample and continue to style preview"
+            save_help = "Save the current file selection and move to figure style preview."
+
+        save_col1, save_col2 = st.columns([1.35, 2.2])
+        with save_col1:
+            st.button(
+                save_button_label,
+                type="primary",
+                use_container_width=True,
+                on_click=save_current_cycling_selection_and_advance,
+                args=(inspect_sample, selected_samples, folder_map, root_dir),
             )
-            st.pyplot(preview_fig, clear_figure=True)
-            plt.close(preview_fig)
+        with save_col2:
+            st.caption(save_help)
 
-            c1, c2, c3 = st.columns(3)
-            c1.metric("Preview files", preview_df["source_file"].nunique())
-            c2.metric("Preview points", len(preview_df))
-            c3.metric("Max cycle", _fmt_num(preview_df["cycle_index"].max()))
+        st.divider()
+        st.markdown("#### Selection overview for all selected samples")
+        overview_rows = []
+        for sample in selected_samples:
+            records = capacity_file_records(sample, folder_map[sample], root_dir)
+            saved = st.session_state["cycling_saved_selection"].get(sample)
+            if saved is not None:
+                selected = sum(bool(saved.get(str(r["relative_path"]), False)) for r in records)
+                status = "saved"
+            else:
+                selected = sum(
+                    bool(st.session_state.get(cycling_file_include_key(sample, str(r["relative_path"])), True))
+                    for r in records
+                )
+                status = "not saved yet"
+            overview_rows.append({
+                "sample": sample,
+                "selected_files": selected,
+                "total_files": len(records),
+                "status": status,
+            })
+        st.dataframe(pd.DataFrame(overview_rows), use_container_width=True)
+        return
 
-            if not preview_is_placeholder:
-                with st.expander("Preview plotting data"):
-                    st.dataframe(preview_df, use_container_width=True)
+    if workflow_view == "2. Style preview":
+        st.markdown("### Style preview")
+        st.caption("Tune figure labels, axes, colors, and legend placement. This preview uses real selected files after the retention cutoff, but it does not write final outputs yet.")
+
+        unsaved_samples = [
+            sample for sample in selected_samples
+            if sample not in st.session_state.get("cycling_saved_selection", {})
+        ]
+        if unsaved_samples:
+            st.warning(
+                "Some selected samples have not been explicitly saved yet: "
+                + ", ".join(shorten_label(s, 28) for s in unsaved_samples)
+                + ". Go back to Data preview & file selection if you want to review them before output."
+            )
+
+        controls_col, preview_col = st.columns([1.0, 1.85], gap="large")
+
+        with controls_col:
+            with st.expander("Preview", expanded=True):
+                preview_sample = st.selectbox(
+                    "Preview sample",
+                    options=selected_samples,
+                    key="cycling_preview_sample",
+                    help="This preview always uses real selected files. Final output still processes all selected samples.",
+                )
+
+            with st.expander("Plot text", expanded=True):
+                st.text_input(
+                    "Plot title",
+                    key="cycling_plot_title",
+                    help='Use "{sample}" to insert the sample folder name.',
+                )
+                st.text_input("X-axis label", key="cycling_x_label")
+                st.text_input("Left Y-axis label", key="cycling_cap_y_label")
+                st.text_input("Right Y-axis label", key="cycling_ce_y_label")
+
+            with st.expander("Legend", expanded=True):
+                st.checkbox("Show legend", key="cycling_show_legend")
+                show_legend = bool(st.session_state.get("cycling_show_legend", True))
+                legend_position = st.selectbox(
+                    "Legend position",
+                    ["Top", "Right", "Inside", "Hide"],
+                    key="cycling_legend_position",
+                    disabled=not show_legend,
+                    help="Top is usually safest for long labels.",
+                )
+                st.text_input("Legend title", key="cycling_legend_title", disabled=not show_legend)
+                st.slider(
+                    "Max legend label length",
+                    min_value=8,
+                    max_value=80,
+                    key="cycling_legend_label_max_len",
+                    step=1,
+                    disabled=not show_legend,
+                )
+                st.slider(
+                    "Top legend columns",
+                    min_value=1,
+                    max_value=6,
+                    key="cycling_legend_columns",
+                    step=1,
+                    disabled=(not show_legend or legend_position != "Top"),
+                )
+
+            with st.expander("Axis ranges", expanded=False):
+                st.checkbox("Auto X-axis range", key="cycling_auto_x_range")
+                auto_x_range = bool(st.session_state.get("cycling_auto_x_range", True))
+                st.number_input("X min", step=10.0, key="cycling_x_min", disabled=auto_x_range)
+                st.number_input("X max", step=10.0, key="cycling_x_max", disabled=auto_x_range)
+                st.number_input("Capacity retention Y min", step=1.0, key="cycling_cap_y_min")
+                st.number_input("Capacity retention Y max", step=1.0, key="cycling_cap_y_max")
+                st.number_input("Coulombic efficiency Y min", step=0.5, key="cycling_ce_y_min")
+                st.number_input("Coulombic efficiency Y max", step=0.5, key="cycling_ce_y_max")
+
+            with st.expander("Style", expanded=False):
+                st.selectbox(
+                    "Default color palette",
+                    ["Set2 + Dark2 + tab20", "Set2", "Dark2", "tab10", "tab20", "tab20 + tab20b"],
+                    key="cycling_palette_name",
+                )
+                st.slider("Marker size", min_value=20, max_value=200, key="cycling_marker_size", step=5)
+                st.number_input("Figure width", min_value=4.0, max_value=20.0, key="cycling_fig_width", step=0.5)
+                st.number_input("Figure height", min_value=3.0, max_value=15.0, key="cycling_fig_height", step=0.5)
+                st.number_input("Saved figure DPI", min_value=72, max_value=600, key="cycling_dpi", step=50)
+
+            style = current_style_values()
+            with st.expander("Sample colors", expanded=False):
+                colors = palette_to_hex_colors(str(style["palette_name"]), len(sample_names))
+                palette_color_map = {sample: colors[i] for i, sample in enumerate(sample_names)}
+                for i, sample in enumerate(selected_samples, start=1):
+                    st.color_picker(
+                        compact_widget_label("Color", i, sample),
+                        value=st.session_state.get(f"cycling_color_{safe_filename(sample)}", palette_color_map[sample]),
+                        key=f"cycling_color_{safe_filename(sample)}",
+                        help=f"Full sample name: {sample}",
+                    )
+
+            st.button(
+                "Continue to final output",
+                type="primary",
+                use_container_width=True,
+                on_click=set_cycling_workflow_step,
+                args=("3. Final output",),
+            )
+
+        with preview_col:
+            st.markdown("### Live style preview")
+            style = current_style_values()
+            sample_colors = current_sample_colors(style)
+            selected_preview_paths = selected_paths_for_output(preview_sample)
+
+            if selected_preview_paths is not None and len(selected_preview_paths) == 0:
+                preview_df, preview_file_count = None, 0
+            else:
+                with st.spinner(f"Loading selected preview files for {preview_sample}..."):
+                    preview_df, preview_file_count = load_capacity_sample_plot_data(
+                        sample_name=preview_sample,
+                        sample_dir=folder_map[preview_sample],
+                        root_dir=root_dir,
+                        sheet_name=sheet_name,
+                        capacity_col=capacity_col,
+                        efficiency_col=efficiency_col,
+                        skip_initial_rows=int(skip_initial_rows),
+                        min_retention=min_retention,
+                        top_n_value=top_n_value,
+                        selected_relative_paths=selected_preview_paths,
+                    )
+
+            if preview_file_count == 0:
+                st.warning(f"No selected Excel files found for preview sample `{preview_sample}`.")
+            elif preview_df is None:
+                st.warning(f"No valid cycling data found for preview sample `{preview_sample}`.")
+            else:
+                preview_fig = make_capacity_figure(
+                    plot_df=preview_df,
+                    sample_name=preview_sample,
+                    color_hex=sample_colors[preview_sample],
+                    plot_title=str(style["plot_title"]),
+                    x_label=str(style["x_label"]),
+                    cap_y_label=str(style["cap_y_label"]),
+                    ce_y_label=str(style["ce_y_label"]),
+                    legend_title=str(style["legend_title"]),
+                    show_legend=bool(style["show_legend"]),
+                    legend_position=str(style["legend_position"]),
+                    legend_label_max_len=int(style["legend_label_max_len"]),
+                    legend_columns=int(style["legend_columns"]),
+                    auto_x_range=bool(style["auto_x_range"]),
+                    x_min=float(style["x_min"]),
+                    x_max=float(style["x_max"]),
+                    cap_y_min=float(style["cap_y_min"]),
+                    cap_y_max=float(style["cap_y_max"]),
+                    ce_y_min=float(style["ce_y_min"]),
+                    ce_y_max=float(style["ce_y_max"]),
+                    marker_size=int(style["marker_size"]),
+                    fig_width=float(style["fig_width"]),
+                    fig_height=float(style["fig_height"]),
+                )
+                st.pyplot(preview_fig, clear_figure=True)
+                plt.close(preview_fig)
+
+                c1, c2, c3 = st.columns(3)
+                c1.metric("Preview files", preview_df["relative_path"].nunique() if "relative_path" in preview_df else preview_df["source_file"].nunique())
+                c2.metric("Preview points", len(preview_df))
+                c3.metric("Max cycle", _fmt_num(preview_df["cycle_index"].max()))
+        return
+
+    # Final output step
+    st.markdown("### Final output")
+    st.caption("Generate, save, preview, and download the final selected sample plots. Output figures are shown two per row for a compact review.")
+
+    style = current_style_values()
+    sample_colors = current_sample_colors(style)
+
+    unsaved_samples = [
+        sample for sample in selected_samples
+        if sample not in st.session_state.get("cycling_saved_selection", {})
+    ]
+    if unsaved_samples:
+        st.warning(
+            "Some selected samples have not been explicitly saved yet: "
+            + ", ".join(shorten_label(s, 28) for s in unsaved_samples)
+            + ". If this is not intentional, go back to Data preview & file selection before generating outputs."
+        )
+
+    c_back, c_generate = st.columns([1, 1.3])
+    with c_back:
+        st.button(
+            "Back to style preview",
+            use_container_width=True,
+            on_click=set_cycling_workflow_step,
+            args=("2. Style preview",),
+        )
+    with c_generate:
+        run = st.button("Generate and save final outputs", type="primary", use_container_width=True)
 
     if not run:
-        st.info(
-            "Preview changes live. Use **Fast placeholder** for layout/style, then click "
-            "**Process and save all selected samples** when the figure style looks right."
-        )
+        st.info("Click **Generate and save final outputs** when the style preview looks correct.")
         return
 
     output_dir.mkdir(parents=True, exist_ok=True)
 
     summary_rows = []
+    selection_rows = []
+    rendered_outputs: list[dict[str, object]] = []
     zip_buffer = io.BytesIO()
 
     progress = st.progress(0)
@@ -1512,6 +2278,21 @@ def render_cycling_analysis_page() -> None:
     with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zipf:
         for idx, sample_name in enumerate(selected_samples, start=1):
             status.write(f"Processing {sample_name} ({idx}/{len(selected_samples)})...")
+
+            selected_paths = selected_paths_for_output(sample_name)
+            selected_paths_set = set(selected_paths) if selected_paths is not None else None
+
+            for record in capacity_file_records(sample_name, folder_map[sample_name], root_dir):
+                rel = str(record["relative_path"])
+                included = selected_paths_set is None or rel in selected_paths_set
+                selection_rows.append(
+                    {
+                        "sample": sample_name,
+                        "source_file": record["source_file"],
+                        "relative_path": rel,
+                        "included": included,
+                    }
+                )
 
             plot_df, excel_file_count = load_capacity_sample_plot_data(
                 sample_name=sample_name,
@@ -1523,6 +2304,7 @@ def render_cycling_analysis_page() -> None:
                 skip_initial_rows=int(skip_initial_rows),
                 min_retention=min_retention,
                 top_n_value=top_n_value,
+                selected_relative_paths=selected_paths,
             )
 
             if excel_file_count == 0:
@@ -1531,7 +2313,7 @@ def render_cycling_analysis_page() -> None:
                 continue
 
             if plot_df is None:
-                st.warning(f"No valid cycling data found for sample `{sample_name}`.")
+                st.warning(f"No valid selected cycling data found for sample `{sample_name}`.")
                 progress.progress(idx / len(selected_samples))
                 continue
 
@@ -1548,31 +2330,31 @@ def render_cycling_analysis_page() -> None:
                 plot_df=plot_df,
                 sample_name=sample_name,
                 color_hex=sample_colors[sample_name],
-                plot_title=plot_title,
-                x_label=x_label,
-                cap_y_label=cap_y_label,
-                ce_y_label=ce_y_label,
-                legend_title=legend_title,
-                show_legend=show_legend,
-                legend_position=legend_position,
-                legend_label_max_len=int(legend_label_max_len),
-                legend_columns=int(legend_columns),
-                auto_x_range=auto_x_range,
-                x_min=float(x_min),
-                x_max=float(x_max),
-                cap_y_min=float(cap_y_min),
-                cap_y_max=float(cap_y_max),
-                ce_y_min=float(ce_y_min),
-                ce_y_max=float(ce_y_max),
-                marker_size=int(marker_size),
-                fig_width=float(fig_width),
-                fig_height=float(fig_height),
+                plot_title=str(style["plot_title"]),
+                x_label=str(style["x_label"]),
+                cap_y_label=str(style["cap_y_label"]),
+                ce_y_label=str(style["ce_y_label"]),
+                legend_title=str(style["legend_title"]),
+                show_legend=bool(style["show_legend"]),
+                legend_position=str(style["legend_position"]),
+                legend_label_max_len=int(style["legend_label_max_len"]),
+                legend_columns=int(style["legend_columns"]),
+                auto_x_range=bool(style["auto_x_range"]),
+                x_min=float(style["x_min"]),
+                x_max=float(style["x_max"]),
+                cap_y_min=float(style["cap_y_min"]),
+                cap_y_max=float(style["cap_y_max"]),
+                ce_y_min=float(style["ce_y_min"]),
+                ce_y_max=float(style["ce_y_max"]),
+                marker_size=int(style["marker_size"]),
+                fig_width=float(style["fig_width"]),
+                fig_height=float(style["fig_height"]),
             )
 
-            fig.savefig(png_path, dpi=int(dpi), bbox_inches="tight")
+            fig.savefig(png_path, dpi=int(style["dpi"]), bbox_inches="tight")
 
             png_buffer = io.BytesIO()
-            fig.savefig(png_buffer, format="png", dpi=int(dpi), bbox_inches="tight")
+            fig.savefig(png_buffer, format="png", dpi=int(style["dpi"]), bbox_inches="tight")
             png_buffer.seek(0)
 
             csv_bytes = plot_df.to_csv(index=False).encode("utf-8")
@@ -1580,37 +2362,26 @@ def render_cycling_analysis_page() -> None:
             zipf.writestr(f"{safe_name}/{safe_name}_plot_data.csv", csv_bytes)
             zipf.writestr(f"{safe_name}/{safe_name}_capacity_summary.png", png_buffer.getvalue())
 
-            st.markdown(f"## {sample_name}")
-            st.pyplot(fig, clear_figure=True)
-
-            c1, c2 = st.columns(2)
-
-            with c1:
-                st.download_button(
-                    f"Download {shorten_label(sample_name, 28)} CSV",
-                    data=csv_bytes,
-                    file_name=f"{safe_name}_plot_data.csv",
-                    mime="text/csv",
-                )
-
-            with c2:
-                st.download_button(
-                    f"Download {shorten_label(sample_name, 28)} PNG",
-                    data=png_buffer.getvalue(),
-                    file_name=f"{safe_name}_capacity_summary.png",
-                    mime="image/png",
-                )
-
-            with st.expander(f"Preview plotting data: {shorten_label(sample_name, 40)}"):
-                st.dataframe(plot_df, use_container_width=True)
-
-            plt.close(fig)
+            rendered_outputs.append(
+                {
+                    "sample": sample_name,
+                    "figure": fig,
+                    "csv_bytes": csv_bytes,
+                    "png_bytes": png_buffer.getvalue(),
+                    "csv_file_name": f"{safe_name}_plot_data.csv",
+                    "png_file_name": f"{safe_name}_capacity_summary.png",
+                    "plot_df": plot_df,
+                    "csv_path": str(csv_path),
+                    "png_path": str(png_path),
+                    "files_plotted": plot_df["relative_path"].nunique() if "relative_path" in plot_df else plot_df["source_file"].nunique(),
+                }
+            )
 
             summary_rows.append(
                 {
                     "sample": sample_name,
                     "files_found": excel_file_count,
-                    "files_plotted": plot_df["source_file"].nunique(),
+                    "files_plotted": rendered_outputs[-1]["files_plotted"],
                     "points_plotted": len(plot_df),
                     "color": sample_colors[sample_name],
                     "csv_path": str(csv_path),
@@ -1619,6 +2390,10 @@ def render_cycling_analysis_page() -> None:
             )
 
             progress.progress(idx / len(selected_samples))
+
+        if selection_rows:
+            selection_df_for_zip = pd.DataFrame(selection_rows)
+            zipf.writestr("capacity_file_selection.csv", selection_df_for_zip.to_csv(index=False).encode("utf-8"))
 
     status.empty()
     progress.empty()
@@ -1631,20 +2406,57 @@ def render_cycling_analysis_page() -> None:
     summary_path = output_dir / "capacity_batch_summary.csv"
     summary_df.to_csv(summary_path, index=False)
 
+    if selection_rows:
+        selection_df = pd.DataFrame(selection_rows)
+        selection_path = output_dir / "capacity_file_selection.csv"
+        selection_df.to_csv(selection_path, index=False)
+
     st.success(f"Batch cycling analysis completed. Results saved to: `{output_dir}`")
+
+    st.subheader("Final figures")
+    output_cols = st.columns(2)
+    for i, item in enumerate(rendered_outputs):
+        with output_cols[i % 2]:
+            st.markdown(f"#### {item['sample']}")
+            st.pyplot(item["figure"], clear_figure=True)
+
+            d1, d2 = st.columns(2)
+            with d1:
+                st.download_button(
+                    f"CSV",
+                    data=item["csv_bytes"],
+                    file_name=item["csv_file_name"],
+                    mime="text/csv",
+                    key=f"download_csv_{safe_filename(str(item['sample']))}",
+                )
+            with d2:
+                st.download_button(
+                    f"PNG",
+                    data=item["png_bytes"],
+                    file_name=item["png_file_name"],
+                    mime="image/png",
+                    key=f"download_png_{safe_filename(str(item['sample']))}",
+                )
+
+            with st.expander("Data table"):
+                st.dataframe(item["plot_df"], use_container_width=True)
+
+            plt.close(item["figure"])
 
     st.subheader("Summary")
     st.dataframe(summary_df, use_container_width=True)
 
-    zip_buffer.seek(0)
+    if selection_rows:
+        with st.expander("File selection record"):
+            st.dataframe(pd.DataFrame(selection_rows), use_container_width=True)
 
+    zip_buffer.seek(0)
     st.download_button(
         "Download all cycling results ZIP",
         data=zip_buffer.getvalue(),
         file_name="capacity_batch_results.zip",
         mime="application/zip",
     )
-
 
 def render_placeholder_page(title: str) -> None:
     st.title(title)
