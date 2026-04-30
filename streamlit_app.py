@@ -619,6 +619,27 @@ def safe_filename(name: str) -> str:
     return name.strip("_") or "sample"
 
 
+def shorten_label(text: str, max_len: int = 24) -> str:
+    """
+    Shorten long file/sample labels so legends and widgets do not squeeze plots.
+    """
+    text = str(text)
+    max_len = int(max_len)
+
+    if max_len <= 3 or len(text) <= max_len:
+        return text
+
+    keep_left = max(6, int(max_len * 0.62))
+    keep_right = max(3, max_len - keep_left - 3)
+
+    return f"{text[:keep_left]}...{text[-keep_right:]}"
+
+
+def compact_widget_label(prefix: str, index: int, full_name: str, max_len: int = 28) -> str:
+    """Create a short Streamlit widget label while keeping the full name in help text."""
+    return f"{prefix} {index}: {shorten_label(full_name, max_len=max_len)}"
+
+
 def find_capacity_sample_folders(root_dir: Path, output_dir: Path | None = None) -> list[Path]:
     """
     Treat each direct subfolder under root_dir as one sample.
@@ -771,6 +792,63 @@ def read_one_capacity_file(
     return out
 
 
+def load_capacity_sample_plot_data(
+    sample_name: str,
+    sample_dir: Path,
+    root_dir: Path,
+    sheet_name: str,
+    capacity_col: str,
+    efficiency_col: str,
+    skip_initial_rows: int,
+    min_retention: float | None,
+    top_n_value: int | None,
+) -> tuple[pd.DataFrame | None, int]:
+    """
+    Load and optionally filter all Excel cycling files for one sample.
+    Returns (plot_df, number_of_excel_files_found).
+    """
+    excel_files = find_capacity_excel_files(sample_dir)
+
+    if not excel_files:
+        return None, 0
+
+    sample_dfs = []
+
+    for file_path in excel_files:
+        one_df = read_one_capacity_file(
+            file_path=file_path,
+            sample_name=sample_name,
+            root_dir=root_dir,
+            sheet_name=sheet_name,
+            capacity_col=capacity_col,
+            efficiency_col=efficiency_col,
+            skip_initial_rows=int(skip_initial_rows),
+            min_capacity_retention=min_retention,
+        )
+
+        if one_df is not None:
+            sample_dfs.append(one_df)
+
+    if not sample_dfs:
+        return None, len(excel_files)
+
+    plot_df = pd.concat(sample_dfs, ignore_index=True)
+
+    if top_n_value is not None:
+        scores = (
+            plot_df.groupby("source_file")["capacity_retention_percent"]
+            .sum()
+            .sort_values(ascending=False)
+        )
+        keep_files = scores.head(top_n_value).index
+        plot_df = plot_df[plot_df["source_file"].isin(keep_files)].copy()
+
+    if plot_df.empty:
+        return None, len(excel_files)
+
+    return plot_df, len(excel_files)
+
+
 def capacity_auto_x_limit(max_cycle: float) -> int:
     """
     Choose a clean x-axis upper limit.
@@ -824,6 +902,51 @@ def hex_to_rgb_tuple(hex_color: str) -> tuple[float, float, float]:
     return tuple(int(hex_color[i:i + 2], 16) / 255 for i in (0, 2, 4))
 
 
+
+def make_capacity_placeholder_plot_data(
+    sample_name: str,
+    n_files: int = 3,
+    max_cycle: int = 500,
+) -> pd.DataFrame:
+    """
+    Create lightweight placeholder cycling data for style preview.
+
+    This avoids repeatedly reading Excel files while the user is only adjusting
+    labels, legend placement, axis ranges, figure size, or colors.
+    """
+    cycles = np.arange(0, int(max_cycle) + 1)
+    rows = []
+
+    # Long file names are intentional: they make legend spacing problems visible
+    # even before real Excel data are loaded.
+    for i in range(1, int(n_files) + 1):
+        decay = 0.018 + 0.006 * i
+        ripple = 0.9 * np.sin(cycles / 34.0 + i)
+        retention = 100.0 - decay * cycles + ripple
+        efficiency = 99.35 + 0.35 * (1 - np.exp(-cycles / 55.0)) + 0.05 * np.sin(cycles / 17.0 + i)
+
+        source_file = (
+            f"{sample_name}_placeholder_long_filename_cell_{i:02d}_"
+            f"capacity_retention_and_CE_preview.xlsx"
+        )
+
+        rows.append(
+            pd.DataFrame(
+                {
+                    "sample": sample_name,
+                    "source_file": source_file,
+                    "relative_path": source_file,
+                    "cycle_index": cycles,
+                    "discharge_capacity_mAh": retention,
+                    "capacity_retention_percent": retention,
+                    "coulombic_efficiency_percent": efficiency,
+                }
+            )
+        )
+
+    return pd.concat(rows, ignore_index=True)
+
+
 def make_capacity_figure(
     plot_df: pd.DataFrame,
     sample_name: str,
@@ -844,9 +967,17 @@ def make_capacity_figure(
     marker_size: int,
     fig_width: float,
     fig_height: float,
+    legend_position: str = "Top",
+    legend_label_max_len: int = 24,
+    legend_columns: int = 3,
 ):
     """
     Make one capacity-retention / coulombic-efficiency plot for one sample.
+
+    Layout notes:
+    - Top legend uses a figure-level legend and reserves a dedicated top band.
+    - Right legend uses a figure-level legend and reserves a dedicated right band.
+    - This avoids overlap with the title and the right y-axis.
     """
     plt.rcParams["font.family"] = "sans-serif"
     plt.rcParams["font.sans-serif"] = ["Arial", "Helvetica", "DejaVu Sans"]
@@ -859,7 +990,8 @@ def make_capacity_figure(
 
     for source_file, group in plot_df.groupby("source_file", sort=True):
         group = group.sort_values("cycle_index")
-        file_label = Path(source_file).stem
+        full_label = Path(source_file).stem
+        file_label = shorten_label(full_label, legend_label_max_len)
 
         ax1.scatter(
             group["cycle_index"],
@@ -897,11 +1029,11 @@ def make_capacity_figure(
 
     title = plot_title.replace("{sample}", sample_name)
     if title.strip():
-        ax1.set_title(title, fontsize=18, pad=12)
+        ax1.set_title(title, fontsize=18, pad=14)
 
-    ax1.set_xlabel(x_label, fontsize=18)
-    ax1.set_ylabel(cap_y_label, fontsize=18)
-    ax2.set_ylabel(ce_y_label, fontsize=18)
+    ax1.set_xlabel(x_label, fontsize=18, labelpad=8)
+    ax1.set_ylabel(cap_y_label, fontsize=18, labelpad=8)
+    ax2.set_ylabel(ce_y_label, fontsize=18, labelpad=12)
 
     for ax in [ax1, ax2]:
         ax.tick_params(
@@ -911,6 +1043,7 @@ def make_capacity_figure(
             labelsize=15,
             length=6,
             width=1.5,
+            pad=6,
         )
         ax.tick_params(
             axis="both",
@@ -927,17 +1060,72 @@ def make_capacity_figure(
     ax1.yaxis.set_minor_locator(AutoMinorLocator(5))
     ax2.yaxis.set_minor_locator(AutoMinorLocator(2))
 
-    if show_legend:
-        ax1.legend(
-            loc="center left",
-            bbox_to_anchor=(1.12, 0.5),
+    legend_position = legend_position if show_legend else "Hide"
+
+    handles, labels = ax1.get_legend_handles_labels()
+    n_labels = max(1, len(labels))
+    ncol = max(1, min(int(legend_columns), n_labels))
+    legend_rows = int(np.ceil(n_labels / ncol))
+
+    # Avoid tight_layout here. It often cannot correctly reserve space for a
+    # figure-level legend together with a twinx right y-axis.
+    if legend_position == "Top":
+        title_space = 0.08 if title.strip() else 0.0
+        legend_space = min(0.22, 0.075 + 0.045 * legend_rows)
+        top = max(0.58, 1.0 - title_space - legend_space - 0.02)
+        fig.subplots_adjust(left=0.11, right=0.88, bottom=0.14, top=top)
+
+        # Put title inside the axes area and legend above it. This creates a
+        # predictable separation between the two.
+        fig.legend(
+            handles,
+            labels,
+            loc="upper center",
+            bbox_to_anchor=(0.5, 0.985),
+            ncol=ncol,
             title=legend_title,
-            fontsize=11,
-            title_fontsize=13,
+            fontsize=10,
+            title_fontsize=12,
+            frameon=False,
+            handletextpad=0.4,
+            columnspacing=1.0,
+            borderaxespad=0.0,
+        )
+
+    elif legend_position == "Right":
+        # Reserve a wider right band so the right y-axis label/ticks and legend
+        # do not compete for the same physical space.
+        fig.subplots_adjust(left=0.11, right=0.68, bottom=0.14, top=0.90)
+
+        fig.legend(
+            handles,
+            labels,
+            loc="center right",
+            bbox_to_anchor=(0.985, 0.53),
+            ncol=1,
+            title=legend_title,
+            fontsize=10,
+            title_fontsize=12,
+            frameon=False,
+            handletextpad=0.4,
+            borderaxespad=0.0,
+        )
+
+    elif legend_position == "Inside":
+        fig.subplots_adjust(left=0.11, right=0.88, bottom=0.14, top=0.88)
+        ax1.legend(
+            handles,
+            labels,
+            loc="best",
+            title=legend_title,
+            fontsize=10,
+            title_fontsize=12,
             frameon=False,
         )
 
-    fig.tight_layout()
+    else:
+        fig.subplots_adjust(left=0.11, right=0.88, bottom=0.14, top=0.90)
+
     return fig
 
 
@@ -1028,97 +1216,6 @@ def render_cycling_analysis_page() -> None:
             disabled=not top_n_enabled,
         )
 
-        st.header("Plot text")
-
-        plot_title = st.text_input(
-            "Plot title",
-            value="{sample}",
-            help='Use "{sample}" to insert the sample folder name.',
-        )
-
-        x_label = st.text_input("X-axis label", value="Cycle Index")
-        cap_y_label = st.text_input("Left Y-axis label", value="Capacity Retention (%)")
-        ce_y_label = st.text_input("Right Y-axis label", value="Coulombic Efficiency (%)")
-
-        show_legend = st.checkbox("Show legend", value=True)
-
-        legend_title = st.text_input(
-            "Legend title",
-            value="Files",
-            disabled=not show_legend,
-        )
-
-        st.header("Axis ranges")
-
-        auto_x_range = st.checkbox("Auto X-axis range", value=True)
-
-        x_min = st.number_input(
-            "X min",
-            value=0.0,
-            step=10.0,
-            disabled=auto_x_range,
-        )
-
-        x_max = st.number_input(
-            "X max",
-            value=500.0,
-            step=10.0,
-            disabled=auto_x_range,
-        )
-
-        cap_y_min = st.number_input("Capacity retention Y min", value=75.0, step=1.0)
-        cap_y_max = st.number_input("Capacity retention Y max", value=110.0, step=1.0)
-
-        ce_y_min = st.number_input("Coulombic efficiency Y min", value=90.0, step=0.5)
-        ce_y_max = st.number_input("Coulombic efficiency Y max", value=100.5, step=0.5)
-
-        st.header("Style")
-
-        palette_name = st.selectbox(
-            "Default color palette",
-            [
-                "Set2 + Dark2 + tab20",
-                "Set2",
-                "Dark2",
-                "tab10",
-                "tab20",
-                "tab20 + tab20b",
-            ],
-            index=0,
-        )
-
-        marker_size = st.slider(
-            "Marker size",
-            min_value=20,
-            max_value=200,
-            value=80,
-            step=5,
-        )
-
-        fig_width = st.number_input(
-            "Figure width",
-            min_value=4.0,
-            max_value=20.0,
-            value=8.5,
-            step=0.5,
-        )
-
-        fig_height = st.number_input(
-            "Figure height",
-            min_value=3.0,
-            max_value=15.0,
-            value=5.8,
-            step=0.5,
-        )
-
-        dpi = st.number_input(
-            "Saved figure DPI",
-            min_value=72,
-            max_value=600,
-            value=300,
-            step=50,
-        )
-
     if not root_dir_str.strip():
         st.info("Enter a root data directory to start.")
         return
@@ -1145,53 +1242,266 @@ def render_cycling_analysis_page() -> None:
         return
 
     sample_names = [folder.name for folder in sample_folders]
-    default_colors = palette_to_hex_colors(palette_name, len(sample_names))
+    folder_map = {folder.name: folder for folder in sample_folders}
 
-    default_color_map = {
-        sample: default_colors[i]
-        for i, sample in enumerate(sample_names)
-    }
+    st.subheader("Customize and preview")
+    st.caption("The preview updates automatically when you change settings on the left.")
 
-    st.subheader("Detected samples")
+    controls_col, preview_col = st.columns([1.0, 1.85], gap="large")
 
-    selected_samples = st.multiselect(
-        "Samples to process",
-        options=sample_names,
-        default=sample_names,
-    )
+    with controls_col:
+        st.markdown("### Samples")
 
-    if not selected_samples:
-        st.warning("Select at least one sample.")
-        return
+        selected_samples = st.multiselect(
+            "Samples to process",
+            options=sample_names,
+            default=sample_names,
+        )
 
-    st.markdown("### Sample colors")
+        if not selected_samples:
+            st.warning("Select at least one sample.")
+            return
 
-    sample_colors = {}
-    color_columns = st.columns(min(4, len(selected_samples)))
+        preview_sample = st.selectbox(
+            "Preview sample",
+            options=selected_samples,
+            help="Only this sample is loaded for the real-data preview. The final processing step still processes all selected samples.",
+        )
 
-    for i, sample in enumerate(selected_samples):
-        with color_columns[i % len(color_columns)]:
-            sample_colors[sample] = st.color_picker(
-                sample,
-                value=default_color_map[sample],
-                key=f"cycling_color_{sample}",
-            )
+        preview_mode = st.radio(
+            "Preview data source",
+            ["Fast placeholder", "Real selected sample"],
+            index=0,
+            horizontal=True,
+            help=(
+                "Fast placeholder updates immediately and is best for layout/style. "
+                "Real selected sample reads Excel files and can be slower."
+            ),
+        )
 
-    run = st.button("Process cycling data", type="primary")
+        st.markdown("### Plot text")
 
-    if not run:
-        return
+        plot_title = st.text_input(
+            "Plot title",
+            value="{sample}",
+            help='Use "{sample}" to insert the sample folder name.',
+        )
 
-    output_dir.mkdir(parents=True, exist_ok=True)
+        x_label = st.text_input("X-axis label", value="Cycle Index")
+        cap_y_label = st.text_input("Left Y-axis label", value="Capacity Retention (%)")
+        ce_y_label = st.text_input("Right Y-axis label", value="Coulombic Efficiency (%)")
 
-    selected_folder_map = {
-        folder.name: folder
-        for folder in sample_folders
-        if folder.name in selected_samples
-    }
+        st.markdown("### Legend")
+
+        show_legend = st.checkbox("Show legend", value=True)
+
+        legend_position = st.selectbox(
+            "Legend position",
+            ["Top", "Right", "Inside", "Hide"],
+            index=0,
+            disabled=not show_legend,
+            help="Top is the default because it does not squeeze the plot horizontally.",
+        )
+
+        legend_title = st.text_input(
+            "Legend title",
+            value="Files",
+            disabled=not show_legend or legend_position == "Hide",
+        )
+
+        legend_label_max_len = st.slider(
+            "Max legend label length",
+            min_value=8,
+            max_value=60,
+            value=24,
+            step=1,
+            disabled=not show_legend or legend_position == "Hide",
+            help="Long file names are shortened only in the legend. Output CSV still keeps full source_file names.",
+        )
+
+        legend_columns = st.slider(
+            "Legend columns",
+            min_value=1,
+            max_value=6,
+            value=3,
+            step=1,
+            disabled=not show_legend or legend_position != "Top",
+        )
+
+        st.markdown("### Axis ranges")
+
+        auto_x_range = st.checkbox("Auto X-axis range", value=True)
+
+        x_min = st.number_input(
+            "X min",
+            value=0.0,
+            step=10.0,
+            disabled=auto_x_range,
+        )
+
+        x_max = st.number_input(
+            "X max",
+            value=500.0,
+            step=10.0,
+            disabled=auto_x_range,
+        )
+
+        cap_y_min = st.number_input("Capacity retention Y min", value=75.0, step=1.0)
+        cap_y_max = st.number_input("Capacity retention Y max", value=110.0, step=1.0)
+
+        ce_y_min = st.number_input("Coulombic efficiency Y min", value=90.0, step=0.5)
+        ce_y_max = st.number_input("Coulombic efficiency Y max", value=100.5, step=0.5)
+
+        st.markdown("### Style")
+
+        palette_name = st.selectbox(
+            "Default color palette",
+            [
+                "Set2 + Dark2 + tab20",
+                "Set2",
+                "Dark2",
+                "tab10",
+                "tab20",
+                "tab20 + tab20b",
+            ],
+            index=0,
+        )
+
+        default_colors = palette_to_hex_colors(palette_name, len(sample_names))
+        default_color_map = {
+            sample: default_colors[i]
+            for i, sample in enumerate(sample_names)
+        }
+
+        marker_size = st.slider(
+            "Marker size",
+            min_value=20,
+            max_value=200,
+            value=80,
+            step=5,
+        )
+
+        fig_width = st.number_input(
+            "Figure width",
+            min_value=4.0,
+            max_value=20.0,
+            value=9.5,
+            step=0.5,
+            help="The default is wider than before to leave room for axis labels and top legends.",
+        )
+
+        fig_height = st.number_input(
+            "Figure height",
+            min_value=3.0,
+            max_value=15.0,
+            value=5.8,
+            step=0.5,
+        )
+
+        dpi = st.number_input(
+            "Saved figure DPI",
+            min_value=72,
+            max_value=600,
+            value=300,
+            step=50,
+        )
+
+        st.markdown("### Sample colors")
+
+        sample_colors = {}
+        with st.expander("Edit sample colors", expanded=True):
+            for i, sample in enumerate(selected_samples, start=1):
+                sample_colors[sample] = st.color_picker(
+                    compact_widget_label("Color", i, sample),
+                    value=default_color_map[sample],
+                    key=f"cycling_color_{safe_filename(sample)}",
+                    help=f"Full sample name: {sample}",
+                )
+
+        run = st.button("Process and save all selected samples", type="primary")
 
     min_retention = float(min_capacity_retention) if use_retention_filter else None
     top_n_value = int(top_n) if top_n_enabled else None
+
+    with preview_col:
+        st.markdown("### Live preview")
+
+        preview_is_placeholder = preview_mode == "Fast placeholder"
+
+        if preview_is_placeholder:
+            preview_df = make_capacity_placeholder_plot_data(
+                sample_name=preview_sample,
+                n_files=int(top_n_value or 3),
+                max_cycle=int(x_max if not auto_x_range else 500),
+            )
+            preview_file_count = preview_df["source_file"].nunique()
+            st.caption(
+                "Using lightweight placeholder data for instant style preview. "
+                "Switch to **Real selected sample** when you want to inspect actual Excel data."
+            )
+        else:
+            with st.spinner(f"Loading preview data for {preview_sample}..."):
+                preview_df, preview_file_count = load_capacity_sample_plot_data(
+                    sample_name=preview_sample,
+                    sample_dir=folder_map[preview_sample],
+                    root_dir=root_dir,
+                    sheet_name=sheet_name,
+                    capacity_col=capacity_col,
+                    efficiency_col=efficiency_col,
+                    skip_initial_rows=int(skip_initial_rows),
+                    min_retention=min_retention,
+                    top_n_value=top_n_value,
+                )
+
+        if preview_file_count == 0:
+            st.warning(f"No Excel files found for preview sample `{preview_sample}`.")
+        elif preview_df is None:
+            st.warning(f"No valid cycling data found for preview sample `{preview_sample}`.")
+        else:
+            preview_fig = make_capacity_figure(
+                plot_df=preview_df,
+                sample_name=preview_sample,
+                color_hex=sample_colors[preview_sample],
+                plot_title=plot_title,
+                x_label=x_label,
+                cap_y_label=cap_y_label,
+                ce_y_label=ce_y_label,
+                legend_title=legend_title,
+                show_legend=show_legend,
+                legend_position=legend_position,
+                legend_label_max_len=int(legend_label_max_len),
+                legend_columns=int(legend_columns),
+                auto_x_range=auto_x_range,
+                x_min=float(x_min),
+                x_max=float(x_max),
+                cap_y_min=float(cap_y_min),
+                cap_y_max=float(cap_y_max),
+                ce_y_min=float(ce_y_min),
+                ce_y_max=float(ce_y_max),
+                marker_size=int(marker_size),
+                fig_width=float(fig_width),
+                fig_height=float(fig_height),
+            )
+            st.pyplot(preview_fig, clear_figure=True)
+            plt.close(preview_fig)
+
+            c1, c2, c3 = st.columns(3)
+            c1.metric("Preview files", preview_df["source_file"].nunique())
+            c2.metric("Preview points", len(preview_df))
+            c3.metric("Max cycle", _fmt_num(preview_df["cycle_index"].max()))
+
+            if not preview_is_placeholder:
+                with st.expander("Preview plotting data"):
+                    st.dataframe(preview_df, use_container_width=True)
+
+    if not run:
+        st.info(
+            "Preview changes live. Use **Fast placeholder** for layout/style, then click "
+            "**Process and save all selected samples** when the figure style looks right."
+        )
+        return
+
+    output_dir.mkdir(parents=True, exist_ok=True)
 
     summary_rows = []
     zip_buffer = io.BytesIO()
@@ -1203,46 +1513,27 @@ def render_cycling_analysis_page() -> None:
         for idx, sample_name in enumerate(selected_samples, start=1):
             status.write(f"Processing {sample_name} ({idx}/{len(selected_samples)})...")
 
-            sample_dir = selected_folder_map[sample_name]
-            excel_files = find_capacity_excel_files(sample_dir)
+            plot_df, excel_file_count = load_capacity_sample_plot_data(
+                sample_name=sample_name,
+                sample_dir=folder_map[sample_name],
+                root_dir=root_dir,
+                sheet_name=sheet_name,
+                capacity_col=capacity_col,
+                efficiency_col=efficiency_col,
+                skip_initial_rows=int(skip_initial_rows),
+                min_retention=min_retention,
+                top_n_value=top_n_value,
+            )
 
-            if not excel_files:
+            if excel_file_count == 0:
                 st.warning(f"No Excel files found for sample `{sample_name}`.")
                 progress.progress(idx / len(selected_samples))
                 continue
 
-            sample_dfs = []
-
-            for file_path in excel_files:
-                one_df = read_one_capacity_file(
-                    file_path=file_path,
-                    sample_name=sample_name,
-                    root_dir=root_dir,
-                    sheet_name=sheet_name,
-                    capacity_col=capacity_col,
-                    efficiency_col=efficiency_col,
-                    skip_initial_rows=int(skip_initial_rows),
-                    min_capacity_retention=min_retention,
-                )
-
-                if one_df is not None:
-                    sample_dfs.append(one_df)
-
-            if not sample_dfs:
+            if plot_df is None:
                 st.warning(f"No valid cycling data found for sample `{sample_name}`.")
                 progress.progress(idx / len(selected_samples))
                 continue
-
-            plot_df = pd.concat(sample_dfs, ignore_index=True)
-
-            if top_n_value is not None:
-                scores = (
-                    plot_df.groupby("source_file")["capacity_retention_percent"]
-                    .sum()
-                    .sort_values(ascending=False)
-                )
-                keep_files = scores.head(top_n_value).index
-                plot_df = plot_df[plot_df["source_file"].isin(keep_files)].copy()
 
             safe_name = safe_filename(sample_name)
             sample_output_dir = output_dir / safe_name
@@ -1263,6 +1554,9 @@ def render_cycling_analysis_page() -> None:
                 ce_y_label=ce_y_label,
                 legend_title=legend_title,
                 show_legend=show_legend,
+                legend_position=legend_position,
+                legend_label_max_len=int(legend_label_max_len),
+                legend_columns=int(legend_columns),
                 auto_x_range=auto_x_range,
                 x_min=float(x_min),
                 x_max=float(x_max),
@@ -1293,7 +1587,7 @@ def render_cycling_analysis_page() -> None:
 
             with c1:
                 st.download_button(
-                    f"Download {sample_name} CSV",
+                    f"Download {shorten_label(sample_name, 28)} CSV",
                     data=csv_bytes,
                     file_name=f"{safe_name}_plot_data.csv",
                     mime="text/csv",
@@ -1301,13 +1595,13 @@ def render_cycling_analysis_page() -> None:
 
             with c2:
                 st.download_button(
-                    f"Download {sample_name} PNG",
+                    f"Download {shorten_label(sample_name, 28)} PNG",
                     data=png_buffer.getvalue(),
                     file_name=f"{safe_name}_capacity_summary.png",
                     mime="image/png",
                 )
 
-            with st.expander(f"Preview plotting data: {sample_name}"):
+            with st.expander(f"Preview plotting data: {shorten_label(sample_name, 40)}"):
                 st.dataframe(plot_df, use_container_width=True)
 
             plt.close(fig)
@@ -1315,7 +1609,7 @@ def render_cycling_analysis_page() -> None:
             summary_rows.append(
                 {
                     "sample": sample_name,
-                    "files_found": len(excel_files),
+                    "files_found": excel_file_count,
                     "files_plotted": plot_df["source_file"].nunique(),
                     "points_plotted": len(plot_df),
                     "color": sample_colors[sample_name],
