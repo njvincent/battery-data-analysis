@@ -15,6 +15,8 @@ Run locally:
 
 from __future__ import annotations
 
+import os
+import re
 import io
 import tempfile
 import zipfile
@@ -25,6 +27,7 @@ import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 import streamlit as st
+from matplotlib.ticker import AutoMinorLocator
 
 # Use the files that actually exist in your repo.
 from eis_fit import (
@@ -604,6 +607,751 @@ def render_eis_fit_batch_page() -> None:
         st.dataframe(primary.curve_df, use_container_width=True)
 
 
+# -----------------------------------------------------------------------------
+# Cycling capacity batch analysis
+# -----------------------------------------------------------------------------
+
+
+def safe_filename(name: str) -> str:
+    """Convert a sample name into a safe filename."""
+    name = str(name).strip()
+    name = re.sub(r"[^\w\-\.]+", "_", name)
+    return name.strip("_") or "sample"
+
+
+def find_capacity_sample_folders(root_dir: Path, output_dir: Path | None = None) -> list[Path]:
+    """
+    Treat each direct subfolder under root_dir as one sample.
+    """
+    folders = []
+
+    for item in sorted(root_dir.iterdir()):
+        if not item.is_dir():
+            continue
+        if item.name.lower() == "ignore":
+            continue
+
+        if output_dir is not None:
+            try:
+                if item.resolve() == output_dir.resolve():
+                    continue
+            except Exception:
+                pass
+
+        folders.append(item)
+
+    return folders
+
+
+def find_capacity_excel_files(sample_dir: Path) -> list[Path]:
+    """
+    Recursively find Excel files under one sample folder.
+    """
+    files = []
+
+    for path in sample_dir.rglob("*"):
+        if not path.is_file():
+            continue
+        if path.name.startswith("~$"):
+            continue
+        if path.suffix.lower() in [".xlsx", ".xls"]:
+            files.append(path)
+
+    return sorted(files)
+
+
+def detect_cycle_column(df: pd.DataFrame) -> str | None:
+    """
+    Detect a cycle index column if it exists.
+    If not found, cycle index will be generated automatically.
+    """
+    possible_names = [
+        "Cycle Index",
+        "Cycle",
+        "Cycle No.",
+        "Cycle Number",
+        "Cycle Num",
+        "Cycle_Index",
+    ]
+
+    for name in possible_names:
+        if name in df.columns:
+            return name
+
+    return None
+
+
+def read_one_capacity_file(
+    file_path: Path,
+    sample_name: str,
+    root_dir: Path,
+    sheet_name: str,
+    capacity_col: str,
+    efficiency_col: str,
+    skip_initial_rows: int,
+    min_capacity_retention: float | None,
+) -> pd.DataFrame | None:
+    """
+    Read one cycling Excel file and return tidy plotting data.
+
+    Returned columns:
+        sample
+        source_file
+        relative_path
+        cycle_index
+        discharge_capacity_mAh
+        capacity_retention_percent
+        coulombic_efficiency_percent
+    """
+    try:
+        df = pd.read_excel(file_path, sheet_name=sheet_name)
+    except Exception as exc:
+        st.warning(f"Could not read `{file_path.name}`: {exc}")
+        return None
+
+    missing_cols = [
+        col for col in [capacity_col, efficiency_col] if col not in df.columns
+    ]
+
+    if missing_cols:
+        st.warning(f"Skipping `{file_path.name}`: missing columns {missing_cols}")
+        return None
+
+    cycle_col = detect_cycle_column(df)
+
+    data = df.iloc[int(skip_initial_rows):].copy()
+
+    capacity = pd.to_numeric(data[capacity_col], errors="coerce")
+    efficiency = pd.to_numeric(data[efficiency_col], errors="coerce")
+
+    if cycle_col is not None:
+        cycle_index = pd.to_numeric(data[cycle_col], errors="coerce")
+    else:
+        cycle_index = pd.Series(np.arange(len(data)), index=data.index)
+
+    valid_mask = capacity.notna() & efficiency.notna() & cycle_index.notna()
+
+    capacity = capacity[valid_mask].reset_index(drop=True)
+    efficiency = efficiency[valid_mask].reset_index(drop=True)
+    cycle_index = cycle_index[valid_mask].reset_index(drop=True)
+
+    if len(capacity) == 0:
+        st.warning(f"Skipping `{file_path.name}`: no valid numeric data.")
+        return None
+
+    initial_capacity = capacity.iloc[0]
+
+    if pd.isna(initial_capacity) or initial_capacity == 0:
+        st.warning(f"Skipping `{file_path.name}`: invalid initial capacity.")
+        return None
+
+    capacity_retention = capacity / initial_capacity * 100
+
+    out = pd.DataFrame(
+        {
+            "sample": sample_name,
+            "source_file": file_path.name,
+            "relative_path": str(file_path.relative_to(root_dir)),
+            "cycle_index": cycle_index,
+            "discharge_capacity_mAh": capacity,
+            "capacity_retention_percent": capacity_retention,
+            "coulombic_efficiency_percent": efficiency,
+        }
+    )
+
+    if min_capacity_retention is not None:
+        out = out[
+            out["capacity_retention_percent"] >= float(min_capacity_retention)
+        ].reset_index(drop=True)
+
+    if out.empty:
+        st.warning(f"Skipping `{file_path.name}`: no data after filtering.")
+        return None
+
+    return out
+
+
+def capacity_auto_x_limit(max_cycle: float) -> int:
+    """
+    Choose a clean x-axis upper limit.
+    """
+    if max_cycle <= 100:
+        return 100
+    if max_cycle <= 200:
+        return 200
+    if max_cycle <= 300:
+        return 300
+    if max_cycle <= 500:
+        return 500
+    if max_cycle <= 1000:
+        return 1000
+
+    return int(np.ceil(max_cycle / 500) * 500)
+
+
+def palette_to_hex_colors(palette_name: str, n: int) -> list[str]:
+    """
+    Create default hex colors from a Matplotlib qualitative palette.
+    """
+    if palette_name == "Set2":
+        colors = list(plt.cm.Set2.colors)
+    elif palette_name == "Dark2":
+        colors = list(plt.cm.Dark2.colors)
+    elif palette_name == "tab10":
+        colors = list(plt.cm.tab10.colors)
+    elif palette_name == "tab20":
+        colors = list(plt.cm.tab20.colors)
+    elif palette_name == "tab20 + tab20b":
+        colors = list(plt.cm.tab20.colors) + list(plt.cm.tab20b.colors)
+    else:
+        colors = list(plt.cm.Set2.colors) + list(plt.cm.Dark2.colors) + list(plt.cm.tab20.colors)
+
+    hex_colors = []
+
+    for i in range(n):
+        rgb = colors[i % len(colors)]
+        rgb255 = tuple(int(round(c * 255)) for c in rgb[:3])
+        hex_colors.append("#{:02x}{:02x}{:02x}".format(*rgb255))
+
+    return hex_colors
+
+
+def hex_to_rgb_tuple(hex_color: str) -> tuple[float, float, float]:
+    """
+    Convert #RRGGBB to Matplotlib RGB tuple.
+    """
+    hex_color = hex_color.lstrip("#")
+    return tuple(int(hex_color[i:i + 2], 16) / 255 for i in (0, 2, 4))
+
+
+def make_capacity_figure(
+    plot_df: pd.DataFrame,
+    sample_name: str,
+    color_hex: str,
+    plot_title: str,
+    x_label: str,
+    cap_y_label: str,
+    ce_y_label: str,
+    legend_title: str,
+    show_legend: bool,
+    auto_x_range: bool,
+    x_min: float,
+    x_max: float,
+    cap_y_min: float,
+    cap_y_max: float,
+    ce_y_min: float,
+    ce_y_max: float,
+    marker_size: int,
+    fig_width: float,
+    fig_height: float,
+):
+    """
+    Make one capacity-retention / coulombic-efficiency plot for one sample.
+    """
+    plt.rcParams["font.family"] = "sans-serif"
+    plt.rcParams["font.sans-serif"] = ["Arial", "Helvetica", "DejaVu Sans"]
+    plt.rcParams["axes.unicode_minus"] = False
+
+    fig, ax1 = plt.subplots(figsize=(fig_width, fig_height))
+    ax2 = ax1.twinx()
+
+    color_rgb = hex_to_rgb_tuple(color_hex)
+
+    for source_file, group in plot_df.groupby("source_file", sort=True):
+        group = group.sort_values("cycle_index")
+        file_label = Path(source_file).stem
+
+        ax1.scatter(
+            group["cycle_index"],
+            group["capacity_retention_percent"],
+            color=color_rgb,
+            marker="o",
+            s=marker_size,
+            alpha=1,
+            zorder=3,
+            label=file_label,
+        )
+
+        ax2.scatter(
+            group["cycle_index"],
+            group["coulombic_efficiency_percent"],
+            facecolors="none",
+            edgecolors=color_rgb,
+            marker="o",
+            s=marker_size,
+            linewidths=1.5,
+            alpha=1,
+            zorder=3,
+        )
+
+    if auto_x_range:
+        x_min_final = 0
+        x_max_final = capacity_auto_x_limit(float(plot_df["cycle_index"].max()))
+    else:
+        x_min_final = float(x_min)
+        x_max_final = float(x_max)
+
+    ax1.set_xlim(x_min_final, x_max_final)
+    ax1.set_ylim(float(cap_y_min), float(cap_y_max))
+    ax2.set_ylim(float(ce_y_min), float(ce_y_max))
+
+    title = plot_title.replace("{sample}", sample_name)
+    if title.strip():
+        ax1.set_title(title, fontsize=18, pad=12)
+
+    ax1.set_xlabel(x_label, fontsize=18)
+    ax1.set_ylabel(cap_y_label, fontsize=18)
+    ax2.set_ylabel(ce_y_label, fontsize=18)
+
+    for ax in [ax1, ax2]:
+        ax.tick_params(
+            axis="both",
+            which="major",
+            direction="in",
+            labelsize=15,
+            length=6,
+            width=1.5,
+        )
+        ax.tick_params(
+            axis="both",
+            which="minor",
+            direction="in",
+            length=4,
+            width=1,
+        )
+
+        for spine in ax.spines.values():
+            spine.set_linewidth(1.5)
+
+    ax1.xaxis.set_minor_locator(AutoMinorLocator(5))
+    ax1.yaxis.set_minor_locator(AutoMinorLocator(5))
+    ax2.yaxis.set_minor_locator(AutoMinorLocator(2))
+
+    if show_legend:
+        ax1.legend(
+            loc="center left",
+            bbox_to_anchor=(1.12, 0.5),
+            title=legend_title,
+            fontsize=11,
+            title_fontsize=13,
+            frameon=False,
+        )
+
+    fig.tight_layout()
+    return fig
+
+
+def render_cycling_analysis_page() -> None:
+    st.title("Cycling Analysis")
+    st.caption("Batch capacity retention and coulombic efficiency plotting.")
+
+    st.markdown(
+        """
+        This tool treats each direct subfolder under the root directory as one sample.
+
+        Expected structure:
+
+        ```text
+        root_directory/
+            sample_1/
+                file_1.xlsx
+                file_2.xlsx
+            sample_2/
+                file_3.xlsx
+        ```
+        """
+    )
+
+    with st.sidebar:
+        st.header("Cycling input")
+
+        root_dir_str = st.text_input(
+            "Root data directory",
+            value="",
+            help="Folder containing sample subfolders. This must be accessible to the Streamlit process.",
+        )
+
+        output_dir_str = st.text_input(
+            "Output directory",
+            value="",
+            help="Leave empty to save to <root_dir>/capacity_batch_results.",
+        )
+
+        st.header("Data settings")
+
+        sheet_name = st.text_input("Excel sheet name", value="cycle")
+
+        capacity_col = st.text_input(
+            "Discharge capacity column",
+            value="DChg. Cap.(mAh)",
+        )
+
+        efficiency_col = st.text_input(
+            "Coulombic efficiency column",
+            value="Chg.-DChg. Eff(%)",
+        )
+
+        skip_initial_rows = st.number_input(
+            "Rows to skip at beginning",
+            min_value=0,
+            max_value=100,
+            value=2,
+            step=1,
+        )
+
+        use_retention_filter = st.checkbox(
+            "Filter by minimum capacity retention",
+            value=True,
+        )
+
+        min_capacity_retention = st.number_input(
+            "Minimum capacity retention (%)",
+            min_value=0.0,
+            max_value=200.0,
+            value=80.0,
+            step=1.0,
+            disabled=not use_retention_filter,
+        )
+
+        top_n_enabled = st.checkbox(
+            "Only plot top N files per sample",
+            value=False,
+            help="Files are ranked by the sum of capacity retention.",
+        )
+
+        top_n = st.number_input(
+            "Top N files",
+            min_value=1,
+            max_value=20,
+            value=3,
+            step=1,
+            disabled=not top_n_enabled,
+        )
+
+        st.header("Plot text")
+
+        plot_title = st.text_input(
+            "Plot title",
+            value="{sample}",
+            help='Use "{sample}" to insert the sample folder name.',
+        )
+
+        x_label = st.text_input("X-axis label", value="Cycle Index")
+        cap_y_label = st.text_input("Left Y-axis label", value="Capacity Retention (%)")
+        ce_y_label = st.text_input("Right Y-axis label", value="Coulombic Efficiency (%)")
+
+        show_legend = st.checkbox("Show legend", value=True)
+
+        legend_title = st.text_input(
+            "Legend title",
+            value="Files",
+            disabled=not show_legend,
+        )
+
+        st.header("Axis ranges")
+
+        auto_x_range = st.checkbox("Auto X-axis range", value=True)
+
+        x_min = st.number_input(
+            "X min",
+            value=0.0,
+            step=10.0,
+            disabled=auto_x_range,
+        )
+
+        x_max = st.number_input(
+            "X max",
+            value=500.0,
+            step=10.0,
+            disabled=auto_x_range,
+        )
+
+        cap_y_min = st.number_input("Capacity retention Y min", value=75.0, step=1.0)
+        cap_y_max = st.number_input("Capacity retention Y max", value=110.0, step=1.0)
+
+        ce_y_min = st.number_input("Coulombic efficiency Y min", value=90.0, step=0.5)
+        ce_y_max = st.number_input("Coulombic efficiency Y max", value=100.5, step=0.5)
+
+        st.header("Style")
+
+        palette_name = st.selectbox(
+            "Default color palette",
+            [
+                "Set2 + Dark2 + tab20",
+                "Set2",
+                "Dark2",
+                "tab10",
+                "tab20",
+                "tab20 + tab20b",
+            ],
+            index=0,
+        )
+
+        marker_size = st.slider(
+            "Marker size",
+            min_value=20,
+            max_value=200,
+            value=80,
+            step=5,
+        )
+
+        fig_width = st.number_input(
+            "Figure width",
+            min_value=4.0,
+            max_value=20.0,
+            value=8.5,
+            step=0.5,
+        )
+
+        fig_height = st.number_input(
+            "Figure height",
+            min_value=3.0,
+            max_value=15.0,
+            value=5.8,
+            step=0.5,
+        )
+
+        dpi = st.number_input(
+            "Saved figure DPI",
+            min_value=72,
+            max_value=600,
+            value=300,
+            step=50,
+        )
+
+    if not root_dir_str.strip():
+        st.info("Enter a root data directory to start.")
+        return
+
+    root_dir = Path(root_dir_str).expanduser().resolve()
+
+    if not root_dir.exists():
+        st.error(f"Root directory does not exist: `{root_dir}`")
+        return
+
+    if not root_dir.is_dir():
+        st.error(f"Root path is not a directory: `{root_dir}`")
+        return
+
+    if output_dir_str.strip():
+        output_dir = Path(output_dir_str).expanduser().resolve()
+    else:
+        output_dir = root_dir / "capacity_batch_results"
+
+    sample_folders = find_capacity_sample_folders(root_dir, output_dir)
+
+    if not sample_folders:
+        st.warning("No sample folders found under the root directory.")
+        return
+
+    sample_names = [folder.name for folder in sample_folders]
+    default_colors = palette_to_hex_colors(palette_name, len(sample_names))
+
+    default_color_map = {
+        sample: default_colors[i]
+        for i, sample in enumerate(sample_names)
+    }
+
+    st.subheader("Detected samples")
+
+    selected_samples = st.multiselect(
+        "Samples to process",
+        options=sample_names,
+        default=sample_names,
+    )
+
+    if not selected_samples:
+        st.warning("Select at least one sample.")
+        return
+
+    st.markdown("### Sample colors")
+
+    sample_colors = {}
+    color_columns = st.columns(min(4, len(selected_samples)))
+
+    for i, sample in enumerate(selected_samples):
+        with color_columns[i % len(color_columns)]:
+            sample_colors[sample] = st.color_picker(
+                sample,
+                value=default_color_map[sample],
+                key=f"cycling_color_{sample}",
+            )
+
+    run = st.button("Process cycling data", type="primary")
+
+    if not run:
+        return
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    selected_folder_map = {
+        folder.name: folder
+        for folder in sample_folders
+        if folder.name in selected_samples
+    }
+
+    min_retention = float(min_capacity_retention) if use_retention_filter else None
+    top_n_value = int(top_n) if top_n_enabled else None
+
+    summary_rows = []
+    zip_buffer = io.BytesIO()
+
+    progress = st.progress(0)
+    status = st.empty()
+
+    with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zipf:
+        for idx, sample_name in enumerate(selected_samples, start=1):
+            status.write(f"Processing {sample_name} ({idx}/{len(selected_samples)})...")
+
+            sample_dir = selected_folder_map[sample_name]
+            excel_files = find_capacity_excel_files(sample_dir)
+
+            if not excel_files:
+                st.warning(f"No Excel files found for sample `{sample_name}`.")
+                progress.progress(idx / len(selected_samples))
+                continue
+
+            sample_dfs = []
+
+            for file_path in excel_files:
+                one_df = read_one_capacity_file(
+                    file_path=file_path,
+                    sample_name=sample_name,
+                    root_dir=root_dir,
+                    sheet_name=sheet_name,
+                    capacity_col=capacity_col,
+                    efficiency_col=efficiency_col,
+                    skip_initial_rows=int(skip_initial_rows),
+                    min_capacity_retention=min_retention,
+                )
+
+                if one_df is not None:
+                    sample_dfs.append(one_df)
+
+            if not sample_dfs:
+                st.warning(f"No valid cycling data found for sample `{sample_name}`.")
+                progress.progress(idx / len(selected_samples))
+                continue
+
+            plot_df = pd.concat(sample_dfs, ignore_index=True)
+
+            if top_n_value is not None:
+                scores = (
+                    plot_df.groupby("source_file")["capacity_retention_percent"]
+                    .sum()
+                    .sort_values(ascending=False)
+                )
+                keep_files = scores.head(top_n_value).index
+                plot_df = plot_df[plot_df["source_file"].isin(keep_files)].copy()
+
+            safe_name = safe_filename(sample_name)
+            sample_output_dir = output_dir / safe_name
+            sample_output_dir.mkdir(parents=True, exist_ok=True)
+
+            csv_path = sample_output_dir / f"{safe_name}_plot_data.csv"
+            png_path = sample_output_dir / f"{safe_name}_capacity_summary.png"
+
+            plot_df.to_csv(csv_path, index=False)
+
+            fig = make_capacity_figure(
+                plot_df=plot_df,
+                sample_name=sample_name,
+                color_hex=sample_colors[sample_name],
+                plot_title=plot_title,
+                x_label=x_label,
+                cap_y_label=cap_y_label,
+                ce_y_label=ce_y_label,
+                legend_title=legend_title,
+                show_legend=show_legend,
+                auto_x_range=auto_x_range,
+                x_min=float(x_min),
+                x_max=float(x_max),
+                cap_y_min=float(cap_y_min),
+                cap_y_max=float(cap_y_max),
+                ce_y_min=float(ce_y_min),
+                ce_y_max=float(ce_y_max),
+                marker_size=int(marker_size),
+                fig_width=float(fig_width),
+                fig_height=float(fig_height),
+            )
+
+            fig.savefig(png_path, dpi=int(dpi), bbox_inches="tight")
+
+            png_buffer = io.BytesIO()
+            fig.savefig(png_buffer, format="png", dpi=int(dpi), bbox_inches="tight")
+            png_buffer.seek(0)
+
+            csv_bytes = plot_df.to_csv(index=False).encode("utf-8")
+
+            zipf.writestr(f"{safe_name}/{safe_name}_plot_data.csv", csv_bytes)
+            zipf.writestr(f"{safe_name}/{safe_name}_capacity_summary.png", png_buffer.getvalue())
+
+            st.markdown(f"## {sample_name}")
+            st.pyplot(fig, clear_figure=True)
+
+            c1, c2 = st.columns(2)
+
+            with c1:
+                st.download_button(
+                    f"Download {sample_name} CSV",
+                    data=csv_bytes,
+                    file_name=f"{safe_name}_plot_data.csv",
+                    mime="text/csv",
+                )
+
+            with c2:
+                st.download_button(
+                    f"Download {sample_name} PNG",
+                    data=png_buffer.getvalue(),
+                    file_name=f"{safe_name}_capacity_summary.png",
+                    mime="image/png",
+                )
+
+            with st.expander(f"Preview plotting data: {sample_name}"):
+                st.dataframe(plot_df, use_container_width=True)
+
+            plt.close(fig)
+
+            summary_rows.append(
+                {
+                    "sample": sample_name,
+                    "files_found": len(excel_files),
+                    "files_plotted": plot_df["source_file"].nunique(),
+                    "points_plotted": len(plot_df),
+                    "color": sample_colors[sample_name],
+                    "csv_path": str(csv_path),
+                    "png_path": str(png_path),
+                }
+            )
+
+            progress.progress(idx / len(selected_samples))
+
+    status.empty()
+    progress.empty()
+
+    if not summary_rows:
+        st.warning("No valid results were generated.")
+        return
+
+    summary_df = pd.DataFrame(summary_rows)
+    summary_path = output_dir / "capacity_batch_summary.csv"
+    summary_df.to_csv(summary_path, index=False)
+
+    st.success(f"Batch cycling analysis completed. Results saved to: `{output_dir}`")
+
+    st.subheader("Summary")
+    st.dataframe(summary_df, use_container_width=True)
+
+    zip_buffer.seek(0)
+
+    st.download_button(
+        "Download all cycling results ZIP",
+        data=zip_buffer.getvalue(),
+        file_name="capacity_batch_results.zip",
+        mime="application/zip",
+    )
+
+
 def render_placeholder_page(title: str) -> None:
     st.title(title)
     st.info("This module can be added later without changing the EIS fitting logic.")
@@ -629,7 +1377,7 @@ def main() -> None:
     elif tool == "EIS Fit Batch":
         render_eis_fit_batch_page()
     elif tool == "Cycling Analysis":
-        render_placeholder_page("Cycling Analysis")
+        render_cycling_analysis_page()
     elif tool == "Stripping Overpotential":
         render_placeholder_page("Stripping Overpotential")
     elif tool == "dQ/dV Analysis":
