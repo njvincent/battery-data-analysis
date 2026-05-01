@@ -1072,6 +1072,59 @@ def set_cycling_workflow_step(step: str) -> None:
     st.session_state["cycling_workflow_step"] = step
 
 
+def rerun_streamlit_app() -> None:
+    """Rerun the app across Streamlit versions."""
+    if hasattr(st, "rerun"):
+        st.rerun()
+    else:
+        st.experimental_rerun()
+
+
+def save_cycling_style_and_go_final(selected_samples: list[str], all_sample_names: list[str]) -> None:
+    """Snapshot current style controls, then switch to Final output.
+
+    Without an explicit snapshot, the first render of the final-output page can
+    sometimes use stale widget values from the previous rerun, which leads to
+    incorrect style or axis ranges that hide the points.
+    """
+    style_snapshot = {
+        "plot_title": st.session_state.get("cycling_plot_title", "{sample}"),
+        "x_label": st.session_state.get("cycling_x_label", "Cycle Index"),
+        "cap_y_label": st.session_state.get("cycling_cap_y_label", "Capacity Retention (%)"),
+        "ce_y_label": st.session_state.get("cycling_ce_y_label", "Coulombic Efficiency (%)"),
+        "show_legend": bool(st.session_state.get("cycling_show_legend", True)),
+        "legend_position": st.session_state.get("cycling_legend_position", "Top"),
+        "legend_title": st.session_state.get("cycling_legend_title", "Files"),
+        "legend_label_max_len": int(st.session_state.get("cycling_legend_label_max_len", 24)),
+        "legend_columns": int(st.session_state.get("cycling_legend_columns", 3)),
+        "auto_x_range": bool(st.session_state.get("cycling_auto_x_range", True)),
+        "x_min": float(st.session_state.get("cycling_x_min", 0.0)),
+        "x_max": float(st.session_state.get("cycling_x_max", 500.0)),
+        "cap_y_min": float(st.session_state.get("cycling_cap_y_min", 75.0)),
+        "cap_y_max": float(st.session_state.get("cycling_cap_y_max", 110.0)),
+        "ce_y_min": float(st.session_state.get("cycling_ce_y_min", 90.0)),
+        "ce_y_max": float(st.session_state.get("cycling_ce_y_max", 100.5)),
+        "palette_name": st.session_state.get("cycling_palette_name", "Set2 + Dark2 + tab20"),
+        "marker_size": int(st.session_state.get("cycling_marker_size", 80)),
+        "fig_width": float(st.session_state.get("cycling_fig_width", 9.5)),
+        "fig_height": float(st.session_state.get("cycling_fig_height", 5.8)),
+        "dpi": int(st.session_state.get("cycling_dpi", 300)),
+    }
+
+    palette_colors = palette_to_hex_colors(str(style_snapshot["palette_name"]), len(all_sample_names))
+    palette_color_map = {sample: palette_colors[i] for i, sample in enumerate(all_sample_names)}
+    style_snapshot["sample_colors"] = {
+        sample: st.session_state.get(
+            f"cycling_color_{safe_filename(sample)}",
+            palette_color_map[sample],
+        )
+        for sample in selected_samples
+    }
+
+    st.session_state["cycling_saved_style"] = style_snapshot
+    st.session_state["cycling_workflow_step"] = "3. Final output"
+
+
 def selected_relative_paths_for_sample_saved_first(
     sample_name: str,
     sample_dir: Path,
@@ -1095,7 +1148,7 @@ def selected_relative_paths_for_sample_saved_first(
         rel = str(record["relative_path"])
         key = cycling_file_include_key(sample_name, rel)
         if saved is not None:
-            include = bool(saved.get(rel, False))
+            include = bool(saved.get(rel, st.session_state.get(key, True)))
         else:
             include = bool(st.session_state.get(key, True))
         if include:
@@ -1136,6 +1189,240 @@ def capacity_file_summary_row(
         "mean_CE_%": float(ordered["coulombic_efficiency_percent"].mean()),
         "status": "OK",
     }
+
+
+def infer_operator_from_path(file_path: Path) -> str:
+    """Best-effort extraction of operator name from a file path.
+
+    The app cannot know the operator unless it is encoded in the file/folder
+    name. This function looks for patterns such as ``operator_Alice`` or
+    ``op-Alice``. If nothing is found, it leaves the field blank.
+    """
+    path_text = str(file_path)
+    patterns = [
+        r"(?:operator|oper|op)[-_\s:=]+([A-Za-z0-9]+)",
+        r"([A-Za-z]+)[-_\s]*(?:operator|oper)",
+    ]
+    for pat in patterns:
+        match = re.search(pat, path_text, flags=re.IGNORECASE)
+        if match:
+            return str(match.group(1))
+    return ""
+
+
+def file_modified_time_string(file_path: Path) -> str:
+    """Return the file modification time as a compact timestamp string."""
+    try:
+        return pd.Timestamp.fromtimestamp(file_path.stat().st_mtime).strftime("%Y-%m-%d %H:%M:%S")
+    except Exception:
+        return ""
+
+
+def compute_capacity_selection_metrics(
+    file_df: pd.DataFrame | None,
+    record: dict[str, object],
+    target_retention: float = 80.0,
+    tolerance: float = 2.0,
+) -> dict[str, object]:
+    """Compute compact per-file metrics for preview cards and summary CSV.
+
+    Definitions used here:
+    - ICE (%): coulombic efficiency at the first valid cycle.
+    - Cycle Life: the first cycle whose capacity retention is within
+      target_retention ± tolerance, i.e. 80 ± 2% by default.
+    - ACE (%): average CE from the first valid cycle through the ACE cycle.
+    - ACE cycle: the cycle used as the upper bound for ACE. If Cycle Life is
+      available, ACE cycle equals Cycle Life. If the file has not reached
+      80 ± 2%, ACE cycle is the last available cycle and Note explains this.
+    """
+    file_path = Path(record.get("path", ""))
+    base = {
+        "Sample": record.get("sample", ""),
+        "ICE (%)": np.nan,
+        "Cycle Life": np.nan,
+        "ACE (%)": np.nan,
+        "ACE cycle": np.nan,
+        "Time": file_modified_time_string(file_path) if file_path else "",
+        "Operator": infer_operator_from_path(file_path) if file_path else "",
+        "File name": record.get("source_file", ""),
+        "Relative path": record.get("relative_path", ""),
+        "Note": "",
+    }
+
+    if file_df is None or file_df.empty:
+        base["Note"] = "invalid"
+        return base
+
+    df = file_df.sort_values("cycle_index").copy()
+    retention = pd.to_numeric(df["capacity_retention_percent"], errors="coerce")
+    ce = pd.to_numeric(df["coulombic_efficiency_percent"], errors="coerce")
+    cycles = pd.to_numeric(df["cycle_index"], errors="coerce")
+    valid = retention.notna() & ce.notna() & cycles.notna()
+    df = df.loc[valid].copy()
+    if df.empty:
+        base["Note"] = "invalid"
+        return base
+
+    df = df.sort_values("cycle_index")
+    base["ICE (%)"] = float(df["coulombic_efficiency_percent"].iloc[0])
+
+    lower = float(target_retention) - float(tolerance)
+    upper = float(target_retention) + float(tolerance)
+    in_window = df[
+        (df["capacity_retention_percent"] >= lower)
+        & (df["capacity_retention_percent"] <= upper)
+    ].sort_values("cycle_index")
+
+    if len(in_window):
+        cycle_life = float(in_window["cycle_index"].iloc[0])
+        base["Cycle Life"] = cycle_life
+        ace_cycle = cycle_life
+    else:
+        max_cycle = float(df["cycle_index"].max())
+        ace_cycle = max_cycle
+        min_retention = float(df["capacity_retention_percent"].min())
+        if min_retention > upper:
+            base["Note"] = "running"
+        elif min_retention < lower:
+            base["Note"] = "not finished"
+        else:
+            base["Note"] = "not finished"
+
+    ace_rows = df[df["cycle_index"] <= ace_cycle]
+    if ace_rows.empty:
+        ace_rows = df
+    base["ACE (%)"] = float(ace_rows["coulombic_efficiency_percent"].mean())
+    base["ACE cycle"] = float(ace_cycle)
+    return base
+
+
+def format_metric_value(value: object, digits: int = 3) -> str:
+    """Compact formatting for preview-card metrics."""
+    try:
+        if value is None or pd.isna(value):
+            return "—"
+        return f"{float(value):.{digits}g}"
+    except Exception:
+        return "—" if value in [None, ""] else str(value)
+
+
+def format_selected_file_summary_for_display(summary_df: pd.DataFrame) -> pd.DataFrame:
+    """Make the selected-file summary easier to read in Streamlit."""
+    out = summary_df.copy()
+    for col in ["ICE (%)", "Cycle Life", "ACE (%)", "ACE cycle"]:
+        if col in out.columns:
+            out[col] = out[col].map(lambda x: "" if pd.isna(x) else float(f"{float(x):.5g}"))
+    return out
+
+
+def load_raw_capacity_metrics_df(
+    record: dict[str, object],
+    sample_name: str,
+    root_dir: Path,
+    sheet_name: str,
+    capacity_col: str,
+    efficiency_col: str,
+    skip_initial_rows: int,
+) -> tuple[pd.DataFrame | None, str | None]:
+    """Load unfiltered data for metrics such as 80±2% cycle life."""
+    return load_cached_capacity_file(
+        file_path=record["path"],
+        sample_name=sample_name,
+        root_dir=root_dir,
+        sheet_name=sheet_name,
+        capacity_col=capacity_col,
+        efficiency_col=efficiency_col,
+        skip_initial_rows=int(skip_initial_rows),
+        min_retention=None,
+    )
+
+
+def load_capacity_sample_file_summary(
+    sample_name: str,
+    sample_dir: Path,
+    root_dir: Path,
+    sheet_name: str,
+    capacity_col: str,
+    efficiency_col: str,
+    skip_initial_rows: int,
+    selected_relative_paths: list[str] | None,
+) -> pd.DataFrame:
+    """Build a per-file metric summary for selected files in one sample."""
+    records = capacity_file_records(sample_name, sample_dir, root_dir)
+    if selected_relative_paths is not None:
+        selected_set = set(selected_relative_paths)
+        records = [r for r in records if str(r["relative_path"]) in selected_set]
+
+    rows = []
+    for record in records:
+        raw_df, error = load_raw_capacity_metrics_df(
+            record=record,
+            sample_name=sample_name,
+            root_dir=root_dir,
+            sheet_name=sheet_name,
+            capacity_col=capacity_col,
+            efficiency_col=efficiency_col,
+            skip_initial_rows=int(skip_initial_rows),
+        )
+        row = compute_capacity_selection_metrics(raw_df, record)
+        if error and not row.get("Note"):
+            row["Note"] = error
+        rows.append(row)
+
+    return pd.DataFrame(rows)
+
+
+def load_capacity_current_sample_summary_from_entries(
+    entries: list[tuple[dict[str, object], pd.DataFrame | None, pd.DataFrame | None, str | None]],
+) -> pd.DataFrame:
+    """Build a summary table for selected files already loaded on the preview page."""
+    rows = []
+    for record, _plot_df, raw_df, error in entries:
+        rel = str(record["relative_path"])
+        key = cycling_file_include_key(str(record["sample"]), rel)
+        if not bool(st.session_state.get(key, False)):
+            continue
+        row = compute_capacity_selection_metrics(raw_df, record)
+        if error and not row.get("Note"):
+            row["Note"] = error
+        rows.append(row)
+    return pd.DataFrame(rows)
+
+
+def load_capacity_all_selected_file_summary(
+    selected_samples: list[str],
+    folder_map: dict[str, Path],
+    root_dir: Path,
+    manual_selection: bool,
+    sheet_name: str,
+    capacity_col: str,
+    efficiency_col: str,
+    skip_initial_rows: int,
+) -> pd.DataFrame:
+    """Build a summary table for every selected file across selected samples."""
+    frames = []
+    for sample_name in selected_samples:
+        selected_paths = selected_relative_paths_for_sample_saved_first(
+            sample_name,
+            folder_map[sample_name],
+            root_dir,
+            manual_selection=manual_selection,
+        )
+        frame = load_capacity_sample_file_summary(
+            sample_name=sample_name,
+            sample_dir=folder_map[sample_name],
+            root_dir=root_dir,
+            sheet_name=sheet_name,
+            capacity_col=capacity_col,
+            efficiency_col=efficiency_col,
+            skip_initial_rows=int(skip_initial_rows),
+            selected_relative_paths=selected_paths,
+        )
+        if not frame.empty:
+            frames.append(frame)
+    if not frames:
+        return pd.DataFrame(columns=["Sample", "ICE (%)", "Cycle Life", "ACE (%)", "ACE cycle", "Time", "Operator", "File name", "Relative path", "Note"])
+    return pd.concat(frames, ignore_index=True)
 
 
 def load_capacity_sample_plot_data(
@@ -1260,6 +1547,89 @@ def hex_to_rgb_tuple(hex_color: str) -> tuple[float, float, float]:
     return tuple(int(hex_color[i:i + 2], 16) / 255 for i in (0, 2, 4))
 
 
+def keep_twin_axes_points_visible(ax1, ax2) -> None:
+    """Keep twin-axis backgrounds from covering scatter points."""
+    ax1.set_zorder(2)
+    ax2.set_zorder(1)
+    ax1.patch.set_visible(False)
+    ax2.patch.set_visible(False)
+
+
+def clean_capacity_plot_df(plot_df: pd.DataFrame) -> pd.DataFrame:
+    """Return only numeric rows that can actually be plotted."""
+    numeric_plot_df = plot_df.copy()
+    for col in ["cycle_index", "capacity_retention_percent", "coulombic_efficiency_percent"]:
+        numeric_plot_df[col] = pd.to_numeric(numeric_plot_df[col], errors="coerce")
+    return numeric_plot_df.dropna(
+        subset=["cycle_index", "capacity_retention_percent", "coulombic_efficiency_percent"]
+    )
+
+
+def padded_limits(values: pd.Series, fallback_min: float, fallback_max: float, min_pad: float) -> tuple[float, float]:
+    vals = pd.to_numeric(values, errors="coerce").dropna()
+    if vals.empty:
+        return float(fallback_min), float(fallback_max)
+    lo = float(vals.min())
+    hi = float(vals.max())
+    pad = max(float(min_pad), 0.08 * max(1.0, hi - lo))
+    return lo - pad, hi + pad
+
+
+def capacity_figure_limits(plot_df: pd.DataFrame, style: dict[str, object]) -> tuple[dict[str, object], pd.DataFrame, bool]:
+    """Use style limits unless they would hide all points in the final figure."""
+    numeric_plot_df = clean_capacity_plot_df(plot_df)
+    if numeric_plot_df.empty:
+        return {
+            "auto_x_range": bool(style["auto_x_range"]),
+            "x_min": float(style["x_min"]),
+            "x_max": float(style["x_max"]),
+            "cap_y_min": float(style["cap_y_min"]),
+            "cap_y_max": float(style["cap_y_max"]),
+            "ce_y_min": float(style["ce_y_min"]),
+            "ce_y_max": float(style["ce_y_max"]),
+        }, numeric_plot_df, False
+
+    adjusted = False
+    auto_x_range = bool(style["auto_x_range"])
+    if auto_x_range:
+        x_min = 0.0
+        x_max = float(capacity_auto_x_limit(float(numeric_plot_df["cycle_index"].max())))
+    else:
+        x_min = float(style["x_min"])
+        x_max = float(style["x_max"])
+
+    cap_y_min = float(style["cap_y_min"])
+    cap_y_max = float(style["cap_y_max"])
+    ce_y_min = float(style["ce_y_min"])
+    ce_y_max = float(style["ce_y_max"])
+
+    x_visible = numeric_plot_df["cycle_index"].between(x_min, x_max)
+    if not x_visible.any():
+        auto_x_range = False
+        x_min = 0.0
+        x_max = float(capacity_auto_x_limit(float(numeric_plot_df["cycle_index"].max())))
+        x_visible = numeric_plot_df["cycle_index"].between(x_min, x_max)
+        adjusted = True
+
+    if not (x_visible & numeric_plot_df["capacity_retention_percent"].between(cap_y_min, cap_y_max)).any():
+        cap_y_min, cap_y_max = padded_limits(numeric_plot_df.loc[x_visible, "capacity_retention_percent"], 75.0, 110.0, 2.0)
+        adjusted = True
+
+    if not (x_visible & numeric_plot_df["coulombic_efficiency_percent"].between(ce_y_min, ce_y_max)).any():
+        ce_y_min, ce_y_max = padded_limits(numeric_plot_df.loc[x_visible, "coulombic_efficiency_percent"], 90.0, 100.5, 0.2)
+        adjusted = True
+
+    return {
+        "auto_x_range": auto_x_range,
+        "x_min": x_min,
+        "x_max": x_max,
+        "cap_y_min": cap_y_min,
+        "cap_y_max": cap_y_max,
+        "ce_y_min": ce_y_min,
+        "ce_y_max": ce_y_max,
+    }, numeric_plot_df, adjusted
+
+
 
 def make_capacity_placeholder_plot_data(
     sample_name: str,
@@ -1341,19 +1711,50 @@ def make_capacity_figure(
     plt.rcParams["font.sans-serif"] = ["Arial", "Helvetica", "DejaVu Sans"]
     plt.rcParams["axes.unicode_minus"] = False
 
+    # Make plotting robust across files whose Excel columns may have been read
+    # as object/string dtype. If these values are not coerced here, Matplotlib
+    # can silently draw an empty-looking figure in some Streamlit reruns.
+    plot_df = plot_df.copy()
+    for numeric_col in [
+        "cycle_index",
+        "capacity_retention_percent",
+        "coulombic_efficiency_percent",
+    ]:
+        plot_df[numeric_col] = pd.to_numeric(plot_df[numeric_col], errors="coerce")
+    plot_df = plot_df.dropna(
+        subset=["cycle_index", "capacity_retention_percent", "coulombic_efficiency_percent"]
+    )
+
     fig, ax1 = plt.subplots(figsize=(fig_width, fig_height))
     ax2 = ax1.twinx()
+    keep_twin_axes_points_visible(ax1, ax2)
 
     color_rgb = hex_to_rgb_tuple(color_hex)
 
-    for source_file, group in plot_df.groupby("source_file", sort=True):
+    group_key = "relative_path" if "relative_path" in plot_df.columns else "source_file"
+
+    if plot_df.empty:
+        ax1.text(
+            0.5,
+            0.5,
+            "No valid numeric plotting data",
+            ha="center",
+            va="center",
+            transform=ax1.transAxes,
+            fontsize=12,
+        )
+
+    for group_id, group in plot_df.groupby(group_key, sort=True):
         group = group.sort_values("cycle_index")
-        full_label = Path(source_file).stem
+        if "source_file" in group.columns and len(group):
+            full_label = Path(str(group["source_file"].iloc[0])).stem
+        else:
+            full_label = Path(str(group_id)).stem
         file_label = shorten_label(full_label, legend_label_max_len)
 
         ax1.scatter(
-            group["cycle_index"],
-            group["capacity_retention_percent"],
+            group["cycle_index"].to_numpy(float),
+            group["capacity_retention_percent"].to_numpy(float),
             color=color_rgb,
             marker="o",
             s=marker_size,
@@ -1363,8 +1764,8 @@ def make_capacity_figure(
         )
 
         ax2.scatter(
-            group["cycle_index"],
-            group["coulombic_efficiency_percent"],
+            group["cycle_index"].to_numpy(float),
+            group["coulombic_efficiency_percent"].to_numpy(float),
             facecolors="none",
             edgecolors=color_rgb,
             marker="o",
@@ -1376,7 +1777,10 @@ def make_capacity_figure(
 
     if auto_x_range:
         x_min_final = 0
-        x_max_final = capacity_auto_x_limit(float(plot_df["cycle_index"].max()))
+        if plot_df.empty:
+            x_max_final = 100
+        else:
+            x_max_final = capacity_auto_x_limit(float(plot_df["cycle_index"].max()))
     else:
         x_min_final = float(x_min)
         x_max_final = float(x_max)
@@ -1517,6 +1921,7 @@ def make_single_file_capacity_preview_figure(
 
     fig, ax1 = plt.subplots(figsize=(fig_width, fig_height))
     ax2 = ax1.twinx()
+    keep_twin_axes_points_visible(ax1, ax2)
 
     # Keep the file-level preview visually consistent with the final
     # sample-level figure: filled circles for capacity retention and open
@@ -1599,9 +2004,36 @@ def make_single_file_capacity_preview_figure(
     return fig
 
 
+def make_empty_single_file_capacity_preview_figure(
+    message: str = "No valid preview",
+    fig_width: float = 3.7,
+    fig_height: float = 2.25,
+):
+    """Create an empty preview figure with the same footprint as valid file previews."""
+    plt.rcParams["font.family"] = "sans-serif"
+    plt.rcParams["font.sans-serif"] = ["Arial", "Helvetica", "DejaVu Sans"]
+    plt.rcParams["axes.unicode_minus"] = False
+
+    fig, ax = plt.subplots(figsize=(fig_width, fig_height))
+    ax.set_axis_off()
+    ax.text(
+        0.5,
+        0.5,
+        message,
+        ha="center",
+        va="center",
+        fontsize=9,
+        color="0.55",
+        transform=ax.transAxes,
+    )
+    fig.subplots_adjust(left=0, right=1, bottom=0, top=1)
+    return fig
+
+
 def render_file_preview_card(
     record: dict[str, object],
     file_df: pd.DataFrame | None,
+    raw_df: pd.DataFrame | None,
     error: str | None,
     checkbox_key: str,
     color_hex: str,
@@ -1612,17 +2044,26 @@ def render_file_preview_card(
     ce_y_max: float = 100.5,
 ) -> None:
     """
-    Render a compact file-level preview card.
+    Render a compact, equal-height file-level preview card.
 
-    The card intentionally shows only the information needed for file selection:
-    the cycle plot, cycle life, initial CE, and average CE. Two cards can be
-    placed in one row by the caller.
+    The card intentionally keeps every file in the same visual footprint so the
+    four-column preview grid stays aligned even when a file is invalid.
     """
     rel = str(record["relative_path"])
     file_stem = Path(rel).stem
+    metrics = compute_capacity_selection_metrics(raw_df, record)
 
-    # A bordered container keeps each file visually separated while preserving
-    # a compact two-column layout.
+    def metric_text(value: object, suffix: str = "", digits: int = 3) -> str:
+        text = format_metric_value(value, digits=digits)
+        return f"{text}{suffix}" if text != "—" else text
+
+    ice_text = metric_text(metrics.get("ICE (%)"), "%")
+    life_text = metric_text(metrics.get("Cycle Life"), "", digits=4)
+    ace_text = metric_text(metrics.get("ACE (%)"), "%")
+    ace_cycle_text = metric_text(metrics.get("ACE cycle"), "", digits=4)
+    note_text = str(metrics.get("Note") or (error or ""))
+    note_text = note_text.strip()
+
     try:
         card_ctx = st.container(border=True)
     except TypeError:
@@ -1630,7 +2071,7 @@ def render_file_preview_card(
 
     with card_ctx:
         st.checkbox(
-            shorten_label(file_stem, 52),
+            shorten_label(file_stem, 30),
             key=checkbox_key,
             help=rel,
         )
@@ -1645,29 +2086,200 @@ def render_file_preview_card(
                 fixed_cap_y_max=cap_y_max,
                 fixed_ce_y_min=ce_y_min,
                 fixed_ce_y_max=ce_y_max,
-                fig_width=4.75,
-                fig_height=2.75,
+                fig_width=3.7,
+                fig_height=2.25,
             )
             st.pyplot(fig, clear_figure=True)
             plt.close(fig)
+        else:
+            # Use a Matplotlib placeholder with the same figsize as valid previews.
+            # This keeps the 4-column grid aligned better than an HTML-only box.
+            empty_fig = make_empty_single_file_capacity_preview_figure(
+                message="No valid preview",
+                fig_width=3.7,
+                fig_height=2.25,
+            )
+            st.pyplot(empty_fig, clear_figure=True)
+            plt.close(empty_fig)
 
-            ordered = file_df.sort_values("cycle_index")
-            metric_cols = st.columns(3)
-            metric_cols[0].metric(
-                "Cycle life",
-                _fmt_num(ordered["cycle_index"].max()),
-            )
-            metric_cols[1].metric(
-                "Initial CE",
-                _fmt_num(ordered["coulombic_efficiency_percent"].iloc[0], "%"),
-            )
-            metric_cols[2].metric(
-                "Average CE",
-                _fmt_num(ordered["coulombic_efficiency_percent"].mean(), "%"),
+        st.markdown(
+            f"""
+            <div style="font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+                        font-size:0.74rem; line-height:1.28; min-height:42px; margin-top:-0.25rem;">
+                <div style="display:grid; grid-template-columns: 1fr 1fr; column-gap:0.55rem;">
+                    <span><b>ICE</b>: {ice_text}</span>
+                    <span><b>Life</b>: {life_text}</span>
+                    <span><b>ACE</b>: {ace_text}</span>
+                    <span><b>ACE cyc.</b>: {ace_cycle_text}</span>
+                </div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+        if note_text:
+            st.markdown(
+                f"<div style='font-size:0.72rem; color:rgba(120,120,120,0.95); min-height:18px;'>Note: {note_text}</div>",
+                unsafe_allow_html=True,
             )
         else:
-            st.warning(error or "No valid preview data.")
+            st.markdown("<div style='min-height:18px;'></div>", unsafe_allow_html=True)
 
+
+def safe_extract_zip_to_dir(uploaded_zip, extract_dir: Path) -> None:
+    """
+    Safely extract an uploaded ZIP file into extract_dir.
+
+    This mode is intended for small demo datasets. It is not recommended for
+    large private research datasets because browser upload and cloud memory
+    limits become the bottleneck long before the analysis logic does.
+    """
+    extract_dir.mkdir(parents=True, exist_ok=True)
+    with zipfile.ZipFile(io.BytesIO(uploaded_zip.getvalue()), "r") as zf:
+        for member in zf.infolist():
+            member_path = Path(member.filename)
+            if member_path.is_absolute() or ".." in member_path.parts:
+                raise ValueError(f"Unsafe ZIP path detected: {member.filename}")
+            target = (extract_dir / member_path).resolve()
+            if not str(target).startswith(str(extract_dir.resolve())):
+                raise ValueError(f"Unsafe ZIP path detected: {member.filename}")
+        zf.extractall(extract_dir)
+
+
+def infer_cycling_root_after_unzip(extract_dir: Path) -> Path:
+    """
+    Infer the actual cycling root after unzipping.
+
+    Handles both structures:
+        zip_root/sample_1/*.xlsx
+        zip_root/outer_folder/sample_1/*.xlsx
+    """
+    visible_children = [p for p in extract_dir.iterdir() if not p.name.startswith("__MACOSX")]
+    dirs = [p for p in visible_children if p.is_dir() and not p.name.startswith(".")]
+    files = [p for p in visible_children if p.is_file() and not p.name.startswith(".")]
+
+    if len(dirs) == 1 and not files:
+        inner = dirs[0]
+        inner_dirs = [p for p in inner.iterdir() if p.is_dir() and not p.name.startswith(".")]
+        if inner_dirs:
+            return inner
+
+    return extract_dir
+
+
+def get_or_create_uploaded_zip_root(uploaded_zip) -> Path:
+    """
+    Extract an uploaded demo ZIP once per session and return the inferred root.
+    """
+    upload_sig = hashlib.sha1(uploaded_zip.getvalue()).hexdigest()[:16]
+    state_key = "cycling_uploaded_zip_state"
+    current = st.session_state.get(state_key)
+
+    if current and current.get("signature") == upload_sig:
+        root = Path(current["root_dir"])
+        if root.exists():
+            return root
+
+    extract_dir = Path(tempfile.mkdtemp(prefix="battery_cycling_zip_"))
+    safe_extract_zip_to_dir(uploaded_zip, extract_dir)
+    root_dir = infer_cycling_root_after_unzip(extract_dir)
+
+    st.session_state[state_key] = {
+        "signature": upload_sig,
+        "extract_dir": str(extract_dir),
+        "root_dir": str(root_dir),
+    }
+    return root_dir
+
+
+def resolve_cycling_input_root_from_sidebar() -> tuple[Path | None, Path | None, str]:
+    """
+    Resolve the cycling root directory and output directory.
+
+    For very large datasets, use Local/server folder path. The Streamlit process
+    must run on the same machine/server where the data directory exists, or on a
+    server where the data is mounted as a filesystem path.
+    """
+    st.header("Cycling input")
+
+    input_mode = st.radio(
+        "Data access mode",
+        ["Local/server folder path", "Demo ZIP upload only"],
+        index=0,
+        help=(
+            "Use Local/server folder path for real 20–50 GB datasets. "
+            "ZIP upload is only for small demo datasets and is not suitable for large private data."
+        ),
+    )
+
+    if input_mode == "Local/server folder path":
+        st.info(
+            "For large datasets, do not upload files through the browser. Run Streamlit on the machine/server that can already access the data, then point this field to that folder."
+        )
+
+        configured_base = os.environ.get("BATTERY_DATA_ROOT", "").strip()
+        use_configured_base = False
+
+        if configured_base:
+            base_path = Path(configured_base).expanduser().resolve()
+            st.caption(f"Configured server data root: `{base_path}`")
+            use_configured_base = st.checkbox(
+                "Use configured BATTERY_DATA_ROOT",
+                value=True,
+                help="Set BATTERY_DATA_ROOT on the server to restrict users to a known data folder.",
+            )
+        else:
+            base_path = None
+
+        if configured_base and use_configured_base and base_path is not None:
+            relative_data_dir = st.text_input(
+                "Dataset folder relative to BATTERY_DATA_ROOT",
+                value="",
+                help="Example: Li Vendor/data/test. Leave empty to use BATTERY_DATA_ROOT itself.",
+            )
+            root_dir = (base_path / relative_data_dir).expanduser().resolve()
+        else:
+            root_dir_str = st.text_input(
+                "Root data directory on this machine/server",
+                value="",
+                help=(
+                    "Folder containing sample subfolders. This path must exist on the machine/server running Streamlit, "
+                    "not necessarily on the browser user's computer."
+                ),
+            )
+            if not root_dir_str.strip():
+                return None, None, "Enter a root data directory to start."
+            root_dir = Path(root_dir_str).expanduser().resolve()
+
+        output_dir_str = st.text_input(
+            "Output directory",
+            value="",
+            help="Leave empty to save to <root_dir>/capacity_batch_results.",
+        )
+        output_dir = Path(output_dir_str).expanduser().resolve() if output_dir_str.strip() else root_dir / "capacity_batch_results"
+        return root_dir, output_dir, input_mode
+
+    st.warning(
+        "ZIP upload is for small demo data only. For 20–50 GB raw datasets, use Local/server folder path on a machine/server where the data is already mounted."
+    )
+    uploaded_zip = st.file_uploader(
+        "Upload a small demo ZIP containing sample folders",
+        type=["zip"],
+        accept_multiple_files=False,
+        help="Do not use this for 20–50 GB datasets.",
+    )
+    if uploaded_zip is None:
+        return None, None, "Upload a small demo ZIP to start, or switch to Local/server folder path for real data."
+
+    try:
+        root_dir = get_or_create_uploaded_zip_root(uploaded_zip)
+    except Exception as exc:
+        st.error(f"Could not extract ZIP: {exc}")
+        return None, None, "ZIP extraction failed."
+
+    output_dir = root_dir / "capacity_batch_results"
+    st.caption(f"Temporary extracted root: `{root_dir}`")
+    return root_dir, output_dir, input_mode
 
 def render_cycling_analysis_page() -> None:
     st.title("Cycling Analysis")
@@ -1691,19 +2303,7 @@ def render_cycling_analysis_page() -> None:
     )
 
     with st.sidebar:
-        st.header("Cycling input")
-
-        root_dir_str = st.text_input(
-            "Root data directory",
-            value="",
-            help="Folder containing sample subfolders. This must be accessible to the Streamlit process.",
-        )
-
-        output_dir_str = st.text_input(
-            "Output directory",
-            value="",
-            help="Leave empty to save to <root_dir>/capacity_batch_results.",
-        )
+        root_dir, output_dir, input_mode = resolve_cycling_input_root_from_sidebar()
 
         st.header("Data settings")
 
@@ -1756,24 +2356,21 @@ def render_cycling_analysis_page() -> None:
             disabled=not top_n_enabled,
         )
 
-    if not root_dir_str.strip():
-        st.info("Enter a root data directory to start.")
+    if root_dir is None or output_dir is None:
+        st.info(input_mode)
         return
 
-    root_dir = Path(root_dir_str).expanduser().resolve()
-
     if not root_dir.exists():
-        st.error(f"Root directory does not exist: `{root_dir}`")
+        st.error(
+            f"Root directory does not exist on the Streamlit runtime machine/server: `{root_dir}`\n\n"
+            "If you are using a deployed web app, a path like `/Users/...` refers to the remote server, not your Mac. "
+            "For 20–50 GB datasets, run this app locally or on a server where the data folder is mounted."
+        )
         return
 
     if not root_dir.is_dir():
         st.error(f"Root path is not a directory: `{root_dir}`")
         return
-
-    if output_dir_str.strip():
-        output_dir = Path(output_dir_str).expanduser().resolve()
-    else:
-        output_dir = root_dir / "capacity_batch_results"
 
     sample_folders = find_capacity_sample_folders(root_dir, output_dir)
 
@@ -1817,11 +2414,10 @@ def render_cycling_analysis_page() -> None:
         st.warning("Select at least one sample.")
         return
 
-    manual_selection = st.checkbox(
-        "Manually choose files within each sample",
-        value=True,
-        help="When enabled, only checked Excel files are used in final plots.",
-    )
+    # Manual file selection is always enabled for the cycling workflow.
+    # The UI no longer exposes this as an option because final plots should
+    # always respect the per-file include/exclude choices made in preview.
+    manual_selection = True
 
     ensure_cycling_selection_store()
 
@@ -1867,6 +2463,31 @@ def render_cycling_analysis_page() -> None:
     for key, value in style_defaults.items():
         st.session_state.setdefault(key, value)
 
+    # Older versions of this app could leave these text fields as empty strings
+    # in session_state. Refill only blank text labels so the Text tab always
+    # opens with useful defaults.
+    text_style_defaults = {
+        "cycling_plot_title": "{sample}",
+        "cycling_x_label": "Cycle Index",
+        "cycling_cap_y_label": "Capacity Retention (%)",
+        "cycling_ce_y_label": "Coulombic Efficiency (%)",
+        "cycling_legend_title": "Files",
+    }
+    for key, value in text_style_defaults.items():
+        if not str(st.session_state.get(key, "")).strip():
+            st.session_state[key] = value
+
+    # Guard against stale or invalid axis values from older sessions.
+    if float(st.session_state.get("cycling_cap_y_max", 110.0)) <= float(st.session_state.get("cycling_cap_y_min", 75.0)):
+        st.session_state["cycling_cap_y_min"] = 75.0
+        st.session_state["cycling_cap_y_max"] = 110.0
+    if float(st.session_state.get("cycling_ce_y_max", 100.5)) <= float(st.session_state.get("cycling_ce_y_min", 90.0)):
+        st.session_state["cycling_ce_y_min"] = 90.0
+        st.session_state["cycling_ce_y_max"] = 100.5
+    if float(st.session_state.get("cycling_x_max", 500.0)) <= float(st.session_state.get("cycling_x_min", 0.0)):
+        st.session_state["cycling_x_min"] = 0.0
+        st.session_state["cycling_x_max"] = 500.0
+
     def current_style_values() -> dict[str, object]:
         return {
             "plot_title": st.session_state.get("cycling_plot_title", "{sample}"),
@@ -1910,6 +2531,82 @@ def render_cycling_analysis_page() -> None:
             root_dir,
             manual_selection=manual_selection,
         )
+
+    def render_final_output_cache(cache: dict[str, object]) -> None:
+        rendered_outputs = cache["rendered_outputs"]
+        summary_df = cache["summary_df"]
+        selected_file_summary_df = cache["selected_file_summary_df"]
+        selection_rows = cache["selection_rows"]
+
+        st.subheader("Final figures")
+        output_cols = st.columns(2)
+        for i, item in enumerate(rendered_outputs):
+            safe_name = safe_filename(str(item["sample"]))
+            with output_cols[i % 2]:
+                st.markdown(f"#### {item['sample']}")
+                display_fig = make_capacity_figure(**item["figure_kwargs"])
+                st.pyplot(display_fig, clear_figure=True)
+                plt.close(display_fig)
+
+                caption = f"Files: {item['files_plotted']} | Points: {len(item['plot_df'])}"
+                if bool(item["adjusted_limits"]) and int(item["numeric_points"]) > 0:
+                    caption += " | Axis range auto-expanded to show data"
+                st.caption(caption)
+
+                d1, d2 = st.columns(2)
+                with d1:
+                    st.download_button(
+                        "CSV",
+                        data=item["csv_bytes"],
+                        file_name=item["csv_file_name"],
+                        mime="text/csv",
+                        key=f"download_csv_live_{safe_name}",
+                    )
+                with d2:
+                    st.download_button(
+                        "PNG",
+                        data=item["png_bytes"],
+                        file_name=item["png_file_name"],
+                        mime="image/png",
+                        key=f"download_png_live_{safe_name}",
+                    )
+
+                with st.expander("Data table"):
+                    st.dataframe(item["plot_df"], use_container_width=True)
+
+        st.success(f"Batch cycling analysis completed. Results saved to: `{cache['output_dir']}`")
+        st.caption("Final figures are rendered from Matplotlib; PNG downloads and ZIP packaging use the saved figure data.")
+
+        st.subheader("Summary")
+        st.dataframe(summary_df, use_container_width=True)
+
+        st.subheader("Selected-file metric summary")
+        if selected_file_summary_df.empty:
+            st.info("No selected-file summary rows were generated.")
+        else:
+            display_cols = ["Sample", "ICE (%)", "Cycle Life", "ACE (%)", "ACE cycle", "Time", "Operator", "File name", "Note"]
+            st.dataframe(
+                format_selected_file_summary_for_display(selected_file_summary_df[display_cols]),
+                use_container_width=True,
+                hide_index=True,
+            )
+            st.download_button(
+                "Download selected-file summary CSV",
+                data=selected_file_summary_df.to_csv(index=False).encode("utf-8"),
+                file_name="capacity_selected_file_summary.csv",
+                mime="text/csv",
+            )
+
+        st.download_button(
+            "Download all cycling results ZIP",
+            data=cache["zip_bytes"],
+            file_name="capacity_batch_results.zip",
+            mime="application/zip",
+        )
+
+        if selection_rows:
+            with st.expander("File selection record"):
+                st.dataframe(pd.DataFrame(selection_rows), use_container_width=True)
 
     if workflow_view == "1. Data preview & file selection":
         st.markdown("### Data preview & file selection")
@@ -1965,26 +2662,54 @@ def render_cycling_analysis_page() -> None:
         else:
             st.caption("Retention cutoff is disabled. File previews, final sample plots, and exported CSV files will keep all valid points.")
 
-        loaded_entries: list[tuple[dict[str, object], pd.DataFrame | None, str | None]] = []
-        with st.spinner(f"Reading individual files for {inspect_sample}..."):
-            for record in file_records:
+        loaded_entries: list[tuple[dict[str, object], pd.DataFrame | None, pd.DataFrame | None, str | None]] = []
+        preview_progress = st.progress(0)
+        preview_status = st.empty()
+        for file_index, record in enumerate(file_records, start=1):
+            preview_status.write(
+                f"Reading {file_index}/{len(file_records)}: {record['source_file']}"
+            )
+            rel = str(record["relative_path"])
+            key = cycling_file_include_key(inspect_sample, rel)
+            file_df, error = load_cached_capacity_file(
+                file_path=record["path"],
+                sample_name=inspect_sample,
+                root_dir=root_dir,
+                sheet_name=sheet_name,
+                capacity_col=capacity_col,
+                efficiency_col=efficiency_col,
+                skip_initial_rows=int(skip_initial_rows),
+                min_retention=preview_min_retention,
+            )
+            raw_df, raw_error = load_raw_capacity_metrics_df(
+                record=record,
+                sample_name=inspect_sample,
+                root_dir=root_dir,
+                sheet_name=sheet_name,
+                capacity_col=capacity_col,
+                efficiency_col=efficiency_col,
+                skip_initial_rows=int(skip_initial_rows),
+            )
+            combined_error = error or raw_error
+            # Invalid/unusable files are always moved to the end and unchecked
+            # before their checkbox is rendered.
+            if file_df is None:
+                st.session_state[key] = False
+            loaded_entries.append((record, file_df, raw_df, combined_error))
+            preview_progress.progress(file_index / len(file_records))
+        preview_status.empty()
+        preview_progress.empty()
+
+        default_marker_key = f"cycling_valid_defaults_applied_{stable_key_part(inspect_sample)}"
+        if (
+            inspect_sample not in st.session_state.get("cycling_saved_selection", {})
+            and not bool(st.session_state.get(default_marker_key, False))
+        ):
+            for record, file_df, _raw_df, _row_error in loaded_entries:
                 rel = str(record["relative_path"])
                 key = cycling_file_include_key(inspect_sample, rel)
-                file_df, error = load_cached_capacity_file(
-                    file_path=record["path"],
-                    sample_name=inspect_sample,
-                    root_dir=root_dir,
-                    sheet_name=sheet_name,
-                    capacity_col=capacity_col,
-                    efficiency_col=efficiency_col,
-                    skip_initial_rows=int(skip_initial_rows),
-                    min_retention=preview_min_retention,
-                )
-                # Invalid/unusable files are always moved to the end and unchecked
-                # before their checkbox is rendered.
-                if file_df is None:
-                    st.session_state[key] = False
-                loaded_entries.append((record, file_df, error))
+                st.session_state[key] = file_df is not None
+            st.session_state[default_marker_key] = True
 
         valid_entries = [entry for entry in loaded_entries if entry[1] is not None]
         invalid_entries = [entry for entry in loaded_entries if entry[1] is None]
@@ -2000,16 +2725,17 @@ def render_cycling_analysis_page() -> None:
         )
 
         st.markdown("#### File previews and checklist")
-        st.caption("Each card shows the filtered preview used for decision-making: cycle plot, cycle life, initial CE, and average CE. Unavailable files are listed last and unchecked.")
+        st.caption("Each compact card shows the filtered preview plus ICE, Cycle Life, ACE, and ACE cycle. Valid files appear first; unavailable files are listed last and unchecked.")
 
-        file_cols = st.columns(2)
-        for i, (record, file_df, row_error) in enumerate(display_entries):
+        file_cols = st.columns(4)
+        for i, (record, file_df, raw_df, row_error) in enumerate(display_entries):
             rel = str(record["relative_path"])
             key = cycling_file_include_key(inspect_sample, rel)
-            with file_cols[i % 2]:
+            with file_cols[i % 4]:
                 render_file_preview_card(
                     record=record,
                     file_df=file_df,
+                    raw_df=raw_df,
                     error=row_error,
                     checkbox_key=key,
                     color_hex=default_color_map[inspect_sample],
@@ -2019,6 +2745,25 @@ def render_cycling_analysis_page() -> None:
                     ce_y_min=90,
                     ce_y_max=100.5,
                 )
+
+        current_sample_summary_df = load_capacity_current_sample_summary_from_entries(loaded_entries)
+        st.markdown("#### Selected-file summary for this sample")
+        if current_sample_summary_df.empty:
+            st.info("No files are currently selected for this sample.")
+        else:
+            display_cols = ["ICE (%)", "Cycle Life", "ACE (%)", "ACE cycle", "Time", "Operator", "File name", "Note"]
+            st.dataframe(
+                format_selected_file_summary_for_display(current_sample_summary_df[display_cols]),
+                use_container_width=True,
+                hide_index=True,
+            )
+            st.download_button(
+                "Download this sample summary CSV",
+                data=current_sample_summary_df.to_csv(index=False).encode("utf-8"),
+                file_name=f"{safe_filename(inspect_sample)}_selected_file_summary.csv",
+                mime="text/csv",
+                use_container_width=True,
+            )
 
         st.divider()
         current_sample_index = selected_samples.index(inspect_sample)
@@ -2049,7 +2794,13 @@ def render_cycling_analysis_page() -> None:
             records = capacity_file_records(sample, folder_map[sample], root_dir)
             saved = st.session_state["cycling_saved_selection"].get(sample)
             if saved is not None:
-                selected = sum(bool(saved.get(str(r["relative_path"]), False)) for r in records)
+                selected = sum(
+                    bool(saved.get(
+                        str(r["relative_path"]),
+                        st.session_state.get(cycling_file_include_key(sample, str(r["relative_path"])), True),
+                    ))
+                    for r in records
+                )
                 status = "saved"
             else:
                 selected = sum(
@@ -2068,7 +2819,7 @@ def render_cycling_analysis_page() -> None:
 
     if workflow_view == "2. Style preview":
         st.markdown("### Style preview")
-        st.caption("Tune figure labels, axes, colors, and legend placement. This preview uses real selected files after the retention cutoff, but it does not write final outputs yet.")
+        st.caption("Tune figure style on the left. The preview on the right always uses real selected files after the retention cutoff.")
 
         unsaved_samples = [
             sample for sample in selected_samples
@@ -2081,28 +2832,32 @@ def render_cycling_analysis_page() -> None:
                 + ". Go back to Data preview & file selection if you want to review them before output."
             )
 
-        controls_col, preview_col = st.columns([1.0, 1.85], gap="large")
+        style_controls_col, style_preview_col = st.columns([0.9, 1.55], gap="large")
 
-        with controls_col:
-            with st.expander("Preview", expanded=True):
-                preview_sample = st.selectbox(
-                    "Preview sample",
-                    options=selected_samples,
-                    key="cycling_preview_sample",
-                    help="This preview always uses real selected files. Final output still processes all selected samples.",
-                )
+        with style_controls_col:
+            preview_sample = st.selectbox(
+                "Preview sample",
+                options=selected_samples,
+                key="cycling_preview_sample",
+                help="This preview always uses real selected files. Final output processes all selected samples.",
+            )
 
-            with st.expander("Plot text", expanded=True):
+            control_tab_1, control_tab_2, control_tab_3, control_tab_4 = st.tabs(
+                ["Text", "Legend", "Axes", "Style"]
+            )
+
+            with control_tab_1:
                 st.text_input(
                     "Plot title",
                     key="cycling_plot_title",
+                    placeholder="{sample}",
                     help='Use "{sample}" to insert the sample folder name.',
                 )
-                st.text_input("X-axis label", key="cycling_x_label")
-                st.text_input("Left Y-axis label", key="cycling_cap_y_label")
-                st.text_input("Right Y-axis label", key="cycling_ce_y_label")
+                st.text_input("X-axis label", key="cycling_x_label", placeholder="Cycle Index")
+                st.text_input("Left Y-axis label", key="cycling_cap_y_label", placeholder="Capacity Retention (%)")
+                st.text_input("Right Y-axis label", key="cycling_ce_y_label", placeholder="Coulombic Efficiency (%)")
 
-            with st.expander("Legend", expanded=True):
+            with control_tab_2:
                 st.checkbox("Show legend", key="cycling_show_legend")
                 show_legend = bool(st.session_state.get("cycling_show_legend", True))
                 legend_position = st.selectbox(
@@ -2110,11 +2865,10 @@ def render_cycling_analysis_page() -> None:
                     ["Top", "Right", "Inside", "Hide"],
                     key="cycling_legend_position",
                     disabled=not show_legend,
-                    help="Top is usually safest for long labels.",
                 )
                 st.text_input("Legend title", key="cycling_legend_title", disabled=not show_legend)
                 st.slider(
-                    "Max legend label length",
+                    "Label length",
                     min_value=8,
                     max_value=80,
                     key="cycling_legend_label_max_len",
@@ -2130,48 +2884,60 @@ def render_cycling_analysis_page() -> None:
                     disabled=(not show_legend or legend_position != "Top"),
                 )
 
-            with st.expander("Axis ranges", expanded=False):
+            with control_tab_3:
                 st.checkbox("Auto X-axis range", key="cycling_auto_x_range")
                 auto_x_range = bool(st.session_state.get("cycling_auto_x_range", True))
-                st.number_input("X min", step=10.0, key="cycling_x_min", disabled=auto_x_range)
-                st.number_input("X max", step=10.0, key="cycling_x_max", disabled=auto_x_range)
-                st.number_input("Capacity retention Y min", step=1.0, key="cycling_cap_y_min")
-                st.number_input("Capacity retention Y max", step=1.0, key="cycling_cap_y_max")
-                st.number_input("Coulombic efficiency Y min", step=0.5, key="cycling_ce_y_min")
-                st.number_input("Coulombic efficiency Y max", step=0.5, key="cycling_ce_y_max")
+                x1, x2 = st.columns(2)
+                with x1:
+                    st.number_input("X min", step=10.0, key="cycling_x_min", disabled=auto_x_range)
+                with x2:
+                    st.number_input("X max", step=10.0, key="cycling_x_max", disabled=auto_x_range)
 
-            with st.expander("Style", expanded=False):
+                y1, y2 = st.columns(2)
+                with y1:
+                    st.number_input("Cap. Y min", step=1.0, key="cycling_cap_y_min")
+                    st.number_input("CE Y min", step=0.5, key="cycling_ce_y_min")
+                with y2:
+                    st.number_input("Cap. Y max", step=1.0, key="cycling_cap_y_max")
+                    st.number_input("CE Y max", step=0.5, key="cycling_ce_y_max")
+
+            with control_tab_4:
                 st.selectbox(
                     "Default color palette",
                     ["Set2 + Dark2 + tab20", "Set2", "Dark2", "tab10", "tab20", "tab20 + tab20b"],
                     key="cycling_palette_name",
                 )
                 st.slider("Marker size", min_value=20, max_value=200, key="cycling_marker_size", step=5)
-                st.number_input("Figure width", min_value=4.0, max_value=20.0, key="cycling_fig_width", step=0.5)
-                st.number_input("Figure height", min_value=3.0, max_value=15.0, key="cycling_fig_height", step=0.5)
-                st.number_input("Saved figure DPI", min_value=72, max_value=600, key="cycling_dpi", step=50)
 
-            style = current_style_values()
-            with st.expander("Sample colors", expanded=False):
+                f1, f2 = st.columns(2)
+                with f1:
+                    st.number_input("Figure width", min_value=4.0, max_value=20.0, key="cycling_fig_width", step=0.5)
+                    st.number_input("DPI", min_value=72, max_value=600, key="cycling_dpi", step=50)
+                with f2:
+                    st.number_input("Figure height", min_value=3.0, max_value=15.0, key="cycling_fig_height", step=0.5)
+
+                style = current_style_values()
                 colors = palette_to_hex_colors(str(style["palette_name"]), len(sample_names))
                 palette_color_map = {sample: colors[i] for i, sample in enumerate(sample_names)}
-                for i, sample in enumerate(selected_samples, start=1):
-                    st.color_picker(
-                        compact_widget_label("Color", i, sample),
-                        value=st.session_state.get(f"cycling_color_{safe_filename(sample)}", palette_color_map[sample]),
-                        key=f"cycling_color_{safe_filename(sample)}",
-                        help=f"Full sample name: {sample}",
-                    )
+
+                with st.expander("Sample colors", expanded=False):
+                    for i, sample in enumerate(selected_samples, start=1):
+                        st.color_picker(
+                            compact_widget_label("Color", i, sample, max_len=18),
+                            value=st.session_state.get(f"cycling_color_{safe_filename(sample)}", palette_color_map[sample]),
+                            key=f"cycling_color_{safe_filename(sample)}",
+                            help=f"Full sample name: {sample}",
+                        )
 
             st.button(
-                "Continue to final output",
+                "Generate final outputs",
                 type="primary",
                 use_container_width=True,
-                on_click=set_cycling_workflow_step,
-                args=("3. Final output",),
+                on_click=save_cycling_style_and_go_final,
+                args=(selected_samples, sample_names),
             )
 
-        with preview_col:
+        with style_preview_col:
             st.markdown("### Live style preview")
             style = current_style_values()
             sample_colors = current_sample_colors(style)
@@ -2234,10 +3000,29 @@ def render_cycling_analysis_page() -> None:
 
     # Final output step
     st.markdown("### Final output")
-    st.caption("Generate, save, preview, and download the final selected sample plots. Output figures are shown two per row for a compact review.")
+    st.caption("Generating, saving, previewing, and packaging the selected sample plots. Output figures are shown two per row for compact review.")
 
     style = current_style_values()
     sample_colors = current_sample_colors(style)
+    selected_paths_by_sample = {sample: selected_paths_for_output(sample) for sample in selected_samples}
+    final_signature = hashlib.sha1(
+        repr(
+            {
+                "root_dir": str(root_dir),
+                "output_dir": str(output_dir),
+                "selected_samples": selected_samples,
+                "selected_paths": selected_paths_by_sample,
+                "sheet_name": sheet_name,
+                "capacity_col": capacity_col,
+                "efficiency_col": efficiency_col,
+                "skip_initial_rows": int(skip_initial_rows),
+                "min_retention": min_retention,
+                "top_n_value": top_n_value,
+                "style": style,
+                "sample_colors": sample_colors,
+            }
+        ).encode("utf-8")
+    ).hexdigest()
 
     unsaved_samples = [
         sample for sample in selected_samples
@@ -2247,28 +3032,36 @@ def render_cycling_analysis_page() -> None:
         st.warning(
             "Some selected samples have not been explicitly saved yet: "
             + ", ".join(shorten_label(s, 28) for s in unsaved_samples)
-            + ". If this is not intentional, go back to Data preview & file selection before generating outputs."
+            + ". Go back to Data preview & file selection if you want to review them before output."
         )
 
-    c_back, c_generate = st.columns([1, 1.3])
-    with c_back:
-        st.button(
-            "Back to style preview",
-            use_container_width=True,
-            on_click=set_cycling_workflow_step,
-            args=("2. Style preview",),
-        )
-    with c_generate:
-        run = st.button("Generate and save final outputs", type="primary", use_container_width=True)
+    st.button(
+        "Back to style preview",
+        use_container_width=False,
+        on_click=set_cycling_workflow_step,
+        args=("2. Style preview",),
+    )
 
-    if not run:
-        st.info("Click **Generate and save final outputs** when the style preview looks correct.")
-        return
+    cached_output = st.session_state.get("cycling_final_output_cache")
+    cache_is_current = bool(
+        cached_output
+        and cached_output.get("signature") == final_signature
+        and all("figure_kwargs" in item for item in cached_output.get("rendered_outputs", []))
+    )
+    if cached_output and not cache_is_current:
+        st.session_state.pop("cycling_final_output_cache", None)
+    if cache_is_current:
+        if st.button("Regenerate final outputs", type="primary", use_container_width=False):
+            st.session_state.pop("cycling_final_output_cache", None)
+        else:
+            render_final_output_cache(cached_output)
+            return
 
     output_dir.mkdir(parents=True, exist_ok=True)
 
     summary_rows = []
     selection_rows = []
+    selected_file_summary_frames: list[pd.DataFrame] = []
     rendered_outputs: list[dict[str, object]] = []
     zip_buffer = io.BytesIO()
 
@@ -2279,7 +3072,7 @@ def render_cycling_analysis_page() -> None:
         for idx, sample_name in enumerate(selected_samples, start=1):
             status.write(f"Processing {sample_name} ({idx}/{len(selected_samples)})...")
 
-            selected_paths = selected_paths_for_output(sample_name)
+            selected_paths = selected_paths_by_sample[sample_name]
             selected_paths_set = set(selected_paths) if selected_paths is not None else None
 
             for record in capacity_file_records(sample_name, folder_map[sample_name], root_dir):
@@ -2317,6 +3110,19 @@ def render_cycling_analysis_page() -> None:
                 progress.progress(idx / len(selected_samples))
                 continue
 
+            sample_file_summary_df = load_capacity_sample_file_summary(
+                sample_name=sample_name,
+                sample_dir=folder_map[sample_name],
+                root_dir=root_dir,
+                sheet_name=sheet_name,
+                capacity_col=capacity_col,
+                efficiency_col=efficiency_col,
+                skip_initial_rows=int(skip_initial_rows),
+                selected_relative_paths=selected_paths,
+            )
+            if not sample_file_summary_df.empty:
+                selected_file_summary_frames.append(sample_file_summary_df)
+
             safe_name = safe_filename(sample_name)
             sample_output_dir = output_dir / safe_name
             sample_output_dir.mkdir(parents=True, exist_ok=True)
@@ -2325,8 +3131,9 @@ def render_cycling_analysis_page() -> None:
             png_path = sample_output_dir / f"{safe_name}_capacity_summary.png"
 
             plot_df.to_csv(csv_path, index=False)
+            effective_limits, numeric_plot_df, adjusted_limits = capacity_figure_limits(plot_df, style)
 
-            fig = make_capacity_figure(
+            figure_kwargs = dict(
                 plot_df=plot_df,
                 sample_name=sample_name,
                 color_hex=sample_colors[sample_name],
@@ -2339,41 +3146,51 @@ def render_cycling_analysis_page() -> None:
                 legend_position=str(style["legend_position"]),
                 legend_label_max_len=int(style["legend_label_max_len"]),
                 legend_columns=int(style["legend_columns"]),
-                auto_x_range=bool(style["auto_x_range"]),
-                x_min=float(style["x_min"]),
-                x_max=float(style["x_max"]),
-                cap_y_min=float(style["cap_y_min"]),
-                cap_y_max=float(style["cap_y_max"]),
-                ce_y_min=float(style["ce_y_min"]),
-                ce_y_max=float(style["ce_y_max"]),
+                auto_x_range=bool(effective_limits["auto_x_range"]),
+                x_min=float(effective_limits["x_min"]),
+                x_max=float(effective_limits["x_max"]),
+                cap_y_min=float(effective_limits["cap_y_min"]),
+                cap_y_max=float(effective_limits["cap_y_max"]),
+                ce_y_min=float(effective_limits["ce_y_min"]),
+                ce_y_max=float(effective_limits["ce_y_max"]),
                 marker_size=int(style["marker_size"]),
                 fig_width=float(style["fig_width"]),
                 fig_height=float(style["fig_height"]),
             )
 
-            fig.savefig(png_path, dpi=int(style["dpi"]), bbox_inches="tight")
+            # Render once to PNG and use the same bytes for preview/download.
+            # This avoids Streamlit/Matplotlib figure-clear timing issues.
+            save_fig = make_capacity_figure(**figure_kwargs)
+            save_fig.canvas.draw()
+            save_fig.savefig(png_path, dpi=int(style["dpi"]), bbox_inches="tight")
 
             png_buffer = io.BytesIO()
-            fig.savefig(png_buffer, format="png", dpi=int(style["dpi"]), bbox_inches="tight")
+            save_fig.savefig(png_buffer, format="png", dpi=int(style["dpi"]), bbox_inches="tight")
             png_buffer.seek(0)
+            png_bytes = png_buffer.getvalue()
+            plt.close(save_fig)
 
             csv_bytes = plot_df.to_csv(index=False).encode("utf-8")
 
             zipf.writestr(f"{safe_name}/{safe_name}_plot_data.csv", csv_bytes)
-            zipf.writestr(f"{safe_name}/{safe_name}_capacity_summary.png", png_buffer.getvalue())
+            zipf.writestr(f"{safe_name}/{safe_name}_capacity_summary.png", png_bytes)
+
+            files_plotted = plot_df["relative_path"].nunique() if "relative_path" in plot_df else plot_df["source_file"].nunique()
 
             rendered_outputs.append(
                 {
                     "sample": sample_name,
-                    "figure": fig,
                     "csv_bytes": csv_bytes,
-                    "png_bytes": png_buffer.getvalue(),
+                    "png_bytes": png_bytes,
                     "csv_file_name": f"{safe_name}_plot_data.csv",
                     "png_file_name": f"{safe_name}_capacity_summary.png",
                     "plot_df": plot_df,
                     "csv_path": str(csv_path),
                     "png_path": str(png_path),
-                    "files_plotted": plot_df["relative_path"].nunique() if "relative_path" in plot_df else plot_df["source_file"].nunique(),
+                    "files_plotted": files_plotted,
+                    "adjusted_limits": adjusted_limits,
+                    "numeric_points": len(numeric_plot_df),
+                    "figure_kwargs": figure_kwargs,
                 }
             )
 
@@ -2395,6 +3212,13 @@ def render_cycling_analysis_page() -> None:
             selection_df_for_zip = pd.DataFrame(selection_rows)
             zipf.writestr("capacity_file_selection.csv", selection_df_for_zip.to_csv(index=False).encode("utf-8"))
 
+        if selected_file_summary_frames:
+            selected_file_summary_for_zip = pd.concat(selected_file_summary_frames, ignore_index=True)
+            zipf.writestr(
+                "capacity_selected_file_summary.csv",
+                selected_file_summary_for_zip.to_csv(index=False).encode("utf-8"),
+            )
+
     status.empty()
     progress.empty()
 
@@ -2411,52 +3235,25 @@ def render_cycling_analysis_page() -> None:
         selection_path = output_dir / "capacity_file_selection.csv"
         selection_df.to_csv(selection_path, index=False)
 
-    st.success(f"Batch cycling analysis completed. Results saved to: `{output_dir}`")
-
-    st.subheader("Final figures")
-    output_cols = st.columns(2)
-    for i, item in enumerate(rendered_outputs):
-        with output_cols[i % 2]:
-            st.markdown(f"#### {item['sample']}")
-            st.pyplot(item["figure"], clear_figure=True)
-
-            d1, d2 = st.columns(2)
-            with d1:
-                st.download_button(
-                    f"CSV",
-                    data=item["csv_bytes"],
-                    file_name=item["csv_file_name"],
-                    mime="text/csv",
-                    key=f"download_csv_{safe_filename(str(item['sample']))}",
-                )
-            with d2:
-                st.download_button(
-                    f"PNG",
-                    data=item["png_bytes"],
-                    file_name=item["png_file_name"],
-                    mime="image/png",
-                    key=f"download_png_{safe_filename(str(item['sample']))}",
-                )
-
-            with st.expander("Data table"):
-                st.dataframe(item["plot_df"], use_container_width=True)
-
-            plt.close(item["figure"])
-
-    st.subheader("Summary")
-    st.dataframe(summary_df, use_container_width=True)
-
-    if selection_rows:
-        with st.expander("File selection record"):
-            st.dataframe(pd.DataFrame(selection_rows), use_container_width=True)
+    selected_file_summary_df = (
+        pd.concat(selected_file_summary_frames, ignore_index=True)
+        if selected_file_summary_frames
+        else pd.DataFrame(columns=["Sample", "ICE (%)", "Cycle Life", "ACE (%)", "ACE cycle", "Time", "Operator", "File name", "Relative path", "Note"])
+    )
+    selected_file_summary_path = output_dir / "capacity_selected_file_summary.csv"
+    selected_file_summary_df.to_csv(selected_file_summary_path, index=False)
 
     zip_buffer.seek(0)
-    st.download_button(
-        "Download all cycling results ZIP",
-        data=zip_buffer.getvalue(),
-        file_name="capacity_batch_results.zip",
-        mime="application/zip",
-    )
+    st.session_state["cycling_final_output_cache"] = {
+        "signature": final_signature,
+        "output_dir": str(output_dir),
+        "rendered_outputs": rendered_outputs,
+        "summary_df": summary_df,
+        "selected_file_summary_df": selected_file_summary_df,
+        "selection_rows": selection_rows,
+        "zip_bytes": zip_buffer.getvalue(),
+    }
+    rerun_streamlit_app()
 
 def render_placeholder_page(title: str) -> None:
     st.title(title)
