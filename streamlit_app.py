@@ -18,6 +18,7 @@ from __future__ import annotations
 import os
 import re
 import io
+import html
 import tempfile
 import zipfile
 import hashlib
@@ -41,6 +42,8 @@ from eis_fit import (
     read_csv_eis,
     read_zfit_xml,
 )
+
+import stripping_batch as stripping
 
 
 # -----------------------------------------------------------------------------
@@ -682,6 +685,21 @@ def find_capacity_excel_files(sample_dir: Path) -> list[Path]:
     return sorted(files)
 
 
+def infer_repeat_from_relative_path(sample_name: str, relative_path: str) -> str:
+    """Infer a repeat label from root-relative path data/sample/repeat/file.xlsx."""
+    parts = Path(str(relative_path)).parts
+    if parts and parts[0] == sample_name:
+        rest = parts[1:]
+    else:
+        rest = parts
+
+    if len(rest) >= 2:
+        return str(rest[0])
+    if rest:
+        return Path(rest[-1]).stem
+    return Path(str(relative_path)).stem or "repeat"
+
+
 def detect_cycle_column(df: pd.DataFrame) -> str | None:
     """
     Detect a cycle index column if it exists.
@@ -772,6 +790,7 @@ def read_one_capacity_file(
     out = pd.DataFrame(
         {
             "sample": sample_name,
+            "repeat": infer_repeat_from_relative_path(sample_name, str(file_path.relative_to(root_dir))),
             "source_file": file_path.name,
             "relative_path": str(file_path.relative_to(root_dir)),
             "cycle_index": cycle_index,
@@ -849,6 +868,7 @@ def read_one_capacity_file_silent(
     out = pd.DataFrame(
         {
             "sample": sample_name,
+            "repeat": infer_repeat_from_relative_path(sample_name, str(file_path.relative_to(root_dir))),
             "source_file": file_path.name,
             "relative_path": str(file_path.relative_to(root_dir)),
             "cycle_index": cycle_index,
@@ -940,6 +960,7 @@ def capacity_file_records(sample_name: str, sample_dir: Path, root_dir: Path) ->
         records.append(
             {
                 "sample": sample_name,
+                "repeat": infer_repeat_from_relative_path(sample_name, relative_path),
                 "source_file": file_path.name,
                 "relative_path": relative_path,
                 "path": file_path,
@@ -1105,6 +1126,8 @@ def save_cycling_style_and_go_final(selected_samples: list[str], all_sample_name
         "ce_y_min": float(st.session_state.get("cycling_ce_y_min", 90.0)),
         "ce_y_max": float(st.session_state.get("cycling_ce_y_max", 100.5)),
         "palette_name": st.session_state.get("cycling_palette_name", "Set2 + Dark2 + tab20"),
+        "plot_mode": st.session_state.get("cycling_plot_mode", "Single sample repeat overlay"),
+        "compare_repeat": st.session_state.get("cycling_compare_repeat", ""),
         "marker_size": int(st.session_state.get("cycling_marker_size", 80)),
         "fig_width": float(st.session_state.get("cycling_fig_width", 9.5)),
         "fig_height": float(st.session_state.get("cycling_fig_height", 5.8)),
@@ -1238,6 +1261,7 @@ def compute_capacity_selection_metrics(
     file_path = Path(record.get("path", ""))
     base = {
         "Sample": record.get("sample", ""),
+        "Repeat": record.get("repeat", ""),
         "ICE (%)": np.nan,
         "Cycle Life": np.nan,
         "ACE (%)": np.nan,
@@ -1304,6 +1328,44 @@ def format_metric_value(value: object, digits: int = 3) -> str:
         return f"{float(value):.{digits}g}"
     except Exception:
         return "—" if value in [None, ""] else str(value)
+
+
+def preview_metric_text(value: object, suffix: str = "", digits: int = 3) -> str:
+    """Format one preview-card metric with the same compact style everywhere."""
+    text = format_metric_value(value, digits=digits)
+    return f"{text}{suffix}" if text != "—" else text
+
+
+def render_preview_metric_grid(metrics: list[tuple[str, str]]) -> None:
+    """Render the shared two-column metric grid used by compact preview cards."""
+    cells = "\n".join(
+        f"<span style='white-space:nowrap; overflow:hidden; text-overflow:ellipsis;'><b>{label}</b>: {value}</span>"
+        for label, value in metrics
+    )
+    st.markdown(
+        f"""
+        <div style="font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+                    font-size:0.74rem; line-height:1.28; height:42px; overflow:hidden; margin-top:-0.25rem;">
+            <div style="display:grid; grid-template-columns: 1fr 1fr; column-gap:0.55rem;">
+                {cells}
+            </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def render_preview_note(note_text: str) -> None:
+    """Render the shared note line below compact preview-card metrics."""
+    note_text = str(note_text or "").strip()
+    if note_text:
+        safe_note = html.escape(note_text)
+        st.markdown(
+            f"<div title='{safe_note}' style='font-size:0.72rem; color:rgba(120,120,120,0.95); height:18px; overflow:hidden; white-space:nowrap; text-overflow:ellipsis;'>Note: {safe_note}</div>",
+            unsafe_allow_html=True,
+        )
+    else:
+        st.markdown("<div style='height:18px;'></div>", unsafe_allow_html=True)
 
 
 def format_selected_file_summary_for_display(summary_df: pd.DataFrame) -> pd.DataFrame:
@@ -1421,7 +1483,7 @@ def load_capacity_all_selected_file_summary(
         if not frame.empty:
             frames.append(frame)
     if not frames:
-        return pd.DataFrame(columns=["Sample", "ICE (%)", "Cycle Life", "ACE (%)", "ACE cycle", "Time", "Operator", "File name", "Relative path", "Note"])
+        return pd.DataFrame(columns=["Sample", "Repeat", "ICE (%)", "Cycle Life", "ACE (%)", "ACE cycle", "Time", "Operator", "File name", "Relative path", "Note"])
     return pd.concat(frames, ignore_index=True)
 
 
@@ -1747,9 +1809,14 @@ def make_capacity_figure(
     for group_id, group in plot_df.groupby(group_key, sort=True):
         group = group.sort_values("cycle_index")
         if "source_file" in group.columns and len(group):
-            full_label = Path(str(group["source_file"].iloc[0])).stem
+            file_label_raw = Path(str(group["source_file"].iloc[0])).stem
         else:
-            full_label = Path(str(group_id)).stem
+            file_label_raw = Path(str(group_id)).stem
+        if "repeat" in group.columns and len(group):
+            repeat_label = str(group["repeat"].iloc[0])
+            full_label = repeat_label if repeat_label == file_label_raw else f"{repeat_label} | {file_label_raw}"
+        else:
+            full_label = file_label_raw
         file_label = shorten_label(full_label, legend_label_max_len)
 
         ax1.scatter(
@@ -1889,6 +1956,183 @@ def make_capacity_figure(
         fig.subplots_adjust(left=0.11, right=0.88, bottom=0.14, top=0.90)
 
     return fig
+
+
+def make_capacity_sample_comparison_figure(
+    plot_df: pd.DataFrame,
+    repeat_name: str,
+    sample_colors: dict[str, str],
+    plot_title: str,
+    x_label: str,
+    cap_y_label: str,
+    ce_y_label: str,
+    legend_title: str,
+    show_legend: bool,
+    auto_x_range: bool,
+    x_min: float,
+    x_max: float,
+    cap_y_min: float,
+    cap_y_max: float,
+    ce_y_min: float,
+    ce_y_max: float,
+    marker_size: int,
+    fig_width: float,
+    fig_height: float,
+    legend_position: str = "Top",
+    legend_label_max_len: int = 24,
+    legend_columns: int = 3,
+):
+    """Make one cycling comparison figure for the same repeat across samples."""
+    plt.rcParams["font.family"] = "sans-serif"
+    plt.rcParams["font.sans-serif"] = ["Arial", "Helvetica", "DejaVu Sans"]
+    plt.rcParams["axes.unicode_minus"] = False
+
+    plot_df = plot_df.copy()
+    for numeric_col in [
+        "cycle_index",
+        "capacity_retention_percent",
+        "coulombic_efficiency_percent",
+    ]:
+        plot_df[numeric_col] = pd.to_numeric(plot_df[numeric_col], errors="coerce")
+    plot_df = plot_df.dropna(
+        subset=["cycle_index", "capacity_retention_percent", "coulombic_efficiency_percent"]
+    )
+
+    fig, ax1 = plt.subplots(figsize=(fig_width, fig_height))
+    ax2 = ax1.twinx()
+    keep_twin_axes_points_visible(ax1, ax2)
+
+    if plot_df.empty:
+        ax1.text(
+            0.5,
+            0.5,
+            "No valid numeric plotting data",
+            ha="center",
+            va="center",
+            transform=ax1.transAxes,
+            fontsize=12,
+        )
+
+    handles_seen: set[str] = set()
+    for sample, sample_df in plot_df.groupby("sample", sort=True):
+        color_rgb = hex_to_rgb_tuple(sample_colors.get(str(sample), "#4E79A7"))
+        label = shorten_label(str(sample), legend_label_max_len)
+        for _group_id, group in sample_df.groupby("relative_path", sort=True):
+            group = group.sort_values("cycle_index")
+            legend_label = label if str(sample) not in handles_seen else "_nolegend_"
+            handles_seen.add(str(sample))
+            ax1.scatter(
+                group["cycle_index"].to_numpy(float),
+                group["capacity_retention_percent"].to_numpy(float),
+                color=color_rgb,
+                marker="o",
+                s=marker_size,
+                alpha=1,
+                zorder=3,
+                label=legend_label,
+            )
+            ax2.scatter(
+                group["cycle_index"].to_numpy(float),
+                group["coulombic_efficiency_percent"].to_numpy(float),
+                facecolors="none",
+                edgecolors=color_rgb,
+                marker="o",
+                s=marker_size,
+                linewidths=1.5,
+                alpha=1,
+                zorder=3,
+            )
+
+    if auto_x_range:
+        x_min_final = 0
+        x_max_final = 100 if plot_df.empty else capacity_auto_x_limit(float(plot_df["cycle_index"].max()))
+    else:
+        x_min_final = float(x_min)
+        x_max_final = float(x_max)
+
+    ax1.set_xlim(x_min_final, x_max_final)
+    ax1.set_ylim(float(cap_y_min), float(cap_y_max))
+    ax2.set_ylim(float(ce_y_min), float(ce_y_max))
+
+    title = plot_title.replace("{repeat}", repeat_name).replace("{sample}", repeat_name)
+    if title.strip():
+        ax1.set_title(title, fontsize=18, pad=14)
+
+    ax1.set_xlabel(x_label, fontsize=18, labelpad=8)
+    ax1.set_ylabel(cap_y_label, fontsize=18, labelpad=8)
+    ax2.set_ylabel(ce_y_label, fontsize=18, labelpad=12)
+
+    for ax in [ax1, ax2]:
+        ax.tick_params(
+            axis="both",
+            which="major",
+            direction="in",
+            labelsize=15,
+            length=6,
+            width=1.5,
+            pad=6,
+        )
+        ax.tick_params(axis="both", which="minor", direction="in", length=4, width=1)
+        for spine in ax.spines.values():
+            spine.set_linewidth(1.5)
+
+    ax1.xaxis.set_minor_locator(AutoMinorLocator(5))
+    ax1.yaxis.set_minor_locator(AutoMinorLocator(5))
+    ax2.yaxis.set_minor_locator(AutoMinorLocator(2))
+
+    legend_position = legend_position if show_legend else "Hide"
+    handles, labels = ax1.get_legend_handles_labels()
+    n_labels = max(1, len(labels))
+    ncol = max(1, min(int(legend_columns), n_labels))
+    legend_rows = int(np.ceil(n_labels / ncol))
+
+    if legend_position == "Top":
+        title_space = 0.08 if title.strip() else 0.0
+        legend_space = min(0.22, 0.075 + 0.045 * legend_rows)
+        top = max(0.58, 1.0 - title_space - legend_space - 0.02)
+        fig.subplots_adjust(left=0.11, right=0.88, bottom=0.14, top=top)
+        fig.legend(
+            handles,
+            labels,
+            loc="upper center",
+            bbox_to_anchor=(0.5, 0.985),
+            ncol=ncol,
+            title=legend_title,
+            fontsize=10,
+            title_fontsize=12,
+            frameon=False,
+            handletextpad=0.4,
+            columnspacing=1.0,
+            borderaxespad=0.0,
+        )
+    elif legend_position == "Right":
+        fig.subplots_adjust(left=0.11, right=0.68, bottom=0.14, top=0.90)
+        fig.legend(
+            handles,
+            labels,
+            loc="center right",
+            bbox_to_anchor=(0.985, 0.53),
+            ncol=1,
+            title=legend_title,
+            fontsize=10,
+            title_fontsize=12,
+            frameon=False,
+            handletextpad=0.4,
+            borderaxespad=0.0,
+        )
+    elif legend_position == "Inside":
+        fig.subplots_adjust(left=0.11, right=0.88, bottom=0.14, top=0.88)
+        ax1.legend(handles, labels, loc="best", title=legend_title, fontsize=10, title_fontsize=12, frameon=False)
+    else:
+        fig.subplots_adjust(left=0.11, right=0.88, bottom=0.14, top=0.90)
+
+    return fig
+
+
+def render_capacity_output_figure(item: dict[str, object]):
+    if item.get("plot_kind") == "sample_comparison":
+        return make_capacity_sample_comparison_figure(**item["figure_kwargs"])
+    return make_capacity_figure(**item["figure_kwargs"])
 
 
 
@@ -2053,14 +2297,10 @@ def render_file_preview_card(
     file_stem = Path(rel).stem
     metrics = compute_capacity_selection_metrics(raw_df, record)
 
-    def metric_text(value: object, suffix: str = "", digits: int = 3) -> str:
-        text = format_metric_value(value, digits=digits)
-        return f"{text}{suffix}" if text != "—" else text
-
-    ice_text = metric_text(metrics.get("ICE (%)"), "%")
-    life_text = metric_text(metrics.get("Cycle Life"), "", digits=4)
-    ace_text = metric_text(metrics.get("ACE (%)"), "%")
-    ace_cycle_text = metric_text(metrics.get("ACE cycle"), "", digits=4)
+    ice_text = preview_metric_text(metrics.get("ICE (%)"), "%")
+    life_text = preview_metric_text(metrics.get("Cycle Life"), "", digits=4)
+    ace_text = preview_metric_text(metrics.get("ACE (%)"), "%")
+    ace_cycle_text = preview_metric_text(metrics.get("ACE cycle"), "", digits=4)
     note_text = str(metrics.get("Note") or (error or ""))
     note_text = note_text.strip()
 
@@ -2102,28 +2342,15 @@ def render_file_preview_card(
             st.pyplot(empty_fig, clear_figure=True)
             plt.close(empty_fig)
 
-        st.markdown(
-            f"""
-            <div style="font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
-                        font-size:0.74rem; line-height:1.28; min-height:42px; margin-top:-0.25rem;">
-                <div style="display:grid; grid-template-columns: 1fr 1fr; column-gap:0.55rem;">
-                    <span><b>ICE</b>: {ice_text}</span>
-                    <span><b>Life</b>: {life_text}</span>
-                    <span><b>ACE</b>: {ace_text}</span>
-                    <span><b>ACE cyc.</b>: {ace_cycle_text}</span>
-                </div>
-            </div>
-            """,
-            unsafe_allow_html=True,
+        render_preview_metric_grid(
+            [
+                ("ICE", ice_text),
+                ("Life", life_text),
+                ("ACE", ace_text),
+                ("ACE cyc.", ace_cycle_text),
+            ]
         )
-
-        if note_text:
-            st.markdown(
-                f"<div style='font-size:0.72rem; color:rgba(120,120,120,0.95); min-height:18px;'>Note: {note_text}</div>",
-                unsafe_allow_html=True,
-            )
-        else:
-            st.markdown("<div style='min-height:18px;'></div>", unsafe_allow_html=True)
+        render_preview_note(note_text)
 
 
 def safe_extract_zip_to_dir(uploaded_zip, extract_dir: Path) -> None:
@@ -2455,6 +2682,8 @@ def render_cycling_analysis_page() -> None:
         "cycling_ce_y_min": 90.0,
         "cycling_ce_y_max": 100.5,
         "cycling_palette_name": "Set2 + Dark2 + tab20",
+        "cycling_plot_mode": "Single sample repeat overlay",
+        "cycling_compare_repeat": "",
         "cycling_marker_size": 80,
         "cycling_fig_width": 9.5,
         "cycling_fig_height": 5.8,
@@ -2507,6 +2736,8 @@ def render_cycling_analysis_page() -> None:
             "ce_y_min": float(st.session_state.get("cycling_ce_y_min", 90.0)),
             "ce_y_max": float(st.session_state.get("cycling_ce_y_max", 100.5)),
             "palette_name": st.session_state.get("cycling_palette_name", "Set2 + Dark2 + tab20"),
+            "plot_mode": st.session_state.get("cycling_plot_mode", "Single sample repeat overlay"),
+            "compare_repeat": st.session_state.get("cycling_compare_repeat", ""),
             "marker_size": int(st.session_state.get("cycling_marker_size", 80)),
             "fig_width": float(st.session_state.get("cycling_fig_width", 9.5)),
             "fig_height": float(st.session_state.get("cycling_fig_height", 5.8)),
@@ -2532,6 +2763,17 @@ def render_cycling_analysis_page() -> None:
             manual_selection=manual_selection,
         )
 
+    def available_repeats_for_selected_paths() -> list[str]:
+        repeats: set[str] = set()
+        for sample in selected_samples:
+            selected_paths = selected_paths_for_output(sample)
+            selected_set = set(selected_paths) if selected_paths is not None else None
+            for record in capacity_file_records(sample, folder_map[sample], root_dir):
+                if selected_set is not None and str(record["relative_path"]) not in selected_set:
+                    continue
+                repeats.add(str(record.get("repeat") or "repeat"))
+        return sorted(repeats)
+
     def render_final_output_cache(cache: dict[str, object]) -> None:
         rendered_outputs = cache["rendered_outputs"]
         summary_df = cache["summary_df"]
@@ -2541,10 +2783,11 @@ def render_cycling_analysis_page() -> None:
         st.subheader("Final figures")
         output_cols = st.columns(2)
         for i, item in enumerate(rendered_outputs):
-            safe_name = safe_filename(str(item["sample"]))
+            display_name = str(item.get("sample", item.get("repeat", "comparison")))
+            safe_name = safe_filename(display_name)
             with output_cols[i % 2]:
-                st.markdown(f"#### {item['sample']}")
-                display_fig = make_capacity_figure(**item["figure_kwargs"])
+                st.markdown(f"#### {display_name}")
+                display_fig = render_capacity_output_figure(item)
                 st.pyplot(display_fig, clear_figure=True)
                 plt.close(display_fig)
 
@@ -2584,7 +2827,7 @@ def render_cycling_analysis_page() -> None:
         if selected_file_summary_df.empty:
             st.info("No selected-file summary rows were generated.")
         else:
-            display_cols = ["Sample", "ICE (%)", "Cycle Life", "ACE (%)", "ACE cycle", "Time", "Operator", "File name", "Note"]
+            display_cols = ["Sample", "Repeat", "ICE (%)", "Cycle Life", "ACE (%)", "ACE cycle", "Time", "Operator", "File name", "Note"]
             st.dataframe(
                 format_selected_file_summary_for_display(selected_file_summary_df[display_cols]),
                 use_container_width=True,
@@ -2751,7 +2994,7 @@ def render_cycling_analysis_page() -> None:
         if current_sample_summary_df.empty:
             st.info("No files are currently selected for this sample.")
         else:
-            display_cols = ["ICE (%)", "Cycle Life", "ACE (%)", "ACE cycle", "Time", "Operator", "File name", "Note"]
+            display_cols = ["Repeat", "ICE (%)", "Cycle Life", "ACE (%)", "ACE cycle", "Time", "Operator", "File name", "Note"]
             st.dataframe(
                 format_selected_file_summary_for_display(current_sample_summary_df[display_cols]),
                 use_container_width=True,
@@ -2840,6 +3083,21 @@ def render_cycling_analysis_page() -> None:
                 options=selected_samples,
                 key="cycling_preview_sample",
                 help="This preview always uses real selected files. Final output processes all selected samples.",
+            )
+            repeat_options = available_repeats_for_selected_paths()
+            if repeat_options and st.session_state.get("cycling_compare_repeat") not in repeat_options:
+                st.session_state["cycling_compare_repeat"] = repeat_options[0]
+            st.selectbox(
+                "Plot mode",
+                ["Single sample repeat overlay", "Compare samples by one repeat"],
+                key="cycling_plot_mode",
+                help="Use the first mode for all repeats/files within one sample, or compare the same repeat across selected samples.",
+            )
+            st.selectbox(
+                "Repeat to compare",
+                options=repeat_options or [""],
+                key="cycling_compare_repeat",
+                disabled=st.session_state.get("cycling_plot_mode") != "Compare samples by one repeat",
             )
 
             control_tab_1, control_tab_2, control_tab_3, control_tab_4 = st.tabs(
@@ -2942,53 +3200,108 @@ def render_cycling_analysis_page() -> None:
             style = current_style_values()
             sample_colors = current_sample_colors(style)
             selected_preview_paths = selected_paths_for_output(preview_sample)
+            plot_mode = str(style.get("plot_mode", "Single sample repeat overlay"))
+            compare_repeat = str(style.get("compare_repeat", ""))
 
-            if selected_preview_paths is not None and len(selected_preview_paths) == 0:
-                preview_df, preview_file_count = None, 0
+            if plot_mode == "Compare samples by one repeat":
+                preview_frames = []
+                preview_file_count = 0
+                for sample in selected_samples:
+                    selected_paths = selected_paths_for_output(sample)
+                    if selected_paths is not None and len(selected_paths) == 0:
+                        continue
+                    with st.spinner(f"Loading {compare_repeat} for {sample}..."):
+                        sample_df, sample_file_count = load_capacity_sample_plot_data(
+                            sample_name=sample,
+                            sample_dir=folder_map[sample],
+                            root_dir=root_dir,
+                            sheet_name=sheet_name,
+                            capacity_col=capacity_col,
+                            efficiency_col=efficiency_col,
+                            skip_initial_rows=int(skip_initial_rows),
+                            min_retention=min_retention,
+                            top_n_value=None,
+                            selected_relative_paths=selected_paths,
+                        )
+                    preview_file_count += sample_file_count
+                    if sample_df is not None and "repeat" in sample_df.columns:
+                        filtered = sample_df[sample_df["repeat"].astype(str) == compare_repeat].copy()
+                        if not filtered.empty:
+                            preview_frames.append(filtered)
+                preview_df = pd.concat(preview_frames, ignore_index=True) if preview_frames else None
             else:
-                with st.spinner(f"Loading selected preview files for {preview_sample}..."):
-                    preview_df, preview_file_count = load_capacity_sample_plot_data(
-                        sample_name=preview_sample,
-                        sample_dir=folder_map[preview_sample],
-                        root_dir=root_dir,
-                        sheet_name=sheet_name,
-                        capacity_col=capacity_col,
-                        efficiency_col=efficiency_col,
-                        skip_initial_rows=int(skip_initial_rows),
-                        min_retention=min_retention,
-                        top_n_value=top_n_value,
-                        selected_relative_paths=selected_preview_paths,
-                    )
+                if selected_preview_paths is not None and len(selected_preview_paths) == 0:
+                    preview_df, preview_file_count = None, 0
+                else:
+                    with st.spinner(f"Loading selected preview files for {preview_sample}..."):
+                        preview_df, preview_file_count = load_capacity_sample_plot_data(
+                            sample_name=preview_sample,
+                            sample_dir=folder_map[preview_sample],
+                            root_dir=root_dir,
+                            sheet_name=sheet_name,
+                            capacity_col=capacity_col,
+                            efficiency_col=efficiency_col,
+                            skip_initial_rows=int(skip_initial_rows),
+                            min_retention=min_retention,
+                            top_n_value=top_n_value,
+                            selected_relative_paths=selected_preview_paths,
+                        )
 
             if preview_file_count == 0:
-                st.warning(f"No selected Excel files found for preview sample `{preview_sample}`.")
+                st.warning("No selected Excel files found for preview.")
             elif preview_df is None:
-                st.warning(f"No valid cycling data found for preview sample `{preview_sample}`.")
+                st.warning("No valid cycling data found for this preview.")
             else:
-                preview_fig = make_capacity_figure(
-                    plot_df=preview_df,
-                    sample_name=preview_sample,
-                    color_hex=sample_colors[preview_sample],
-                    plot_title=str(style["plot_title"]),
-                    x_label=str(style["x_label"]),
-                    cap_y_label=str(style["cap_y_label"]),
-                    ce_y_label=str(style["ce_y_label"]),
-                    legend_title=str(style["legend_title"]),
-                    show_legend=bool(style["show_legend"]),
-                    legend_position=str(style["legend_position"]),
-                    legend_label_max_len=int(style["legend_label_max_len"]),
-                    legend_columns=int(style["legend_columns"]),
-                    auto_x_range=bool(style["auto_x_range"]),
-                    x_min=float(style["x_min"]),
-                    x_max=float(style["x_max"]),
-                    cap_y_min=float(style["cap_y_min"]),
-                    cap_y_max=float(style["cap_y_max"]),
-                    ce_y_min=float(style["ce_y_min"]),
-                    ce_y_max=float(style["ce_y_max"]),
-                    marker_size=int(style["marker_size"]),
-                    fig_width=float(style["fig_width"]),
-                    fig_height=float(style["fig_height"]),
-                )
+                if plot_mode == "Compare samples by one repeat":
+                    preview_fig = make_capacity_sample_comparison_figure(
+                        plot_df=preview_df,
+                        repeat_name=compare_repeat,
+                        sample_colors=sample_colors,
+                        plot_title=str(style["plot_title"]),
+                        x_label=str(style["x_label"]),
+                        cap_y_label=str(style["cap_y_label"]),
+                        ce_y_label=str(style["ce_y_label"]),
+                        legend_title=str(style["legend_title"]),
+                        show_legend=bool(style["show_legend"]),
+                        legend_position=str(style["legend_position"]),
+                        legend_label_max_len=int(style["legend_label_max_len"]),
+                        legend_columns=int(style["legend_columns"]),
+                        auto_x_range=bool(style["auto_x_range"]),
+                        x_min=float(style["x_min"]),
+                        x_max=float(style["x_max"]),
+                        cap_y_min=float(style["cap_y_min"]),
+                        cap_y_max=float(style["cap_y_max"]),
+                        ce_y_min=float(style["ce_y_min"]),
+                        ce_y_max=float(style["ce_y_max"]),
+                        marker_size=int(style["marker_size"]),
+                        fig_width=float(style["fig_width"]),
+                        fig_height=float(style["fig_height"]),
+                    )
+                else:
+                    preview_fig = make_capacity_figure(
+                        plot_df=preview_df,
+                        sample_name=preview_sample,
+                        color_hex=sample_colors[preview_sample],
+                        plot_title=str(style["plot_title"]),
+                        x_label=str(style["x_label"]),
+                        cap_y_label=str(style["cap_y_label"]),
+                        ce_y_label=str(style["ce_y_label"]),
+                        legend_title=str(style["legend_title"]),
+                        show_legend=bool(style["show_legend"]),
+                        legend_position=str(style["legend_position"]),
+                        legend_label_max_len=int(style["legend_label_max_len"]),
+                        legend_columns=int(style["legend_columns"]),
+                        auto_x_range=bool(style["auto_x_range"]),
+                        x_min=float(style["x_min"]),
+                        x_max=float(style["x_max"]),
+                        cap_y_min=float(style["cap_y_min"]),
+                        cap_y_max=float(style["cap_y_max"]),
+                        ce_y_min=float(style["ce_y_min"]),
+                        ce_y_max=float(style["ce_y_max"]),
+                        marker_size=int(style["marker_size"]),
+                        fig_width=float(style["fig_width"]),
+                        fig_height=float(style["fig_height"]),
+                    )
                 st.pyplot(preview_fig, clear_figure=True)
                 plt.close(preview_fig)
 
@@ -3067,9 +3380,145 @@ def render_cycling_analysis_page() -> None:
 
     progress = st.progress(0)
     status = st.empty()
+    plot_mode = str(style.get("plot_mode", "Single sample repeat overlay"))
+    compare_repeat = str(style.get("compare_repeat", ""))
 
     with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zipf:
-        for idx, sample_name in enumerate(selected_samples, start=1):
+        if plot_mode == "Compare samples by one repeat":
+            comparison_frames = []
+            total_files_found = 0
+            for idx, sample_name in enumerate(selected_samples, start=1):
+                status.write(f"Processing {sample_name} ({idx}/{len(selected_samples)})...")
+                selected_paths = selected_paths_by_sample[sample_name]
+                selected_paths_set = set(selected_paths) if selected_paths is not None else None
+
+                for record in capacity_file_records(sample_name, folder_map[sample_name], root_dir):
+                    rel = str(record["relative_path"])
+                    included = selected_paths_set is None or rel in selected_paths_set
+                    repeat_match = str(record.get("repeat", "")) == compare_repeat
+                    selection_rows.append(
+                        {
+                            "sample": sample_name,
+                            "repeat": record.get("repeat", ""),
+                            "source_file": record["source_file"],
+                            "relative_path": rel,
+                            "included": included and repeat_match,
+                        }
+                    )
+
+                plot_df, excel_file_count = load_capacity_sample_plot_data(
+                    sample_name=sample_name,
+                    sample_dir=folder_map[sample_name],
+                    root_dir=root_dir,
+                    sheet_name=sheet_name,
+                    capacity_col=capacity_col,
+                    efficiency_col=efficiency_col,
+                    skip_initial_rows=int(skip_initial_rows),
+                    min_retention=min_retention,
+                    top_n_value=None,
+                    selected_relative_paths=selected_paths,
+                )
+                total_files_found += excel_file_count
+
+                sample_file_summary_df = load_capacity_sample_file_summary(
+                    sample_name=sample_name,
+                    sample_dir=folder_map[sample_name],
+                    root_dir=root_dir,
+                    sheet_name=sheet_name,
+                    capacity_col=capacity_col,
+                    efficiency_col=efficiency_col,
+                    skip_initial_rows=int(skip_initial_rows),
+                    selected_relative_paths=selected_paths,
+                )
+                if not sample_file_summary_df.empty:
+                    selected_file_summary_frames.append(sample_file_summary_df)
+
+                if plot_df is not None and "repeat" in plot_df.columns:
+                    filtered = plot_df[plot_df["repeat"].astype(str) == compare_repeat].copy()
+                    if not filtered.empty:
+                        comparison_frames.append(filtered)
+                progress.progress(idx / len(selected_samples))
+
+            if comparison_frames:
+                plot_df = pd.concat(comparison_frames, ignore_index=True)
+                safe_name = safe_filename(f"repeat_{compare_repeat}_sample_comparison")
+                csv_path = output_dir / f"{safe_name}_plot_data.csv"
+                png_path = output_dir / f"{safe_name}_capacity_summary.png"
+                plot_df.to_csv(csv_path, index=False)
+                effective_limits, numeric_plot_df, adjusted_limits = capacity_figure_limits(plot_df, style)
+
+                figure_kwargs = dict(
+                    plot_df=plot_df,
+                    repeat_name=compare_repeat,
+                    sample_colors=sample_colors,
+                    plot_title=str(style["plot_title"]),
+                    x_label=str(style["x_label"]),
+                    cap_y_label=str(style["cap_y_label"]),
+                    ce_y_label=str(style["ce_y_label"]),
+                    legend_title=str(style["legend_title"]),
+                    show_legend=bool(style["show_legend"]),
+                    legend_position=str(style["legend_position"]),
+                    legend_label_max_len=int(style["legend_label_max_len"]),
+                    legend_columns=int(style["legend_columns"]),
+                    auto_x_range=bool(effective_limits["auto_x_range"]),
+                    x_min=float(effective_limits["x_min"]),
+                    x_max=float(effective_limits["x_max"]),
+                    cap_y_min=float(effective_limits["cap_y_min"]),
+                    cap_y_max=float(effective_limits["cap_y_max"]),
+                    ce_y_min=float(effective_limits["ce_y_min"]),
+                    ce_y_max=float(effective_limits["ce_y_max"]),
+                    marker_size=int(style["marker_size"]),
+                    fig_width=float(style["fig_width"]),
+                    fig_height=float(style["fig_height"]),
+                )
+
+                save_fig = make_capacity_sample_comparison_figure(**figure_kwargs)
+                save_fig.canvas.draw()
+                save_fig.savefig(png_path, dpi=int(style["dpi"]), bbox_inches="tight")
+                png_buffer = io.BytesIO()
+                save_fig.savefig(png_buffer, format="png", dpi=int(style["dpi"]), bbox_inches="tight")
+                png_buffer.seek(0)
+                png_bytes = png_buffer.getvalue()
+                plt.close(save_fig)
+
+                csv_bytes = plot_df.to_csv(index=False).encode("utf-8")
+                zipf.writestr(f"{safe_name}/{safe_name}_plot_data.csv", csv_bytes)
+                zipf.writestr(f"{safe_name}/{safe_name}_capacity_summary.png", png_bytes)
+
+                rendered_outputs.append(
+                    {
+                        "plot_kind": "sample_comparison",
+                        "repeat": f"Repeat comparison: {compare_repeat}",
+                        "csv_bytes": csv_bytes,
+                        "png_bytes": png_bytes,
+                        "csv_file_name": f"{safe_name}_plot_data.csv",
+                        "png_file_name": f"{safe_name}_capacity_summary.png",
+                        "plot_df": plot_df,
+                        "csv_path": str(csv_path),
+                        "png_path": str(png_path),
+                        "files_plotted": plot_df["relative_path"].nunique(),
+                        "adjusted_limits": adjusted_limits,
+                        "numeric_points": len(numeric_plot_df),
+                        "figure_kwargs": figure_kwargs,
+                    }
+                )
+                summary_rows.append(
+                    {
+                        "sample": "sample comparison",
+                        "repeat": compare_repeat,
+                        "files_found": total_files_found,
+                        "files_plotted": rendered_outputs[-1]["files_plotted"],
+                        "points_plotted": len(plot_df),
+                        "color": "by sample",
+                        "csv_path": str(csv_path),
+                        "png_path": str(png_path),
+                    }
+                )
+            else:
+                st.warning(f"No selected cycling data found for repeat `{compare_repeat}`.")
+
+        samples_to_process = [] if plot_mode == "Compare samples by one repeat" else selected_samples
+        for idx, sample_name in enumerate(samples_to_process, start=1):
             status.write(f"Processing {sample_name} ({idx}/{len(selected_samples)})...")
 
             selected_paths = selected_paths_by_sample[sample_name]
@@ -3238,7 +3687,7 @@ def render_cycling_analysis_page() -> None:
     selected_file_summary_df = (
         pd.concat(selected_file_summary_frames, ignore_index=True)
         if selected_file_summary_frames
-        else pd.DataFrame(columns=["Sample", "ICE (%)", "Cycle Life", "ACE (%)", "ACE cycle", "Time", "Operator", "File name", "Relative path", "Note"])
+        else pd.DataFrame(columns=["Sample", "Repeat", "ICE (%)", "Cycle Life", "ACE (%)", "ACE cycle", "Time", "Operator", "File name", "Relative path", "Note"])
     )
     selected_file_summary_path = output_dir / "capacity_selected_file_summary.csv"
     selected_file_summary_df.to_csv(selected_file_summary_path, index=False)
@@ -3254,6 +3703,1156 @@ def render_cycling_analysis_page() -> None:
         "zip_bytes": zip_buffer.getvalue(),
     }
     rerun_streamlit_app()
+
+
+# -----------------------------------------------------------------------------
+# Stripping-cell batch analysis
+# -----------------------------------------------------------------------------
+
+
+def ensure_stripping_selection_store() -> None:
+    if "stripping_saved_selection" not in st.session_state:
+        st.session_state["stripping_saved_selection"] = {}
+
+
+STRIPPING_PLOT_MODE_SINGLE = "Single sample repeat overlay"
+STRIPPING_PLOT_MODE_COMPARE = "Compare all selected samples"
+STRIPPING_COMPARE_MODE_ALIASES = {
+    STRIPPING_PLOT_MODE_COMPARE,
+    "Compare all selected samples by one repeat",
+    "Compare samples by one repeat",
+}
+
+
+def is_stripping_compare_mode(plot_mode: object) -> bool:
+    return str(plot_mode) in STRIPPING_COMPARE_MODE_ALIASES
+
+
+def normalize_stripping_plot_mode(plot_mode: object) -> str:
+    return STRIPPING_PLOT_MODE_COMPARE if is_stripping_compare_mode(plot_mode) else STRIPPING_PLOT_MODE_SINGLE
+
+
+def stripping_file_include_key(sample: str, repeat: str, source_path: str) -> str:
+    return f"stripping_include_{stable_key_part(sample)}_{stable_key_part(repeat)}_{stable_key_part(source_path)}"
+
+
+def collect_stripping_file_records(root_dir: Path, output_dir: Path) -> list[dict[str, object]]:
+    output_dir_name = output_dir.name if output_dir.parent.resolve() == root_dir.resolve() else "__streamlit_stripping_outputs__"
+    files = stripping.collect_excel_files(root_dir, output_dir_name=output_dir_name)
+    records = []
+    for file_info in files:
+        try:
+            if output_dir.resolve() in file_info.path.resolve().parents:
+                continue
+        except Exception:
+            pass
+        records.append(
+            {
+                "sample": file_info.sample,
+                "repeat": file_info.repeat,
+                "source_file": file_info.path.name,
+                "relative_path": str(file_info.path.relative_to(root_dir)),
+                "path": file_info.path,
+            }
+        )
+    return records
+
+
+def save_stripping_selection_for_sample(sample_name: str, file_records: list[dict[str, object]]) -> None:
+    ensure_stripping_selection_store()
+    saved = {}
+    for record in file_records:
+        rel = str(record["relative_path"])
+        key = stripping_file_include_key(sample_name, str(record["repeat"]), rel)
+        saved[rel] = bool(st.session_state.get(key, True))
+    st.session_state["stripping_saved_selection"][sample_name] = saved
+
+
+def save_current_stripping_selection_and_advance(
+    current_sample: str,
+    selected_samples: list[str],
+    records_by_sample: dict[str, list[dict[str, object]]],
+) -> None:
+    """Save the current stripping sample selection and advance the workflow."""
+    ensure_stripping_selection_store()
+    if current_sample not in selected_samples:
+        return
+
+    save_stripping_selection_for_sample(current_sample, records_by_sample[current_sample])
+    current_idx = selected_samples.index(current_sample)
+    if current_idx < len(selected_samples) - 1:
+        st.session_state["stripping_inspect_sample"] = selected_samples[current_idx + 1]
+        st.session_state["stripping_workflow_step"] = "1. Data preview & file selection"
+    else:
+        st.session_state["stripping_workflow_step"] = "2. Style preview"
+
+
+def set_stripping_workflow_step(step: str) -> None:
+    """Set the stripping workflow step from a Streamlit callback."""
+    st.session_state["stripping_workflow_step"] = step
+
+
+def reset_stripping_visual_style_defaults() -> None:
+    """Keep stripping plot-mode changes from carrying stale visual styling."""
+    normalization = st.session_state.get("stripping_normalization", "area")
+    if normalization == "area":
+        x_label = "Capacity (mAh/cm$^2$)"
+    elif normalization == "test-dchg":
+        x_label = "Normalized capacity by test DChg divisor"
+    else:
+        x_label = "Capacity (mAh)"
+
+    defaults = {
+        "stripping_plot_title": "{sample}",
+        "stripping_x_label": x_label,
+        "stripping_y_label": "Voltage (V)",
+        "stripping_show_legend": True,
+        "stripping_legend_position": "Top",
+        "stripping_legend_title": "Repeats",
+        "stripping_legend_label_max_len": 28,
+        "stripping_legend_columns": 3,
+        "stripping_auto_x_range": True,
+        "stripping_x_min": -0.5,
+        "stripping_x_max": 7.5,
+        "stripping_small_capacity_limit": 2.0,
+        "stripping_large_capacity_limit": 7.5,
+        "stripping_y_min": -1.0,
+        "stripping_y_max": 0.2,
+        "stripping_palette_name": "Set2 + Dark2 + tab20",
+        "stripping_linewidth": 2.2,
+        "stripping_fig_width": 6.0,
+        "stripping_fig_height": 4.6,
+        "stripping_dpi": 300,
+    }
+    for key, value in defaults.items():
+        st.session_state[key] = value
+
+
+def save_all_stripping_selections_and_go_style(
+    selected_samples: list[str],
+    records_by_sample: dict[str, list[dict[str, object]]],
+) -> None:
+    """Save all currently visible stripping selections and advance to style preview."""
+    ensure_stripping_selection_store()
+    for sample in selected_samples:
+        if sample in records_by_sample:
+            save_stripping_selection_for_sample(sample, records_by_sample[sample])
+    st.session_state["stripping_workflow_step"] = "2. Style preview"
+
+
+def selected_stripping_paths_for_sample(sample_name: str, file_records: list[dict[str, object]]) -> list[str]:
+    ensure_stripping_selection_store()
+    saved = st.session_state["stripping_saved_selection"].get(sample_name)
+    selected = []
+    for record in file_records:
+        rel = str(record["relative_path"])
+        key = stripping_file_include_key(sample_name, str(record["repeat"]), rel)
+        include = bool(saved.get(rel, st.session_state.get(key, True))) if saved is not None else bool(st.session_state.get(key, True))
+        if include:
+            selected.append(rel)
+    return selected
+
+
+def stripping_summary_is_short(summary_row: dict[str, object]) -> bool:
+    return "short" in str(summary_row.get("Status", "")).lower()
+
+
+@st.cache_data(show_spinner=False)
+def cached_read_stripping_file(
+    file_path_str: str,
+    sample: str,
+    repeat: str,
+    area: float,
+    operator: str,
+    normalization: str,
+    step_type: str,
+    valley_window: int,
+    short_capacity_threshold: float,
+    file_size: int,
+    file_mtime: float,
+) -> tuple[pd.DataFrame | None, dict[str, object], str | None]:
+    _ = file_size, file_mtime
+    file_info = stripping.FileInfo(path=Path(file_path_str), sample=sample, repeat=repeat)
+    metadata = stripping.read_metadata(file_info.path, area=float(area), default_operator=operator)
+    try:
+        record_numeric, plot_df = stripping.read_record_data(
+            file_info=file_info,
+            metadata=metadata,
+            area=float(area),
+            normalization=normalization,
+            step_type=step_type,
+        )
+        nucleation_mV, plateau_mV, overp_mV = stripping.compute_summary_metrics(
+            record_numeric=record_numeric,
+            metadata=metadata,
+            valley_window=int(valley_window),
+        )
+        file_max = stripping.max_plot_capacity(plot_df)
+        is_short = file_max is not None and file_max > float(short_capacity_threshold)
+        if is_short:
+            metadata.status = stripping.append_status(metadata.status, "short")
+        plot_df.attrs["is_short"] = is_short
+    except Exception as exc:
+        plot_df = None
+        nucleation_mV = "N/A"
+        plateau_mV = "N/A"
+        overp_mV = "N/A"
+        metadata.status = f"record error: {exc}"
+        return None, {
+            "Sample": sample,
+            "Repeat": repeat,
+            "Nucleation (ohm)": nucleation_mV,
+            "Plateau (mV)": plateau_mV,
+            "Overp. (mV)": overp_mV,
+            "Cap. (mAh/cm2)": metadata.areal_capacity_mAh_cm2,
+            "Time": metadata.time,
+            "Operator": metadata.operator,
+            "File name": metadata.displayed_file_name,
+            "Source path": file_path_str,
+            "Status": metadata.status,
+        }, str(exc)
+
+    return plot_df, {
+        "Sample": sample,
+        "Repeat": repeat,
+        "Nucleation (ohm)": nucleation_mV,
+        "Plateau (mV)": plateau_mV,
+        "Overp. (mV)": overp_mV,
+        "Cap. (mAh/cm2)": metadata.areal_capacity_mAh_cm2,
+        "Time": metadata.time,
+        "Operator": metadata.operator,
+        "File name": metadata.displayed_file_name,
+        "Source path": file_path_str,
+        "Status": metadata.status,
+    }, None
+
+
+def load_cached_stripping_file(
+    record: dict[str, object],
+    area: float,
+    operator: str,
+    normalization: str,
+    step_type: str,
+    valley_window: int,
+    short_capacity_threshold: float,
+) -> tuple[pd.DataFrame | None, dict[str, object], str | None]:
+    path = Path(record["path"])
+    stat = path.stat()
+    return cached_read_stripping_file(
+        file_path_str=str(path),
+        sample=str(record["sample"]),
+        repeat=str(record["repeat"]),
+        area=float(area),
+        operator=operator,
+        normalization=normalization,
+        step_type=step_type,
+        valley_window=int(valley_window),
+        short_capacity_threshold=float(short_capacity_threshold),
+        file_size=int(stat.st_size),
+        file_mtime=float(stat.st_mtime),
+    )
+
+
+def stripping_x_axis_label(normalization: str) -> str:
+    if normalization == "area":
+        return "Capacity (mAh/cm$^2$)"
+    if normalization == "test-dchg":
+        return "Normalized capacity by test DChg divisor"
+    return "Capacity (mAh)"
+
+
+def clean_stripping_plot_df(plot_df: pd.DataFrame) -> pd.DataFrame:
+    df = plot_df.copy()
+    for col in ["Plot x", "Plot y"]:
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+    return df.dropna(subset=["Plot x", "Plot y"])
+
+
+def stripping_figure_limits(plot_df: pd.DataFrame, style: dict[str, object]) -> tuple[dict[str, object], pd.DataFrame, bool]:
+    numeric_df = clean_stripping_plot_df(plot_df)
+    if numeric_df.empty:
+        return {
+            "auto_x_range": bool(style["auto_x_range"]),
+            "x_min": float(style["x_min"]),
+            "x_max": float(style["x_max"]),
+            "y_min": float(style["y_min"]),
+            "y_max": float(style["y_max"]),
+        }, numeric_df, False
+
+    adjusted = False
+    if bool(style["auto_x_range"]):
+        x_min = float(style["x_min"])
+        max_x = float(numeric_df["Plot x"].max())
+        x_max = float(style["small_capacity_limit"]) if max_x <= float(style["small_capacity_limit"]) else float(style["large_capacity_limit"])
+    else:
+        x_min = float(style["x_min"])
+        x_max = float(style["x_max"])
+    y_min = float(style["y_min"])
+    y_max = float(style["y_max"])
+
+    visible = numeric_df["Plot x"].between(x_min, x_max)
+    if not visible.any():
+        x_min = min(float(style["x_min"]), float(numeric_df["Plot x"].min()))
+        x_max = max(float(style["large_capacity_limit"]), float(numeric_df["Plot x"].max()))
+        visible = numeric_df["Plot x"].between(x_min, x_max)
+        adjusted = True
+    if not (visible & numeric_df["Plot y"].between(y_min, y_max)).any():
+        y_min, y_max = padded_limits(numeric_df.loc[visible, "Plot y"], -1.0, 0.2, 0.05)
+        adjusted = True
+    return {"auto_x_range": bool(style["auto_x_range"]), "x_min": x_min, "x_max": x_max, "y_min": y_min, "y_max": y_max}, numeric_df, adjusted
+
+
+def make_stripping_figure(
+    plot_df: pd.DataFrame,
+    title_name: str,
+    sample_colors: dict[str, str],
+    plot_mode: str,
+    plot_title: str,
+    x_label: str,
+    y_label: str,
+    legend_title: str,
+    show_legend: bool,
+    x_min: float,
+    x_max: float,
+    y_min: float,
+    y_max: float,
+    linewidth: float,
+    fig_width: float,
+    fig_height: float,
+    legend_position: str = "Top",
+    legend_label_max_len: int = 28,
+    legend_columns: int = 3,
+):
+    df = clean_stripping_plot_df(plot_df)
+    fig, ax = plt.subplots(figsize=(fig_width, fig_height))
+
+    if df.empty:
+        ax.text(0.5, 0.5, "No valid numeric plotting data", ha="center", va="center", transform=ax.transAxes)
+
+    seen_labels: set[str] = set()
+    for source_path, group in df.groupby("Source path", sort=True):
+        group = group.sort_values("Plot x")
+        sample = str(group["Sample"].iloc[0])
+        repeat = str(group["Repeat"].iloc[0])
+        file_stem = Path(str(source_path)).stem
+        color = sample_colors.get(sample, "#4E79A7")
+        if is_stripping_compare_mode(plot_mode):
+            label_raw = sample
+        else:
+            label_raw = repeat if repeat == file_stem else f"{repeat} | {file_stem}"
+        legend_label = shorten_label(label_raw, legend_label_max_len)
+        if is_stripping_compare_mode(plot_mode) and label_raw in seen_labels:
+            legend_label = "_nolegend_"
+        seen_labels.add(label_raw)
+        ax.plot(
+            group["Plot x"].to_numpy(float),
+            group["Plot y"].to_numpy(float),
+            color=color,
+            linewidth=float(linewidth),
+            alpha=0.9,
+            label=legend_label,
+        )
+
+    title = plot_title.replace("{sample}", title_name).replace("{repeat}", title_name)
+    if title.strip():
+        ax.set_title(title, fontsize=18, pad=14)
+    ax.set_xlim(float(x_min), float(x_max))
+    ax.set_ylim(float(y_min), float(y_max))
+    ax.set_xlabel(x_label, fontsize=17, labelpad=8)
+    ax.set_ylabel(y_label, fontsize=17, labelpad=8)
+    ax.tick_params(axis="both", which="major", direction="in", labelsize=14, length=6, width=1.4, pad=6)
+    ax.tick_params(axis="both", which="minor", direction="in", length=3.5, width=1.0)
+    ax.xaxis.set_minor_locator(AutoMinorLocator(2))
+    ax.yaxis.set_minor_locator(AutoMinorLocator(2))
+    for spine in ax.spines.values():
+        spine.set_linewidth(1.4)
+
+    handles, labels = ax.get_legend_handles_labels()
+    if show_legend and handles:
+        n_labels = max(1, len(labels))
+        ncol = max(1, min(int(legend_columns), n_labels))
+        if legend_position == "Top":
+            top = 0.74 if title.strip() else 0.80
+            fig.subplots_adjust(left=0.12, right=0.96, bottom=0.15, top=top)
+            fig.legend(handles, labels, loc="upper center", bbox_to_anchor=(0.5, 0.985), ncol=ncol, title=legend_title, fontsize=10, title_fontsize=12, frameon=False)
+        elif legend_position == "Right":
+            fig.subplots_adjust(left=0.12, right=0.72, bottom=0.15, top=0.90)
+            fig.legend(handles, labels, loc="center right", bbox_to_anchor=(0.985, 0.53), ncol=1, title=legend_title, fontsize=10, title_fontsize=12, frameon=False)
+        else:
+            fig.subplots_adjust(left=0.12, right=0.96, bottom=0.15, top=0.90)
+            ax.legend(loc="best", title=legend_title, fontsize=10, title_fontsize=12, frameon=False)
+    else:
+        fig.subplots_adjust(left=0.12, right=0.96, bottom=0.15, top=0.90)
+    return fig
+
+
+def make_single_stripping_preview_figure(plot_df: pd.DataFrame | None, color_hex: str, fig_width: float = 3.7, fig_height: float = 2.25):
+    if plot_df is None or plot_df.empty:
+        return make_empty_single_file_capacity_preview_figure("No valid preview", fig_width=fig_width, fig_height=fig_height)
+    df = clean_stripping_plot_df(plot_df)
+    fig, ax = plt.subplots(figsize=(fig_width, fig_height))
+    if not df.empty:
+        ax.plot(df["Plot x"], df["Plot y"], color=color_hex, linewidth=1.5)
+    ax.set_xlabel("Capacity", fontsize=9, labelpad=4)
+    ax.set_ylabel("Voltage (V)", fontsize=9, labelpad=4)
+    ax.tick_params(axis="both", which="major", direction="in", labelsize=8, length=4, width=1.0, pad=3)
+    ax.tick_params(axis="both", which="minor", direction="in", length=2.5, width=0.8)
+    ax.xaxis.set_minor_locator(AutoMinorLocator(2))
+    ax.yaxis.set_minor_locator(AutoMinorLocator(2))
+    for spine in ax.spines.values():
+        spine.set_linewidth(1.0)
+    fig.subplots_adjust(left=0.16, right=0.95, bottom=0.22, top=0.92)
+    return fig
+
+
+def render_stripping_file_preview_card(
+    record: dict[str, object],
+    plot_df: pd.DataFrame | None,
+    summary_row: dict[str, object],
+    error: str | None,
+    checkbox_key: str,
+    color_hex: str,
+) -> None:
+    """Render a stripping preview card using the same card shell as cycling."""
+    rel = str(record["relative_path"])
+    file_stem = Path(rel).stem
+    repeat = str(record.get("repeat", ""))
+    label = repeat if repeat == file_stem else f"{repeat} | {file_stem}"
+
+    status = str(summary_row.get("Status", "") or "").strip()
+    note_text = str(error or "")
+    if not note_text and status and status != "ok":
+        note_text = status
+
+    try:
+        card_ctx = st.container(border=True)
+    except TypeError:
+        card_ctx = st.container()
+
+    with card_ctx:
+        st.checkbox(
+            shorten_label(label, 30),
+            key=checkbox_key,
+            help=rel,
+        )
+
+        fig = make_single_stripping_preview_figure(
+            plot_df=plot_df,
+            color_hex=color_hex,
+            fig_width=3.7,
+            fig_height=2.25,
+        )
+        st.pyplot(fig, clear_figure=True)
+        plt.close(fig)
+
+        render_preview_metric_grid(
+            [
+                ("Nuc.", preview_metric_text(summary_row.get("Nucleation (ohm)"))),
+                ("Plateau", preview_metric_text(summary_row.get("Plateau (mV)"))),
+                ("Overp.", preview_metric_text(summary_row.get("Overp. (mV)"))),
+                ("Cap.", preview_metric_text(summary_row.get("Cap. (mAh/cm2)"))),
+            ]
+        )
+        render_preview_note(note_text)
+
+
+def render_stripping_analysis_page() -> None:
+    st.title("Stripping Overpotential")
+    st.caption("Batch summary and voltage-capacity plotting for stripping-cell data.")
+
+    with st.sidebar:
+        st.header("Stripping input")
+        root_dir_str = st.text_input(
+            "Root data directory on this machine/server",
+            value="",
+            help="Folder containing one first-level folder per sample.",
+            key="stripping_root_dir",
+        )
+        if not root_dir_str.strip():
+            st.info("Enter a root data directory to start.")
+            return
+        root_dir = Path(root_dir_str).expanduser().resolve()
+        output_dir_str = st.text_input(
+            "Output directory",
+            value="",
+            help="Leave empty to save to <root_dir>/stripping_outputs.",
+            key="stripping_output_dir",
+        )
+        output_dir = Path(output_dir_str).expanduser().resolve() if output_dir_str.strip() else root_dir / "stripping_outputs"
+
+        st.header("Data settings")
+        area = st.number_input("Electrode area (cm2)", min_value=0.0001, value=1.27, step=0.01, key="stripping_area")
+        if (
+            not bool(st.session_state.get("stripping_operator_default_migrated", False))
+            and st.session_state.get("stripping_operator", "Vincent") == "Sravani"
+        ):
+            st.session_state["stripping_operator"] = "Vincent"
+            st.session_state["stripping_operator_default_migrated"] = True
+        operator = st.text_input("Default operator", value="Vincent", key="stripping_operator")
+        normalization = st.selectbox("Capacity normalization", ["area", "test-dchg", "none"], index=0, key="stripping_normalization")
+        step_type = st.text_input("Record Step Type for plotting", value="CC DChg", key="stripping_step_type")
+        valley_window = st.number_input("Valley detection window", min_value=1, max_value=25, value=3, step=1, key="stripping_valley_window")
+        short_capacity_threshold = st.number_input("Short capacity threshold", min_value=0.1, value=7.5, step=0.5, key="stripping_short_capacity_threshold")
+        bulk_preview = st.checkbox(
+            "Load all selected samples at once in data preview",
+            value=False,
+            key="stripping_bulk_preview",
+            help="Read all selected samples in one pass, then review and select files without stepping sample-by-sample.",
+        )
+
+    if not root_dir.exists() or not root_dir.is_dir():
+        st.error(f"Root path is not a directory on this runtime machine: `{root_dir}`")
+        return
+
+    records = collect_stripping_file_records(root_dir, output_dir)
+    if not records:
+        st.warning("No valid `.xlsx` stripping files found under the root directory.")
+        return
+
+    sample_names = sorted({str(r["sample"]) for r in records})
+    records_by_sample = {sample: [r for r in records if str(r["sample"]) == sample] for sample in sample_names}
+    default_colors = palette_to_hex_colors("Set2 + Dark2 + tab20", len(sample_names))
+    default_color_map = {sample: default_colors[i] for i, sample in enumerate(sample_names)}
+    ensure_stripping_selection_store()
+
+    st.subheader("Stripping workflow")
+    workflow_options = ["1. Data preview & file selection", "2. Style preview", "3. Final output"]
+    if st.session_state.get("stripping_workflow_step") not in workflow_options:
+        st.session_state["stripping_workflow_step"] = workflow_options[0]
+    workflow_view = st.radio("Choose workflow step", workflow_options, horizontal=True, key="stripping_workflow_step")
+    selected_samples = st.multiselect("Samples to process", options=sample_names, default=sample_names, key="stripping_selected_samples")
+    if not selected_samples:
+        st.warning("Select at least one sample.")
+        return
+
+    for sample in selected_samples:
+        saved = st.session_state["stripping_saved_selection"].get(sample, {})
+        for record in records_by_sample[sample]:
+            rel = str(record["relative_path"])
+            key = stripping_file_include_key(sample, str(record["repeat"]), rel)
+            if key not in st.session_state:
+                st.session_state[key] = bool(saved.get(rel, True))
+
+    style_defaults = {
+        "stripping_plot_mode": STRIPPING_PLOT_MODE_SINGLE,
+        "stripping_compare_repeat": "",
+        "stripping_compare_samples": selected_samples,
+        "stripping_plot_title": "{sample}",
+        "stripping_x_label": stripping_x_axis_label(normalization),
+        "stripping_y_label": "Voltage (V)",
+        "stripping_show_legend": True,
+        "stripping_legend_position": "Top",
+        "stripping_legend_title": "Repeats",
+        "stripping_legend_label_max_len": 28,
+        "stripping_legend_columns": 3,
+        "stripping_auto_x_range": True,
+        "stripping_x_min": -0.5,
+        "stripping_x_max": 7.5,
+        "stripping_small_capacity_limit": 2.0,
+        "stripping_large_capacity_limit": 7.5,
+        "stripping_y_min": -1.0,
+        "stripping_y_max": 0.2,
+        "stripping_palette_name": "Set2 + Dark2 + tab20",
+        "stripping_linewidth": 2.2,
+        "stripping_fig_width": 6.0,
+        "stripping_fig_height": 4.6,
+        "stripping_dpi": 300,
+    }
+    for key, value in style_defaults.items():
+        st.session_state.setdefault(key, value)
+    st.session_state["stripping_plot_mode"] = normalize_stripping_plot_mode(
+        st.session_state.get("stripping_plot_mode", STRIPPING_PLOT_MODE_SINGLE)
+    )
+    if not isinstance(st.session_state.get("stripping_compare_samples"), list):
+        st.session_state["stripping_compare_samples"] = selected_samples
+    st.session_state["stripping_compare_samples"] = [
+        sample for sample in st.session_state.get("stripping_compare_samples", selected_samples)
+        if sample in selected_samples
+    ] or list(selected_samples)
+
+    text_style_defaults = {
+        "stripping_plot_title": "{sample}",
+        "stripping_x_label": stripping_x_axis_label(normalization),
+        "stripping_y_label": "Voltage (V)",
+        "stripping_legend_title": "Repeats",
+    }
+    for key, value in text_style_defaults.items():
+        if not str(st.session_state.get(key, "")).strip():
+            st.session_state[key] = value
+
+    if float(st.session_state.get("stripping_x_max", 7.5)) <= float(st.session_state.get("stripping_x_min", -0.5)):
+        st.session_state["stripping_x_min"] = -0.5
+        st.session_state["stripping_x_max"] = 7.5
+    if float(st.session_state.get("stripping_y_max", 0.2)) <= float(st.session_state.get("stripping_y_min", -1.0)):
+        st.session_state["stripping_y_min"] = -1.0
+        st.session_state["stripping_y_max"] = 0.2
+    if float(st.session_state.get("stripping_large_capacity_limit", 7.5)) <= float(st.session_state.get("stripping_small_capacity_limit", 2.0)):
+        st.session_state["stripping_small_capacity_limit"] = 2.0
+        st.session_state["stripping_large_capacity_limit"] = 7.5
+
+    def current_stripping_style() -> dict[str, object]:
+        return {
+            "plot_mode": normalize_stripping_plot_mode(st.session_state.get("stripping_plot_mode", STRIPPING_PLOT_MODE_SINGLE)),
+            "compare_repeat": st.session_state.get("stripping_compare_repeat", ""),
+            "compare_samples": list(st.session_state.get("stripping_compare_samples", selected_samples)),
+            "plot_title": st.session_state.get("stripping_plot_title", "{sample}"),
+            "x_label": st.session_state.get("stripping_x_label", stripping_x_axis_label(normalization)),
+            "y_label": st.session_state.get("stripping_y_label", "Voltage (V)"),
+            "show_legend": bool(st.session_state.get("stripping_show_legend", True)),
+            "legend_position": st.session_state.get("stripping_legend_position", "Top"),
+            "legend_title": st.session_state.get("stripping_legend_title", "Repeats"),
+            "legend_label_max_len": int(st.session_state.get("stripping_legend_label_max_len", 28)),
+            "legend_columns": int(st.session_state.get("stripping_legend_columns", 3)),
+            "auto_x_range": bool(st.session_state.get("stripping_auto_x_range", True)),
+            "x_min": float(st.session_state.get("stripping_x_min", -0.5)),
+            "x_max": float(st.session_state.get("stripping_x_max", 7.5)),
+            "small_capacity_limit": float(st.session_state.get("stripping_small_capacity_limit", 2.0)),
+            "large_capacity_limit": float(st.session_state.get("stripping_large_capacity_limit", 7.5)),
+            "y_min": float(st.session_state.get("stripping_y_min", -1.0)),
+            "y_max": float(st.session_state.get("stripping_y_max", 0.2)),
+            "palette_name": st.session_state.get("stripping_palette_name", "Set2 + Dark2 + tab20"),
+            "linewidth": float(st.session_state.get("stripping_linewidth", 2.2)),
+            "fig_width": float(st.session_state.get("stripping_fig_width", 6.0)),
+            "fig_height": float(st.session_state.get("stripping_fig_height", 4.6)),
+            "dpi": int(st.session_state.get("stripping_dpi", 300)),
+        }
+
+    def current_stripping_colors(style: dict[str, object]) -> dict[str, str]:
+        colors = palette_to_hex_colors(str(style["palette_name"]), len(sample_names))
+        palette_color_map = {sample: colors[i] for i, sample in enumerate(sample_names)}
+        return {
+            sample: st.session_state.get(f"stripping_color_{safe_filename(sample)}", palette_color_map[sample])
+            for sample in selected_samples
+        }
+
+    def selected_stripping_records(sample: str) -> list[dict[str, object]]:
+        selected_paths = set(selected_stripping_paths_for_sample(sample, records_by_sample[sample]))
+        return [r for r in records_by_sample[sample] if str(r["relative_path"]) in selected_paths]
+
+    def available_stripping_repeats() -> list[str]:
+        repeats = set()
+        for sample in selected_samples:
+            for record in selected_stripping_records(sample):
+                repeats.add(str(record["repeat"]))
+        return sorted(repeats)
+
+    def resolve_compare_repeat(repeat_options: list[str] | None = None, update_state: bool = True) -> str:
+        options = repeat_options if repeat_options is not None else available_stripping_repeats()
+        current = str(st.session_state.get("stripping_compare_repeat", "") or "")
+        if current in options:
+            return current
+        fallback = options[0] if options else ""
+        if fallback and update_state:
+            st.session_state["stripping_compare_repeat"] = fallback
+        return fallback
+
+    def comparison_samples_from_style(style: dict[str, object]) -> list[str]:
+        compare_samples = [
+            sample for sample in list(style.get("compare_samples", selected_samples))
+            if sample in selected_samples
+        ]
+        return compare_samples or list(selected_samples)
+
+    def load_stripping_records_for_plot(records_to_load: list[dict[str, object]]) -> tuple[pd.DataFrame | None, pd.DataFrame]:
+        plot_frames = []
+        summary_rows = []
+        for record in records_to_load:
+            plot_df, summary_row, _error = load_cached_stripping_file(
+                record=record,
+                area=float(area),
+                operator=operator,
+                normalization=normalization,
+                step_type=step_type,
+                valley_window=int(valley_window),
+                short_capacity_threshold=float(short_capacity_threshold),
+            )
+            summary_rows.append(summary_row)
+            if plot_df is not None and not plot_df.empty:
+                plot_frames.append(plot_df)
+        combined_plot = pd.concat(plot_frames, ignore_index=True) if plot_frames else None
+        return combined_plot, pd.DataFrame(summary_rows)
+
+    if workflow_view == "1. Data preview & file selection":
+        st.markdown("### Data preview & file selection")
+        if bulk_preview:
+            st.caption("All selected samples are loaded in one pass. Short files are unchecked by default on first load.")
+            all_loaded_entries: dict[str, list[tuple[dict[str, object], pd.DataFrame | None, dict[str, object], str | None]]] = {}
+            total_files = sum(len(records_by_sample[sample]) for sample in selected_samples)
+            completed = 0
+            progress = st.progress(0)
+            status = st.empty()
+            for sample in selected_samples:
+                sample_entries = []
+                saved_selection_exists = sample in st.session_state.get("stripping_saved_selection", {})
+                default_marker_key = f"stripping_valid_defaults_applied_{stable_key_part(sample)}"
+                defaults_already_applied = bool(st.session_state.get(default_marker_key, False))
+                for record in records_by_sample[sample]:
+                    completed += 1
+                    status.write(f"Reading {completed}/{total_files}: {sample} / {record['source_file']}")
+                    plot_df, summary_row, error = load_cached_stripping_file(
+                        record,
+                        float(area),
+                        operator,
+                        normalization,
+                        step_type,
+                        int(valley_window),
+                        float(short_capacity_threshold),
+                    )
+                    key = stripping_file_include_key(sample, str(record["repeat"]), str(record["relative_path"]))
+                    if plot_df is None:
+                        st.session_state[key] = False
+                    elif not saved_selection_exists and not defaults_already_applied and stripping_summary_is_short(summary_row):
+                        st.session_state[key] = False
+                    sample_entries.append((record, plot_df, summary_row, error))
+                    progress.progress(completed / max(1, total_files))
+                if not saved_selection_exists and not defaults_already_applied:
+                    st.session_state[default_marker_key] = True
+                all_loaded_entries[sample] = sample_entries
+            status.empty()
+            progress.empty()
+
+            total_valid = sum(1 for entries in all_loaded_entries.values() for entry in entries if entry[1] is not None)
+            total_short = sum(1 for entries in all_loaded_entries.values() for entry in entries if entry[1] is not None and stripping_summary_is_short(entry[2]))
+            total_invalid = total_files - total_valid
+            st.success(f"Loaded {total_files} files across {len(selected_samples)} samples. Valid: {total_valid}; short/default unchecked: {total_short}; unavailable: {total_invalid}.")
+
+            b1, b2, b3 = st.columns([1, 1, 2])
+            with b1:
+                if st.button("Select all valid non-short", use_container_width=True, key="stripping_bulk_select_valid"):
+                    for sample, entries in all_loaded_entries.items():
+                        for record, plot_df, summary_row, _error in entries:
+                            key = stripping_file_include_key(sample, str(record["repeat"]), str(record["relative_path"]))
+                            st.session_state[key] = plot_df is not None and not stripping_summary_is_short(summary_row)
+                        save_stripping_selection_for_sample(sample, records_by_sample[sample])
+                    rerun_streamlit_app()
+            with b2:
+                if st.button("Clear all", use_container_width=True, key="stripping_bulk_clear_all"):
+                    for sample in selected_samples:
+                        for record in records_by_sample[sample]:
+                            st.session_state[stripping_file_include_key(sample, str(record["repeat"]), str(record["relative_path"]))] = False
+                        save_stripping_selection_for_sample(sample, records_by_sample[sample])
+                    rerun_streamlit_app()
+            with b3:
+                selected_total = sum(len(selected_stripping_paths_for_sample(sample, records_by_sample[sample])) for sample in selected_samples)
+                st.caption(f"Current selection across all samples: {selected_total} / {total_files} files included.")
+
+            summary_frames = []
+            for sample in selected_samples:
+                entries = all_loaded_entries[sample]
+                selected_count = sum(
+                    bool(st.session_state.get(stripping_file_include_key(sample, str(record["repeat"]), str(record["relative_path"])), False))
+                    for record, _plot_df, _summary_row, _error in entries
+                )
+                with st.expander(f"{sample} ({selected_count}/{len(entries)} selected)", expanded=(sample == selected_samples[0])):
+                    file_cols = st.columns(4)
+                    valid_entries = [entry for entry in entries if entry[1] is not None]
+                    invalid_entries = [entry for entry in entries if entry[1] is None]
+                    for idx, (record, plot_df, summary_row, error) in enumerate(valid_entries + invalid_entries):
+                        key = stripping_file_include_key(sample, str(record["repeat"]), str(record["relative_path"]))
+                        with file_cols[idx % 4]:
+                            render_stripping_file_preview_card(
+                                record=record,
+                                plot_df=plot_df,
+                                summary_row=summary_row,
+                                error=error,
+                                checkbox_key=key,
+                                color_hex=default_color_map[sample],
+                            )
+                    current_summary = pd.DataFrame([
+                        summary_row for record, _plot_df, summary_row, _error in entries
+                        if bool(st.session_state.get(stripping_file_include_key(sample, str(record["repeat"]), str(record["relative_path"])), False))
+                    ])
+                    if not current_summary.empty:
+                        summary_frames.append(current_summary)
+                        st.dataframe(current_summary, use_container_width=True, hide_index=True)
+
+            if summary_frames:
+                all_summary = pd.concat(summary_frames, ignore_index=True)
+                st.download_button(
+                    "Download selected stripping summary CSV",
+                    data=all_summary.to_csv(index=False).encode("utf-8"),
+                    file_name="selected_stripping_summary.csv",
+                    mime="text/csv",
+                    use_container_width=True,
+                )
+
+            st.button(
+                "Save all selections and continue to style preview",
+                type="primary",
+                use_container_width=True,
+                on_click=save_all_stripping_selections_and_go_style,
+                args=(selected_samples, records_by_sample),
+            )
+            return
+
+        if st.session_state.get("stripping_inspect_sample") not in selected_samples:
+            st.session_state["stripping_inspect_sample"] = selected_samples[0]
+        inspect_sample = st.selectbox("Sample to inspect", options=selected_samples, key="stripping_inspect_sample")
+        file_records = records_by_sample[inspect_sample]
+
+        c1, c2, c3 = st.columns([1, 1, 2.2])
+        with c1:
+            if st.button("Select all valid", use_container_width=True, key="stripping_select_all_valid"):
+                for record in file_records:
+                    plot_df, summary_row, _error = load_cached_stripping_file(record, float(area), operator, normalization, step_type, int(valley_window), float(short_capacity_threshold))
+                    st.session_state[stripping_file_include_key(inspect_sample, str(record["repeat"]), str(record["relative_path"]))] = (
+                        plot_df is not None and not stripping_summary_is_short(summary_row)
+                    )
+                save_stripping_selection_for_sample(inspect_sample, file_records)
+                rerun_streamlit_app()
+        with c2:
+            if st.button("Clear all", use_container_width=True, key="stripping_clear_all"):
+                for record in file_records:
+                    st.session_state[stripping_file_include_key(inspect_sample, str(record["repeat"]), str(record["relative_path"]))] = False
+                save_stripping_selection_for_sample(inspect_sample, file_records)
+                rerun_streamlit_app()
+        with c3:
+            selected_count = len(selected_stripping_paths_for_sample(inspect_sample, file_records))
+            st.caption(f"Saved/current selection: {selected_count} / {len(file_records)} files included.")
+
+        loaded_entries = []
+        default_marker_key = f"stripping_valid_defaults_applied_{stable_key_part(inspect_sample)}"
+        saved_selection_exists = inspect_sample in st.session_state.get("stripping_saved_selection", {})
+        defaults_already_applied = bool(st.session_state.get(default_marker_key, False))
+        progress = st.progress(0)
+        status = st.empty()
+        for idx, record in enumerate(file_records, start=1):
+            status.write(f"Reading {idx}/{len(file_records)}: {record['source_file']}")
+            plot_df, summary_row, error = load_cached_stripping_file(record, float(area), operator, normalization, step_type, int(valley_window), float(short_capacity_threshold))
+            key = stripping_file_include_key(inspect_sample, str(record["repeat"]), str(record["relative_path"]))
+            if plot_df is None:
+                st.session_state[key] = False
+            elif not saved_selection_exists and not defaults_already_applied and stripping_summary_is_short(summary_row):
+                st.session_state[key] = False
+            loaded_entries.append((record, plot_df, summary_row, error))
+            progress.progress(idx / len(file_records))
+        status.empty()
+        progress.empty()
+        if not saved_selection_exists and not defaults_already_applied:
+            st.session_state[default_marker_key] = True
+
+        valid_entries = [entry for entry in loaded_entries if entry[1] is not None]
+        invalid_entries = [entry for entry in loaded_entries if entry[1] is None]
+        short_count = sum(stripping_summary_is_short(entry[2]) for entry in valid_entries)
+        st.info(f"Valid: {len(valid_entries)}; short/default unchecked: {short_count}; unavailable: {len(invalid_entries)}.")
+        file_cols = st.columns(4)
+        for idx, (record, plot_df, summary_row, error) in enumerate(valid_entries + invalid_entries):
+            rel = str(record["relative_path"])
+            key = stripping_file_include_key(inspect_sample, str(record["repeat"]), rel)
+            with file_cols[idx % 4]:
+                render_stripping_file_preview_card(
+                    record=record,
+                    plot_df=plot_df,
+                    summary_row=summary_row,
+                    error=error,
+                    checkbox_key=key,
+                    color_hex=default_color_map[inspect_sample],
+                )
+
+        current_summary = pd.DataFrame([
+            summary_row for record, _plot_df, summary_row, _error in loaded_entries
+            if bool(st.session_state.get(stripping_file_include_key(inspect_sample, str(record["repeat"]), str(record["relative_path"])), False))
+        ])
+        st.markdown("#### Selected-file summary for this sample")
+        if current_summary.empty:
+            st.info("No files are currently selected for this sample.")
+        else:
+            st.dataframe(current_summary, use_container_width=True, hide_index=True)
+            st.download_button(
+                "Download this sample stripping summary CSV",
+                data=current_summary.to_csv(index=False).encode("utf-8"),
+                file_name=f"{safe_filename(inspect_sample)}_stripping_summary.csv",
+                mime="text/csv",
+                use_container_width=True,
+            )
+
+        st.divider()
+        current_idx = selected_samples.index(inspect_sample)
+        if current_idx < len(selected_samples) - 1:
+            next_sample = selected_samples[current_idx + 1]
+            button_label = f"Save this sample and continue to {shorten_label(next_sample, 28)}"
+        else:
+            button_label = "Save this sample and continue to style preview"
+        st.button(
+            button_label,
+            type="primary",
+            use_container_width=True,
+            on_click=save_current_stripping_selection_and_advance,
+            args=(inspect_sample, selected_samples, records_by_sample),
+        )
+        return
+
+    if workflow_view == "2. Style preview":
+        st.markdown("### Style preview")
+        style_controls_col, style_preview_col = st.columns([0.9, 1.55], gap="large")
+        with style_controls_col:
+            compare_mode_enabled = is_stripping_compare_mode(st.session_state.get("stripping_plot_mode"))
+            preview_sample = st.selectbox(
+                "Preview sample",
+                options=selected_samples,
+                key="stripping_preview_sample",
+                disabled=compare_mode_enabled,
+                help="Disabled in compare mode because the preview is the single combined comparison figure.",
+            )
+            repeat_options = available_stripping_repeats()
+            if repeat_options and st.session_state.get("stripping_compare_repeat") not in repeat_options:
+                st.session_state["stripping_compare_repeat"] = repeat_options[0]
+            st.selectbox(
+                "Plot mode",
+                [STRIPPING_PLOT_MODE_SINGLE, STRIPPING_PLOT_MODE_COMPARE],
+                key="stripping_plot_mode",
+                on_change=reset_stripping_visual_style_defaults,
+                help="Changing mode resets visual style to the same default so only the plotted data grouping changes.",
+            )
+            compare_mode_enabled = is_stripping_compare_mode(st.session_state.get("stripping_plot_mode"))
+            st.multiselect(
+                "Samples in comparison",
+                options=selected_samples,
+                key="stripping_compare_samples",
+                disabled=not compare_mode_enabled,
+                help="In comparison mode, preview and final output combine all selected files from these samples into one figure.",
+            )
+
+            tab_text, tab_legend, tab_axes, tab_style = st.tabs(["Text", "Legend", "Axes", "Style"])
+            with tab_text:
+                st.text_input("Plot title", key="stripping_plot_title", help='Use "{sample}" or "{repeat}".')
+                st.text_input("X-axis label", key="stripping_x_label")
+                st.text_input("Y-axis label", key="stripping_y_label")
+            with tab_legend:
+                st.checkbox("Show legend", key="stripping_show_legend")
+                show_legend = bool(st.session_state.get("stripping_show_legend", True))
+                st.selectbox("Legend position", ["Top", "Right", "Inside"], key="stripping_legend_position", disabled=not show_legend)
+                st.text_input("Legend title", key="stripping_legend_title", disabled=not show_legend)
+                st.slider("Label length", min_value=8, max_value=80, key="stripping_legend_label_max_len", disabled=not show_legend)
+                st.slider("Top legend columns", min_value=1, max_value=6, key="stripping_legend_columns", disabled=not show_legend)
+            with tab_axes:
+                st.checkbox("Auto X-axis upper limit", key="stripping_auto_x_range")
+                auto_x = bool(st.session_state.get("stripping_auto_x_range", True))
+                a1, a2 = st.columns(2)
+                with a1:
+                    st.number_input("X min", step=0.1, key="stripping_x_min")
+                    st.number_input("X max", step=0.5, key="stripping_x_max", disabled=auto_x)
+                    st.number_input("Y min", step=0.1, key="stripping_y_min")
+                with a2:
+                    st.number_input("Small capacity limit", step=0.5, key="stripping_small_capacity_limit", disabled=not auto_x)
+                    st.number_input("Large capacity limit", step=0.5, key="stripping_large_capacity_limit", disabled=not auto_x)
+                    st.number_input("Y max", step=0.1, key="stripping_y_max")
+            with tab_style:
+                st.selectbox("Default color palette", ["Set2 + Dark2 + tab20", "Set2", "Dark2", "tab10", "tab20", "tab20 + tab20b"], key="stripping_palette_name")
+                st.slider("Line width", min_value=0.5, max_value=5.0, step=0.1, key="stripping_linewidth")
+                f1, f2 = st.columns(2)
+                with f1:
+                    st.number_input("Figure width", min_value=3.0, max_value=20.0, key="stripping_fig_width", step=0.5)
+                    st.number_input("DPI", min_value=72, max_value=600, key="stripping_dpi", step=50)
+                with f2:
+                    st.number_input("Figure height", min_value=3.0, max_value=15.0, key="stripping_fig_height", step=0.5)
+                style = current_stripping_style()
+                colors = palette_to_hex_colors(str(style["palette_name"]), len(sample_names))
+                palette_color_map = {sample: colors[i] for i, sample in enumerate(sample_names)}
+                with st.expander("Sample colors", expanded=False):
+                    for i, sample in enumerate(selected_samples, start=1):
+                        st.color_picker(compact_widget_label("Color", i, sample, max_len=18), value=st.session_state.get(f"stripping_color_{safe_filename(sample)}", palette_color_map[sample]), key=f"stripping_color_{safe_filename(sample)}")
+            st.button(
+                "Generate final outputs",
+                type="primary",
+                use_container_width=True,
+                on_click=set_stripping_workflow_step,
+                args=("3. Final output",),
+            )
+
+        with style_preview_col:
+            st.markdown("### Live style preview")
+            style = current_stripping_style()
+            sample_colors = current_stripping_colors(style)
+            if is_stripping_compare_mode(style["plot_mode"]):
+                compare_samples = comparison_samples_from_style(style)
+                preview_records = [
+                    record
+                    for sample in compare_samples
+                    for record in selected_stripping_records(sample)
+                ]
+                title_name = "Selected sample comparison"
+            else:
+                preview_records = selected_stripping_records(preview_sample)
+                title_name = preview_sample
+            preview_plot_df, preview_summary = load_stripping_records_for_plot(preview_records)
+            if preview_plot_df is None:
+                st.warning("No valid stripping data found for this preview.")
+            else:
+                effective_limits, _numeric_df, adjusted = stripping_figure_limits(preview_plot_df, style)
+                fig = make_stripping_figure(
+                    plot_df=preview_plot_df,
+                    title_name=title_name,
+                    sample_colors=sample_colors,
+                    plot_mode=str(style["plot_mode"]),
+                    plot_title=str(style["plot_title"]),
+                    x_label=str(style["x_label"]),
+                    y_label=str(style["y_label"]),
+                    legend_title=str(style["legend_title"]),
+                    show_legend=bool(style["show_legend"]),
+                    x_min=float(effective_limits["x_min"]),
+                    x_max=float(effective_limits["x_max"]),
+                    y_min=float(effective_limits["y_min"]),
+                    y_max=float(effective_limits["y_max"]),
+                    linewidth=float(style["linewidth"]),
+                    fig_width=float(style["fig_width"]),
+                    fig_height=float(style["fig_height"]),
+                    legend_position=str(style["legend_position"]),
+                    legend_label_max_len=int(style["legend_label_max_len"]),
+                    legend_columns=int(style["legend_columns"]),
+                )
+                st.pyplot(fig, clear_figure=True)
+                plt.close(fig)
+                if adjusted:
+                    st.caption("Axis range was expanded to keep data visible.")
+                st.dataframe(preview_summary, use_container_width=True, hide_index=True)
+        return
+
+    st.markdown("### Final output")
+    style = current_stripping_style()
+    sample_colors = current_stripping_colors(style)
+    signature = hashlib.sha1(
+        repr(
+            {
+                "root_dir": str(root_dir),
+                "output_dir": str(output_dir),
+                "selected_samples": selected_samples,
+                "selected_paths": {s: selected_stripping_paths_for_sample(s, records_by_sample[s]) for s in selected_samples},
+                "settings": [area, operator, normalization, step_type, valley_window, short_capacity_threshold],
+                "style": style,
+                "colors": sample_colors,
+                "implementation": "stripping_compare_bulk_v2",
+            }
+        ).encode("utf-8")
+    ).hexdigest()
+    cached = st.session_state.get("stripping_final_output_cache")
+    if cached and cached.get("signature") == signature:
+        if st.button("Regenerate final outputs", type="primary"):
+            st.session_state.pop("stripping_final_output_cache", None)
+        else:
+            for item in cached["rendered_outputs"]:
+                safe_item_key = safe_filename(str(item["title"]))
+                st.markdown(f"#### {item['title']}")
+                fig = make_stripping_figure(**item["figure_kwargs"])
+                st.pyplot(fig, clear_figure=True)
+                plt.close(fig)
+                c1, c2 = st.columns(2)
+                c1.download_button("CSV", data=item["csv_bytes"], file_name=item["csv_file_name"], mime="text/csv", key=f"stripping_csv_{safe_item_key}")
+                c2.download_button("PNG", data=item["png_bytes"], file_name=item["png_file_name"], mime="image/png", key=f"stripping_png_{safe_item_key}")
+            st.success(f"Batch stripping analysis completed. Results saved to: `{cached['output_dir']}`")
+            st.dataframe(cached["summary_df"], use_container_width=True, hide_index=True)
+            st.download_button("Download all stripping results ZIP", data=cached["zip_bytes"], file_name="stripping_results.zip", mime="application/zip")
+            return
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    figures_dir = output_dir / "figures"
+    data_dir = output_dir / "plot_data"
+    figures_dir.mkdir(parents=True, exist_ok=True)
+    data_dir.mkdir(parents=True, exist_ok=True)
+    rendered_outputs = []
+    summary_frames = []
+    zip_buffer = io.BytesIO()
+
+    if is_stripping_compare_mode(style["plot_mode"]):
+        compare_samples = comparison_samples_from_style(style)
+        output_specs = [(
+            "Selected sample comparison",
+            "Selected sample comparison",
+            [
+                record
+                for sample in compare_samples
+                for record in selected_stripping_records(sample)
+            ],
+        )]
+    else:
+        output_specs = [(sample, sample, selected_stripping_records(sample)) for sample in selected_samples]
+
+    progress = st.progress(0)
+    status = st.empty()
+    with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zipf:
+        for idx, (title, title_name, spec_records) in enumerate(output_specs, start=1):
+            status.write(f"Processing {title} ({idx}/{len(output_specs)})...")
+            plot_df, summary_df = load_stripping_records_for_plot(spec_records)
+            if not summary_df.empty:
+                summary_frames.append(summary_df)
+            if plot_df is None:
+                st.warning(f"No valid stripping data found for `{title}`.")
+                progress.progress(idx / len(output_specs))
+                continue
+            safe_name = safe_filename(title)
+            csv_path = data_dir / f"{safe_name}_plot_data.csv"
+            png_path = figures_dir / f"{safe_name}_stripping.png"
+            summary_path = data_dir / f"{safe_name}_summary.csv"
+            plot_df.to_csv(csv_path, index=False)
+            summary_df.to_csv(summary_path, index=False)
+            effective_limits, numeric_df, adjusted = stripping_figure_limits(plot_df, style)
+            figure_kwargs = dict(
+                plot_df=plot_df,
+                title_name=title_name,
+                sample_colors=sample_colors,
+                plot_mode=str(style["plot_mode"]),
+                plot_title=str(style["plot_title"]),
+                x_label=str(style["x_label"]),
+                y_label=str(style["y_label"]),
+                legend_title=str(style["legend_title"]),
+                show_legend=bool(style["show_legend"]),
+                x_min=float(effective_limits["x_min"]),
+                x_max=float(effective_limits["x_max"]),
+                y_min=float(effective_limits["y_min"]),
+                y_max=float(effective_limits["y_max"]),
+                linewidth=float(style["linewidth"]),
+                fig_width=float(style["fig_width"]),
+                fig_height=float(style["fig_height"]),
+                legend_position=str(style["legend_position"]),
+                legend_label_max_len=int(style["legend_label_max_len"]),
+                legend_columns=int(style["legend_columns"]),
+            )
+            fig = make_stripping_figure(**figure_kwargs)
+            fig.canvas.draw()
+            fig.savefig(png_path, dpi=int(style["dpi"]), bbox_inches="tight")
+            png_buffer = io.BytesIO()
+            fig.savefig(png_buffer, format="png", dpi=int(style["dpi"]), bbox_inches="tight")
+            png_buffer.seek(0)
+            png_bytes = png_buffer.getvalue()
+            plt.close(fig)
+            csv_bytes = plot_df.to_csv(index=False).encode("utf-8")
+            summary_bytes = summary_df.to_csv(index=False).encode("utf-8")
+            zipf.writestr(f"{safe_name}/{safe_name}_plot_data.csv", csv_bytes)
+            zipf.writestr(f"{safe_name}/{safe_name}_summary.csv", summary_bytes)
+            zipf.writestr(f"{safe_name}/{safe_name}_stripping.png", png_bytes)
+            rendered_outputs.append(
+                {
+                    "title": title,
+                    "csv_bytes": csv_bytes,
+                    "png_bytes": png_bytes,
+                    "csv_file_name": f"{safe_name}_plot_data.csv",
+                    "png_file_name": f"{safe_name}_stripping.png",
+                    "figure_kwargs": figure_kwargs,
+                    "adjusted_limits": adjusted,
+                    "numeric_points": len(numeric_df),
+                }
+            )
+            progress.progress(idx / len(output_specs))
+
+    status.empty()
+    progress.empty()
+    if not rendered_outputs:
+        st.warning("No valid stripping results were generated.")
+        return
+
+    summary_df = pd.concat(summary_frames, ignore_index=True) if summary_frames else pd.DataFrame()
+    summary_df.to_csv(output_dir / "stripping_summary.csv", index=False)
+    zip_buffer.seek(0)
+    cache = {
+        "signature": signature,
+        "output_dir": str(output_dir),
+        "rendered_outputs": rendered_outputs,
+        "summary_df": summary_df,
+        "zip_bytes": zip_buffer.getvalue(),
+    }
+    st.session_state["stripping_final_output_cache"] = cache
+    rerun_streamlit_app()
+
 
 def render_placeholder_page(title: str) -> None:
     st.title(title)
@@ -3282,7 +4881,7 @@ def main() -> None:
     elif tool == "Cycling Analysis":
         render_cycling_analysis_page()
     elif tool == "Stripping Overpotential":
-        render_placeholder_page("Stripping Overpotential")
+        render_stripping_analysis_page()
     elif tool == "dQ/dV Analysis":
         render_placeholder_page("dQ/dV Analysis")
 
