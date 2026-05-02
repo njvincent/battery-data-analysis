@@ -51,6 +51,7 @@ from eis_fit import (
 )
 
 import stripping_batch as stripping
+import dqdv_batch as dqdv
 
 
 # -----------------------------------------------------------------------------
@@ -6169,6 +6170,1291 @@ def render_stripping_analysis_page() -> None:
     rerun_streamlit_app()
 
 
+# -----------------------------------------------------------------------------
+# dQ/dV / V-Q profile batch analysis
+# -----------------------------------------------------------------------------
+
+
+def get_or_create_uploaded_dqdv_zip_root(uploaded_zip) -> Path:
+    """Extract an uploaded dQ/dV demo ZIP once per session and return the inferred root."""
+    upload_sig = hashlib.sha1(uploaded_zip.getvalue()).hexdigest()[:16]
+    state_key = "dqdv_uploaded_zip_state"
+    current = st.session_state.get(state_key)
+
+    if current and current.get("signature") == upload_sig:
+        root = Path(current["root_dir"])
+        if root.exists():
+            return root
+
+    extract_dir = Path(tempfile.mkdtemp(prefix="battery_dqdv_zip_"))
+    safe_extract_zip_to_dir(uploaded_zip, extract_dir)
+    root_dir = infer_cycling_root_after_unzip(extract_dir)
+    st.session_state[state_key] = {
+        "signature": upload_sig,
+        "extract_dir": str(extract_dir),
+        "root_dir": str(root_dir),
+    }
+    return root_dir
+
+
+def ensure_dqdv_selection_store() -> None:
+    if "dqdv_saved_selection" not in st.session_state:
+        st.session_state["dqdv_saved_selection"] = {}
+
+
+def dqdv_file_include_key(sample: str, repeat: str, source_path: str) -> str:
+    return f"dqdv_include_{stable_key_part(sample)}_{stable_key_part(repeat)}_{stable_key_part(source_path)}"
+
+
+def collect_dqdv_file_records(root_dir: Path, output_dir: Path) -> list[dict[str, object]]:
+    records: list[dict[str, object]] = []
+    for file_path in dqdv.find_excel_files(root_dir, output_dir=output_dir):
+        meta = dqdv.infer_file_meta(file_path, root_dir)
+        try:
+            relative_path = str(file_path.relative_to(root_dir))
+        except ValueError:
+            relative_path = file_path.name
+        records.append(
+            {
+                "sample": meta.sample_name,
+                "sample_folder": meta.sample_folder,
+                "repeat": meta.repeat_name,
+                "source_file": file_path.name,
+                "relative_path": relative_path,
+                "path": file_path,
+            }
+        )
+    return sorted(records, key=lambda r: (str(r["sample"]), str(r["repeat"]), str(r["relative_path"])))
+
+
+def save_dqdv_selection_for_sample(sample_name: str, file_records: list[dict[str, object]]) -> None:
+    ensure_dqdv_selection_store()
+    saved: dict[str, bool] = {}
+    for record in file_records:
+        rel = str(record["relative_path"])
+        key = dqdv_file_include_key(sample_name, str(record["repeat"]), rel)
+        saved[rel] = bool(st.session_state.get(key, True))
+    st.session_state["dqdv_saved_selection"][sample_name] = saved
+
+
+def sync_dqdv_checkbox_to_saved(sample_name: str, relative_path: str, checkbox_key: str) -> None:
+    ensure_dqdv_selection_store()
+    all_saved = dict(st.session_state["dqdv_saved_selection"])
+    sample_saved = dict(all_saved.get(sample_name, {}))
+    sample_saved[relative_path] = bool(st.session_state.get(checkbox_key, False))
+    all_saved[sample_name] = sample_saved
+    st.session_state["dqdv_saved_selection"] = all_saved
+
+
+def selected_dqdv_paths_for_sample(sample_name: str, file_records: list[dict[str, object]]) -> list[str]:
+    ensure_dqdv_selection_store()
+    saved = st.session_state["dqdv_saved_selection"].get(sample_name)
+    if saved is not None:
+        return [rel for rel, include in saved.items() if include]
+    paths = []
+    for record in file_records:
+        rel = str(record["relative_path"])
+        key = dqdv_file_include_key(sample_name, str(record["repeat"]), rel)
+        if bool(st.session_state.get(key, True)):
+            paths.append(rel)
+    return paths
+
+
+def set_dqdv_workflow_step(step: str) -> None:
+    st.session_state["dqdv_workflow_step"] = step
+
+
+def save_current_dqdv_selection_and_advance(
+    current_sample: str,
+    selected_samples: list[str],
+    records_by_sample: dict[str, list[dict[str, object]]],
+) -> None:
+    ensure_dqdv_selection_store()
+    save_dqdv_selection_for_sample(current_sample, records_by_sample[current_sample])
+    current_idx = selected_samples.index(current_sample)
+    if current_idx < len(selected_samples) - 1:
+        st.session_state["dqdv_inspect_sample"] = selected_samples[current_idx + 1]
+        st.session_state["dqdv_workflow_step"] = "1. Data preview & file selection"
+    else:
+        apply_dqdv_style_defaults_for_preview(selected_samples)
+        st.session_state["dqdv_workflow_step"] = "2. Cycle & style preview"
+
+
+def save_all_dqdv_selections_and_go_style(
+    selected_samples: list[str],
+    records_by_sample: dict[str, list[dict[str, object]]],
+) -> None:
+    ensure_dqdv_selection_store()
+    for sample in selected_samples:
+        if sample in records_by_sample:
+            save_dqdv_selection_for_sample(sample, records_by_sample[sample])
+    apply_dqdv_style_defaults_for_preview(selected_samples)
+    st.session_state["dqdv_workflow_step"] = "2. Cycle & style preview"
+
+
+def reset_dqdv_visual_style_defaults() -> None:
+    defaults = {
+        "dqdv_plot_title": "{sample} - {repeat}",
+        "dqdv_x_label": "Capacity (mAh cm$^{-2}$)",
+        "dqdv_y_label": "Voltage (V)",
+        "dqdv_show_legend": True,
+        "dqdv_legend_position": "Inside",
+        "dqdv_legend_title": "Cycle Index",
+        "dqdv_legend_label_max_len": 28,
+        "dqdv_legend_columns": 4,
+        "dqdv_auto_x_range": True,
+        "dqdv_x_min": -0.25,
+        "dqdv_x_max": 5.0,
+        "dqdv_y_min": 2.5,
+        "dqdv_y_max": 4.5,
+        "dqdv_palette_name": "Set2 + Dark2 + tab20",
+        "dqdv_linewidth": 2.1,
+        "dqdv_fig_width": 8.2,
+        "dqdv_fig_height": 6.2,
+        "dqdv_dpi": 300,
+    }
+    for key, value in defaults.items():
+        st.session_state[key] = value
+
+
+def dqdv_style_defaults_signature(selected_samples: list[str]) -> str:
+    return hashlib.sha1(
+        repr({"samples": selected_samples, "defaults_version": "dqdv_visual_defaults_v1"}).encode("utf-8")
+    ).hexdigest()
+
+
+def apply_dqdv_style_defaults_for_preview(selected_samples: list[str]) -> None:
+    reset_dqdv_visual_style_defaults()
+    st.session_state["dqdv_style_defaults_signature"] = dqdv_style_defaults_signature(selected_samples)
+
+
+def dqdv_record_to_meta(record: dict[str, object]) -> dqdv.FileMeta:
+    return dqdv.FileMeta(
+        file_path=Path(record["path"]),
+        sample_folder=str(record.get("sample_folder") or record["sample"]),
+        sample_name=str(record["sample"]),
+        repeat_name=str(record["repeat"]),
+    )
+
+
+def dqdv_cache_key(
+    record: dict[str, object],
+    cycles_override: list[int] | None,
+    cycle_start: int,
+    cycle_step: int,
+    charge_step: str,
+    discharge_step: str,
+    retention_cutoff: float | None,
+    stop_at_retention_cutoff: bool,
+) -> str:
+    path = Path(record["path"])
+    stat = path.stat()
+    return persistent_cache_key(
+        {
+            "kind": "dqdv_processed_v1",
+            "relative_path": str(record.get("relative_path", path.name)),
+            "file_size": int(stat.st_size),
+            "file_mtime": float(stat.st_mtime),
+            "cycles_override": cycles_override,
+            "cycle_start": int(cycle_start),
+            "cycle_step": int(cycle_step),
+            "charge_step": charge_step,
+            "discharge_step": discharge_step,
+            "retention_cutoff": retention_cutoff,
+            "stop_at_retention_cutoff": bool(stop_at_retention_cutoff),
+        }
+    )
+
+
+def normalize_dqdv_plot_df(df: pd.DataFrame | None) -> pd.DataFrame | None:
+    if df is None:
+        return None
+    out = df.copy()
+    for col in ["area_cm2", "cycle_index", "point_index", "capacity_mAh", "areal_capacity_mAh_cm2", "voltage_V"]:
+        if col in out.columns:
+            out[col] = pd.to_numeric(out[col], errors="coerce")
+    return out
+
+
+def process_dqdv_record_uncached(
+    record: dict[str, object],
+    cycles_override: list[int] | None,
+    cycle_start: int,
+    cycle_step: int,
+    charge_step: str,
+    discharge_step: str,
+    retention_cutoff: float | None,
+    stop_at_retention_cutoff: bool,
+) -> tuple[pd.DataFrame | None, pd.DataFrame, dict[str, object], str | None]:
+    processed = dqdv.process_one_file(
+        meta=dqdv_record_to_meta(record),
+        cycles_override=cycles_override,
+        cycle_start=int(cycle_start),
+        cycle_step=int(cycle_step),
+        charge_step=charge_step,
+        discharge_step=discharge_step,
+        retention_cutoff=retention_cutoff,
+        stop_at_retention_cutoff=bool(stop_at_retention_cutoff),
+    )
+    raw_df = normalize_dqdv_plot_df(processed.raw_plot_data)
+    cycle_summary = processed.cycle_summary if processed.cycle_summary is not None else pd.DataFrame()
+    summary_row = processed.file_summary or {}
+    if summary_row:
+        summary_row["relative_path"] = str(record.get("relative_path", record.get("source_file", "")))
+    error = None if processed.status in {"ok", "skipped"} else processed.note
+    if raw_df is not None and raw_df.empty:
+        raw_df = None
+    return raw_df, cycle_summary, summary_row, error
+
+
+@st.cache_data(show_spinner=False)
+def cached_process_dqdv_record(
+    record_payload: dict[str, object],
+    cycles_override: list[int] | None,
+    cycle_start: int,
+    cycle_step: int,
+    charge_step: str,
+    discharge_step: str,
+    retention_cutoff: float | None,
+    stop_at_retention_cutoff: bool,
+    file_size: int,
+    file_mtime: float,
+) -> tuple[pd.DataFrame | None, pd.DataFrame, dict[str, object], str | None]:
+    _ = file_size, file_mtime
+    return process_dqdv_record_uncached(
+        record=record_payload,
+        cycles_override=cycles_override,
+        cycle_start=cycle_start,
+        cycle_step=cycle_step,
+        charge_step=charge_step,
+        discharge_step=discharge_step,
+        retention_cutoff=retention_cutoff,
+        stop_at_retention_cutoff=stop_at_retention_cutoff,
+    )
+
+
+def load_persistent_dqdv_record(
+    record: dict[str, object],
+    cycles_override: list[int] | None,
+    cycle_start: int,
+    cycle_step: int,
+    charge_step: str,
+    discharge_step: str,
+    retention_cutoff: float | None,
+    stop_at_retention_cutoff: bool,
+    cache_dir: Path,
+) -> tuple[pd.DataFrame | None, pd.DataFrame, dict[str, object], str | None]:
+    cache_key = dqdv_cache_key(
+        record,
+        cycles_override,
+        cycle_start,
+        cycle_step,
+        charge_step,
+        discharge_step,
+        retention_cutoff,
+        stop_at_retention_cutoff,
+    )
+    hit, cached_df, meta = read_persistent_dataframe_cache(cache_dir, cache_key)
+    if hit:
+        raw_df = normalize_dqdv_plot_df(cached_df)
+        cycle_summary = pd.DataFrame(meta.get("cycle_summary", [])) if isinstance(meta, dict) else pd.DataFrame()
+        summary_row = dict(meta.get("summary_row", {})) if isinstance(meta, dict) else {}
+        error = meta.get("error") if isinstance(meta, dict) else None
+        return raw_df, cycle_summary, summary_row, error
+
+    raw_df, cycle_summary, summary_row, error = process_dqdv_record_uncached(
+        record,
+        cycles_override,
+        cycle_start,
+        cycle_step,
+        charge_step,
+        discharge_step,
+        retention_cutoff,
+        stop_at_retention_cutoff,
+    )
+    write_persistent_dataframe_cache(
+        cache_dir,
+        cache_key,
+        raw_df,
+        error,
+        extra_meta={
+            "summary_row": summary_row,
+            "cycle_summary": cycle_summary.to_dict("records") if not cycle_summary.empty else [],
+        },
+    )
+    return raw_df, cycle_summary, summary_row, error
+
+
+def load_cached_dqdv_record(
+    record: dict[str, object],
+    cycles_override: list[int] | None,
+    cycle_start: int,
+    cycle_step: int,
+    charge_step: str,
+    discharge_step: str,
+    retention_cutoff: float | None,
+    stop_at_retention_cutoff: bool,
+    persistent_cache_dir: Path | None = None,
+) -> tuple[pd.DataFrame | None, pd.DataFrame, dict[str, object], str | None]:
+    if persistent_cache_dir is not None:
+        return load_persistent_dqdv_record(
+            record,
+            cycles_override,
+            cycle_start,
+            cycle_step,
+            charge_step,
+            discharge_step,
+            retention_cutoff,
+            stop_at_retention_cutoff,
+            persistent_cache_dir,
+        )
+
+    path = Path(record["path"])
+    stat = path.stat()
+    payload = dict(record)
+    payload["path"] = str(path)
+    return cached_process_dqdv_record(
+        record_payload=payload,
+        cycles_override=cycles_override,
+        cycle_start=cycle_start,
+        cycle_step=cycle_step,
+        charge_step=charge_step,
+        discharge_step=discharge_step,
+        retention_cutoff=retention_cutoff,
+        stop_at_retention_cutoff=stop_at_retention_cutoff,
+        file_size=int(stat.st_size),
+        file_mtime=float(stat.st_mtime),
+    )
+
+
+def read_dqdv_preview_job_worker(args: tuple) -> tuple[str, dict[str, object], pd.DataFrame | None, pd.DataFrame, dict[str, object], str | None]:
+    (
+        sample,
+        record,
+        cycles_override,
+        cycle_start,
+        cycle_step,
+        charge_step,
+        discharge_step,
+        retention_cutoff,
+        stop_at_retention_cutoff,
+        persistent_cache_dir,
+    ) = args
+    cache_dir = Path(persistent_cache_dir) if persistent_cache_dir else None
+    raw_df, cycle_summary, summary_row, error = load_cached_dqdv_record(
+        record,
+        cycles_override,
+        int(cycle_start),
+        int(cycle_step),
+        charge_step,
+        discharge_step,
+        retention_cutoff,
+        bool(stop_at_retention_cutoff),
+        persistent_cache_dir=cache_dir,
+    )
+    return sample, record, raw_df, cycle_summary, summary_row, error
+
+
+def clean_dqdv_plot_df(plot_df: pd.DataFrame | None) -> pd.DataFrame:
+    if plot_df is None:
+        return pd.DataFrame()
+    df = plot_df.copy()
+    required_cols = ["cycle_index", "point_index", "areal_capacity_mAh_cm2", "voltage_V"]
+    if df.empty or any(col not in df.columns for col in required_cols):
+        return pd.DataFrame()
+    for col in ["cycle_index", "point_index", "areal_capacity_mAh_cm2", "voltage_V"]:
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+    return df.dropna(subset=required_cols)
+
+
+def dqdv_figure_limits(plot_df: pd.DataFrame, style: dict[str, object]) -> tuple[dict[str, object], pd.DataFrame, bool]:
+    numeric_df = clean_dqdv_plot_df(plot_df)
+    if numeric_df.empty:
+        return {
+            "x_min": float(style["x_min"]),
+            "x_max": float(style["x_max"]),
+            "y_min": float(style["y_min"]),
+            "y_max": float(style["y_max"]),
+        }, numeric_df, False
+
+    adjusted = False
+    if bool(style["auto_x_range"]):
+        x_max = float(dqdv.choose_auto_xmax(float(numeric_df["areal_capacity_mAh_cm2"].max())))
+        x_min = -0.05 * x_max
+    else:
+        x_min = float(style["x_min"])
+        x_max = float(style["x_max"])
+
+    y_min = float(style["y_min"])
+    y_max = float(style["y_max"])
+    x_visible = numeric_df["areal_capacity_mAh_cm2"].between(x_min, x_max)
+    if not x_visible.any():
+        x_max = float(dqdv.choose_auto_xmax(float(numeric_df["areal_capacity_mAh_cm2"].max())))
+        x_min = -0.05 * x_max
+        x_visible = numeric_df["areal_capacity_mAh_cm2"].between(x_min, x_max)
+        adjusted = True
+    if not (x_visible & numeric_df["voltage_V"].between(y_min, y_max)).any():
+        y_min, y_max = padded_limits(numeric_df.loc[x_visible, "voltage_V"], 2.5, 4.5, 0.15)
+        adjusted = True
+    return {"x_min": x_min, "x_max": x_max, "y_min": y_min, "y_max": y_max}, numeric_df, adjusted
+
+
+def make_dqdv_figure(
+    plot_df: pd.DataFrame,
+    sample_name: str,
+    repeat_name: str,
+    source_file: str,
+    color_hex: str,
+    plot_title: str,
+    x_label: str,
+    y_label: str,
+    legend_title: str,
+    show_legend: bool,
+    x_min: float,
+    x_max: float,
+    y_min: float,
+    y_max: float,
+    linewidth: float,
+    fig_width: float,
+    fig_height: float,
+    legend_position: str = "Inside",
+    legend_label_max_len: int = 28,
+    legend_columns: int = 4,
+):
+    apply_common_plot_style()
+    df = clean_dqdv_plot_df(plot_df)
+    fig, ax = plt.subplots(figsize=(fig_width, fig_height))
+
+    if df.empty:
+        ax.text(0.5, 0.5, "No valid numeric plotting data", ha="center", va="center", transform=ax.transAxes, fontsize=12)
+    else:
+        cycles = sorted(df["cycle_index"].dropna().astype(int).unique())
+        base_color = hex_to_rgb_tuple(color_hex)
+        cycle_colors = {
+            cycle: dqdv.faded_color(base_color, idx, len(cycles))
+            for idx, cycle in enumerate(cycles)
+        }
+        seen_cycles: set[int] = set()
+        for (_, cycle, step_type), group in df.groupby(["source_file", "cycle_index", "step_type"], sort=True):
+            group = group.sort_values("point_index")
+            cycle_int = int(cycle)
+            label = shorten_label(str(cycle_int), legend_label_max_len) if cycle_int not in seen_cycles else "_nolegend_"
+            seen_cycles.add(cycle_int)
+            ax.plot(
+                group["areal_capacity_mAh_cm2"].to_numpy(float),
+                group["voltage_V"].to_numpy(float),
+                color=cycle_colors.get(cycle_int, base_color),
+                linestyle="-",
+                linewidth=float(linewidth),
+                alpha=0.92,
+                label=label,
+            )
+
+    title = (
+        plot_title
+        .replace("{sample}", sample_name)
+        .replace("{repeat}", repeat_name)
+        .replace("{file}", Path(source_file).stem)
+    )
+    if title.strip():
+        ax.set_title(title, fontsize=17, pad=12)
+    ax.set_xlabel(x_label, fontsize=17, labelpad=8)
+    ax.set_ylabel(y_label, fontsize=17, labelpad=8)
+    ax.set_xlim(float(x_min), float(x_max))
+    ax.set_ylim(float(y_min), float(y_max))
+    dqdv.apply_axis_style(ax)
+
+    legend_position = legend_position if show_legend else "Hide"
+    handles, labels = ax.get_legend_handles_labels()
+    legend_pairs = [(handle, label) for handle, label in zip(handles, labels) if label != "_nolegend_"]
+    handles = [handle for handle, _label in legend_pairs]
+    labels = [label for _handle, label in legend_pairs]
+    n_labels = max(1, len(labels))
+    ncol = max(1, min(int(legend_columns), n_labels))
+
+    if legend_position == "Top" and labels:
+        top = 0.74 if title.strip() else 0.80
+        fig.subplots_adjust(left=0.13, right=0.96, bottom=0.13, top=top)
+        fig.legend(
+            handles,
+            labels,
+            loc="upper center",
+            bbox_to_anchor=(0.5, 0.985),
+            ncol=ncol,
+            title=legend_title,
+            frameon=False,
+            handletextpad=0.4,
+            columnspacing=1.0,
+            borderaxespad=0.0,
+        )
+    elif legend_position == "Right" and labels:
+        fig.subplots_adjust(left=0.13, right=0.75, bottom=0.13, top=0.90)
+        fig.legend(handles, labels, loc="center right", bbox_to_anchor=(0.985, 0.53), ncol=1, title=legend_title, frameon=False)
+    elif legend_position == "Inside" and labels:
+        fig.subplots_adjust(left=0.13, right=0.96, bottom=0.13, top=0.90)
+        ax.legend(handles, labels, loc="best", title=legend_title, frameon=False)
+    else:
+        fig.subplots_adjust(left=0.13, right=0.96, bottom=0.13, top=0.90)
+    return fig
+
+
+def make_single_dqdv_preview_figure(plot_df: pd.DataFrame | None, color_hex: str, fig_width: float = 3.7, fig_height: float = 2.25):
+    style = {
+        "auto_x_range": True,
+        "x_min": -0.25,
+        "x_max": 5.0,
+        "y_min": 2.5,
+        "y_max": 4.5,
+    }
+    limits, _numeric, _adjusted = dqdv_figure_limits(plot_df if plot_df is not None else pd.DataFrame(), style)
+    sample = str(plot_df["sample"].iloc[0]) if plot_df is not None and not plot_df.empty and "sample" in plot_df.columns else "Preview"
+    repeat = str(plot_df["repeat"].iloc[0]) if plot_df is not None and not plot_df.empty and "repeat" in plot_df.columns else ""
+    source = str(plot_df["source_file"].iloc[0]) if plot_df is not None and not plot_df.empty and "source_file" in plot_df.columns else ""
+    return make_dqdv_figure(
+        plot_df=plot_df if plot_df is not None else pd.DataFrame(),
+        sample_name=sample,
+        repeat_name=repeat,
+        source_file=source,
+        color_hex=color_hex,
+        plot_title="",
+        x_label="Capacity",
+        y_label="Voltage",
+        legend_title="Cycle",
+        show_legend=False,
+        x_min=float(limits["x_min"]),
+        x_max=float(limits["x_max"]),
+        y_min=float(limits["y_min"]),
+        y_max=float(limits["y_max"]),
+        linewidth=1.6,
+        fig_width=fig_width,
+        fig_height=fig_height,
+    )
+
+
+def render_dqdv_file_preview_card(
+    record: dict[str, object],
+    plot_df: pd.DataFrame | None,
+    summary_row: dict[str, object],
+    error: str | None,
+    checkbox_key: str,
+    color_hex: str,
+) -> None:
+    rel = str(record["relative_path"])
+    file_stem = Path(rel).stem
+    repeat = str(record.get("repeat", ""))
+    label = repeat if repeat == file_stem else f"{repeat} | {file_stem}"
+    status_text = str(summary_row.get("status", "") or "").strip()
+    note_text = str(error or summary_row.get("note", "") or "")
+    if not note_text and status_text and status_text != "ok":
+        note_text = status_text
+
+    try:
+        card_ctx = st.container(border=True)
+    except TypeError:
+        card_ctx = st.container()
+
+    with card_ctx:
+        st.checkbox(shorten_label(label, 30), key=checkbox_key, help=rel)
+        sync_dqdv_checkbox_to_saved(str(record["sample"]), rel, checkbox_key)
+        fig = make_single_dqdv_preview_figure(plot_df, color_hex=color_hex)
+        st.pyplot(fig, clear_figure=True)
+        plt.close(fig)
+        render_preview_metric_grid(
+            [
+                ("Max cyc", preview_metric_text(summary_row.get("max_record_cycle"), digits=0)),
+                ("Plotted", preview_metric_text(summary_row.get("n_cycles_included_in_plot"), digits=0)),
+                ("First", preview_metric_text(summary_row.get("first_plotted_cycle"), digits=0)),
+                ("Last", preview_metric_text(summary_row.get("last_plotted_cycle"), digits=0)),
+            ]
+        )
+        render_preview_note(note_text if status_text != "ok" else "")
+
+
+def parse_dqdv_cycles_from_state() -> tuple[list[int] | None, str | None]:
+    mode = st.session_state.get("dqdv_cycle_mode", "Interval")
+    if mode == "Custom list":
+        raw = st.session_state.get("dqdv_cycle_list", "")
+        try:
+            return dqdv.parse_cycle_list(raw), None
+        except Exception as exc:
+            return None, f"Could not parse cycle list: {exc}"
+    return None, None
+
+
+def render_dqdv_analysis_page() -> None:
+    st.title("dQ/dV Analysis")
+    st.caption("Batch cycle selection and per-repeat V-Q profile plotting using `dqdv_batch.py`.")
+
+    with st.sidebar:
+        st.header("dQ/dV input")
+        input_mode = st.radio(
+            "Data access mode",
+            ["Local/server folder path", "Demo ZIP upload only"],
+            index=0,
+            key="dqdv_input_mode",
+            help="Use Local/server folder path for real datasets. ZIP upload is only for small demo datasets.",
+        )
+        if input_mode == "Local/server folder path":
+            root_dir_str = st.text_input("Root data directory on this machine/server", value="", help="Folder containing one first-level folder per sample.", key="dqdv_root_dir")
+            root_dir = Path(root_dir_str).expanduser().resolve() if root_dir_str.strip() else None
+            output_dir_str = st.text_input("Output directory", value="", help="Leave empty to save to <root_dir>/dqdv_analysis_outputs.", key="dqdv_output_dir")
+            if output_dir_str.strip():
+                output_dir = Path(output_dir_str).expanduser().resolve()
+            elif root_dir is not None:
+                output_dir = root_dir / "dqdv_analysis_outputs"
+            else:
+                output_dir = None
+            input_message = "Enter a root data directory to start."
+        else:
+            st.warning("ZIP upload is for small demo data only. For larger datasets, use Local/server folder path.")
+            uploaded_zip = st.file_uploader("Upload a small demo ZIP containing sample folders", type=["zip"], accept_multiple_files=False, key="dqdv_uploaded_zip")
+            if uploaded_zip is None:
+                root_dir = None
+                output_dir = None
+                input_message = "Upload a small demo ZIP to start, or switch to Local/server folder path."
+            else:
+                try:
+                    root_dir = get_or_create_uploaded_dqdv_zip_root(uploaded_zip)
+                    output_dir = root_dir / "dqdv_analysis_outputs"
+                    input_message = f"Temporary extracted root: `{root_dir}`"
+                    st.caption(input_message)
+                except Exception as exc:
+                    st.error(f"Could not extract ZIP: {exc}")
+                    root_dir = None
+                    output_dir = None
+                    input_message = "ZIP extraction failed."
+
+        if root_dir is not None and output_dir is None:
+            output_dir = root_dir / "dqdv_analysis_outputs"
+
+        bulk_preview = st.checkbox("Load all selected samples at once in data preview", value=True, key="dqdv_bulk_preview")
+        parallel_load = st.checkbox(
+            "Parallel file loading (experimental)",
+            value=False,
+            key="dqdv_parallel_load",
+            disabled=not bulk_preview,
+            help="Reads multiple Excel files at the same time during load-all preview.",
+        )
+        parallel_backend = st.selectbox("Parallel backend", ["Threads", "Processes"], key="dqdv_parallel_backend", disabled=not parallel_load)
+        parallel_workers = int(st.number_input("Parallel workers", min_value=1, max_value=64, value=12, step=1, key="dqdv_parallel_workers", disabled=not parallel_load))
+        use_parsed_cache = st.checkbox("Cache parsed Excel data", value=True, key="dqdv_use_parsed_excel_cache")
+        notify_load_complete = st.checkbox("Notify when load-all preview finishes", value=True, key="dqdv_notify_load_complete", disabled=not bulk_preview)
+
+        st.header("Cycle extraction")
+        cycle_start = int(st.number_input("Initial cycle index", min_value=0, value=3, step=1, key="dqdv_cycle_start", help="Also used as the initial discharge capacity reference."))
+        st.selectbox("Cycles to plot", ["Interval", "Custom list"], key="dqdv_cycle_mode")
+        if st.session_state.get("dqdv_cycle_mode", "Interval") == "Interval":
+            cycle_step = int(st.number_input("Cycle interval", min_value=1, value=20, step=1, key="dqdv_cycle_step"))
+        else:
+            cycle_step = int(st.number_input("Fallback interval", min_value=1, value=20, step=1, key="dqdv_cycle_step"))
+            st.text_input("Custom cycle list", value="3,23,43,63", key="dqdv_cycle_list", help="Comma-separated cycle indices. This overrides the interval.")
+        charge_step = st.text_input("Charge Step Type", value="CC Chg", key="dqdv_charge_step")
+        discharge_step = st.text_input("Discharge Step Type", value="CC DChg", key="dqdv_discharge_step")
+        use_retention_cutoff = st.checkbox("Apply retention cutoff", value=True, key="dqdv_use_retention_cutoff")
+        retention_cutoff = st.number_input("Retention cutoff (%)", min_value=0.0, max_value=200.0, value=80.0, step=1.0, key="dqdv_retention_cutoff", disabled=not use_retention_cutoff)
+        stop_at_retention_cutoff = st.checkbox("Stop checking after cutoff is reached", value=True, key="dqdv_stop_at_retention_cutoff", disabled=not use_retention_cutoff)
+
+    if root_dir is None or output_dir is None:
+        st.info(input_message)
+        return
+    if not root_dir.exists() or not root_dir.is_dir():
+        st.error(f"Root path is not a directory on this runtime machine: `{root_dir}`")
+        return
+
+    cycles_override, cycle_error = parse_dqdv_cycles_from_state()
+    if cycle_error:
+        st.error(cycle_error)
+        return
+    effective_retention_cutoff = float(retention_cutoff) if use_retention_cutoff else None
+    dqdv_persistent_cache_dir = parsed_excel_cache_dir(output_dir, "dqdv") if bool(use_parsed_cache) else None
+
+    records = collect_dqdv_file_records(root_dir, output_dir)
+    if not records:
+        st.warning("No valid `.xlsx` dQ/dV files found under the root directory.")
+        return
+
+    sample_names = sorted({str(r["sample"]) for r in records})
+    records_by_sample = {sample: [r for r in records if str(r["sample"]) == sample] for sample in sample_names}
+    default_colors = palette_to_hex_colors("Set2 + Dark2 + tab20", len(sample_names))
+    default_color_map = {sample: default_colors[i] for i, sample in enumerate(sample_names)}
+    ensure_dqdv_selection_store()
+
+    st.subheader("dQ/dV workflow")
+    workflow_options = ["1. Data preview & file selection", "2. Cycle & style preview", "3. Final output"]
+    if st.session_state.get("dqdv_workflow_step") not in workflow_options:
+        st.session_state["dqdv_workflow_step"] = workflow_options[0]
+    workflow_view = st.radio("Choose workflow step", workflow_options, horizontal=True, key="dqdv_workflow_step")
+    selected_samples = st.multiselect("Samples to process", options=sample_names, default=sample_names, key="dqdv_selected_samples")
+    if not selected_samples:
+        st.warning("Select at least one sample.")
+        return
+
+    for sample in selected_samples:
+        saved = st.session_state["dqdv_saved_selection"].get(sample, {})
+        for record in records_by_sample[sample]:
+            rel = str(record["relative_path"])
+            key = dqdv_file_include_key(sample, str(record["repeat"]), rel)
+            if key not in st.session_state:
+                st.session_state[key] = bool(saved.get(rel, True))
+
+    style_defaults = {
+        "dqdv_plot_title": "{sample} - {repeat}",
+        "dqdv_x_label": "Capacity (mAh cm$^{-2}$)",
+        "dqdv_y_label": "Voltage (V)",
+        "dqdv_show_legend": True,
+        "dqdv_legend_position": "Inside",
+        "dqdv_legend_title": "Cycle Index",
+        "dqdv_legend_label_max_len": 28,
+        "dqdv_legend_columns": 4,
+        "dqdv_auto_x_range": True,
+        "dqdv_x_min": -0.25,
+        "dqdv_x_max": 5.0,
+        "dqdv_y_min": 2.5,
+        "dqdv_y_max": 4.5,
+        "dqdv_palette_name": "Set2 + Dark2 + tab20",
+        "dqdv_linewidth": 2.1,
+        "dqdv_fig_width": 8.2,
+        "dqdv_fig_height": 6.2,
+        "dqdv_dpi": 300,
+    }
+    for key, value in style_defaults.items():
+        st.session_state.setdefault(key, value)
+    if float(st.session_state.get("dqdv_x_max", 5.0)) <= float(st.session_state.get("dqdv_x_min", -0.25)):
+        st.session_state["dqdv_x_min"] = -0.25
+        st.session_state["dqdv_x_max"] = 5.0
+    if float(st.session_state.get("dqdv_y_max", 4.5)) <= float(st.session_state.get("dqdv_y_min", 2.5)):
+        st.session_state["dqdv_y_min"] = 2.5
+        st.session_state["dqdv_y_max"] = 4.5
+
+    def current_dqdv_style() -> dict[str, object]:
+        return {
+            "plot_title": st.session_state.get("dqdv_plot_title", "{sample} - {repeat}"),
+            "x_label": st.session_state.get("dqdv_x_label", "Capacity (mAh cm$^{-2}$)"),
+            "y_label": st.session_state.get("dqdv_y_label", "Voltage (V)"),
+            "show_legend": bool(st.session_state.get("dqdv_show_legend", True)),
+            "legend_position": st.session_state.get("dqdv_legend_position", "Inside"),
+            "legend_title": st.session_state.get("dqdv_legend_title", "Cycle Index"),
+            "legend_label_max_len": int(st.session_state.get("dqdv_legend_label_max_len", 28)),
+            "legend_columns": int(st.session_state.get("dqdv_legend_columns", 4)),
+            "auto_x_range": bool(st.session_state.get("dqdv_auto_x_range", True)),
+            "x_min": float(st.session_state.get("dqdv_x_min", -0.25)),
+            "x_max": float(st.session_state.get("dqdv_x_max", 5.0)),
+            "y_min": float(st.session_state.get("dqdv_y_min", 2.5)),
+            "y_max": float(st.session_state.get("dqdv_y_max", 4.5)),
+            "palette_name": st.session_state.get("dqdv_palette_name", "Set2 + Dark2 + tab20"),
+            "linewidth": float(st.session_state.get("dqdv_linewidth", 2.1)),
+            "fig_width": float(st.session_state.get("dqdv_fig_width", 8.2)),
+            "fig_height": float(st.session_state.get("dqdv_fig_height", 6.2)),
+            "dpi": int(st.session_state.get("dqdv_dpi", 300)),
+        }
+
+    def current_dqdv_colors(style: dict[str, object]) -> dict[str, str]:
+        colors = palette_to_hex_colors(str(style["palette_name"]), len(sample_names))
+        palette_color_map = {sample: colors[i] for i, sample in enumerate(sample_names)}
+        return {
+            sample: st.session_state.get(f"dqdv_color_{safe_filename(sample)}", palette_color_map[sample])
+            for sample in selected_samples
+        }
+
+    def selected_dqdv_records(sample: str) -> list[dict[str, object]]:
+        selected_paths = set(selected_dqdv_paths_for_sample(sample, records_by_sample[sample]))
+        return [r for r in records_by_sample[sample] if str(r["relative_path"]) in selected_paths]
+
+    def load_dqdv_records_for_plot(records_to_load: list[dict[str, object]]) -> tuple[pd.DataFrame | None, pd.DataFrame, pd.DataFrame]:
+        plot_frames = []
+        summary_rows = []
+        cycle_frames = []
+        for record in records_to_load:
+            plot_df, cycle_summary, summary_row, _error = load_cached_dqdv_record(
+                record=record,
+                cycles_override=cycles_override,
+                cycle_start=int(cycle_start),
+                cycle_step=int(cycle_step),
+                charge_step=charge_step,
+                discharge_step=discharge_step,
+                retention_cutoff=effective_retention_cutoff,
+                stop_at_retention_cutoff=bool(stop_at_retention_cutoff),
+                persistent_cache_dir=dqdv_persistent_cache_dir,
+            )
+            summary_rows.append(summary_row)
+            if cycle_summary is not None and not cycle_summary.empty:
+                cycle_frames.append(cycle_summary)
+            if plot_df is not None and not plot_df.empty:
+                plot_frames.append(plot_df)
+        combined_plot = pd.concat(plot_frames, ignore_index=True) if plot_frames else None
+        combined_cycles = pd.concat(cycle_frames, ignore_index=True) if cycle_frames else pd.DataFrame()
+        return combined_plot, pd.DataFrame(summary_rows), combined_cycles
+
+    if workflow_view == "1. Data preview & file selection":
+        st.markdown("### Data preview & file selection")
+        if cycles_override:
+            st.caption(f"Custom cycles: {', '.join(str(c) for c in cycles_override)}")
+        else:
+            st.caption(f"Cycle interval: start {int(cycle_start)}, every {int(cycle_step)} cycles.")
+
+        if bulk_preview:
+            all_loaded_entries: dict[str, list[tuple[dict[str, object], pd.DataFrame | None, pd.DataFrame, dict[str, object], str | None]]] = {}
+            all_jobs = [(sample, record) for sample in selected_samples for record in records_by_sample[sample]]
+            bulk_signature = hashlib.sha1(
+                repr(
+                    {
+                        "root_dir": str(root_dir),
+                        "selected_samples": selected_samples,
+                        "files": {sample: [file_record_signature(record) for record in records_by_sample[sample]] for sample in selected_samples},
+                        "cycles_override": cycles_override,
+                        "cycle_start": int(cycle_start),
+                        "cycle_step": int(cycle_step),
+                        "charge_step": charge_step,
+                        "discharge_step": discharge_step,
+                        "retention_cutoff": effective_retention_cutoff,
+                        "stop_at_retention_cutoff": bool(stop_at_retention_cutoff),
+                        "implementation": "dqdv_bulk_preview_v1",
+                    }
+                ).encode("utf-8")
+            ).hexdigest()
+            cached_bulk = st.session_state.get("dqdv_bulk_preview_cache")
+            cache_is_current = bool(cached_bulk and cached_bulk.get("signature") == bulk_signature)
+            reload_col, cache_col = st.columns([1, 3])
+            with reload_col:
+                if st.button("Reload preview data", key="dqdv_reload_bulk_preview", use_container_width=True):
+                    st.session_state.pop("dqdv_bulk_preview_cache", None)
+                    rerun_streamlit_app()
+            with cache_col:
+                if cache_is_current:
+                    st.caption("Using the current in-session preview cache.")
+
+            if cache_is_current:
+                all_loaded_entries = cached_bulk["entries"]
+            else:
+                progress = st.progress(0)
+                status = st.empty()
+                for sample in selected_samples:
+                    all_loaded_entries[sample] = []
+
+                def dqdv_worker_args(job: tuple[str, dict[str, object]]):
+                    sample, record = job
+                    return (
+                        sample,
+                        record,
+                        cycles_override,
+                        int(cycle_start),
+                        int(cycle_step),
+                        charge_step,
+                        discharge_step,
+                        effective_retention_cutoff,
+                        bool(stop_at_retention_cutoff),
+                        dqdv_persistent_cache_dir,
+                    )
+
+                if parallel_load and all_jobs:
+                    max_workers = min(int(parallel_workers), len(all_jobs))
+                    executor_cls = ProcessPoolExecutor if parallel_backend == "Processes" else ThreadPoolExecutor
+
+                    def consume_dqdv_executor(executor) -> None:
+                        futures = {
+                            executor.submit(read_dqdv_preview_job_worker, dqdv_worker_args(job)): job
+                            for job in all_jobs
+                        }
+                        for done_idx, future in enumerate(as_completed(futures), start=1):
+                            sample, record, plot_df, cycle_summary, summary_row, error = future.result()
+                            key = dqdv_file_include_key(sample, str(record["repeat"]), str(record["relative_path"]))
+                            if plot_df is None:
+                                st.session_state[key] = False
+                            all_loaded_entries[sample].append((record, plot_df, cycle_summary, summary_row, error))
+                            status.write(f"Loaded {done_idx}/{len(all_jobs)}: {record['source_file']}")
+                            progress.progress(done_idx / len(all_jobs))
+
+                    try:
+                        with executor_cls(max_workers=max_workers) as executor:
+                            consume_dqdv_executor(executor)
+                    except Exception as exc:
+                        if parallel_backend != "Processes":
+                            raise
+                        st.warning(f"Process backend could not start or complete: {exc}. Falling back to Threads.")
+                        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                            consume_dqdv_executor(executor)
+                else:
+                    for idx, job in enumerate(all_jobs, start=1):
+                        sample, record, plot_df, cycle_summary, summary_row, error = read_dqdv_preview_job_worker(dqdv_worker_args(job))
+                        key = dqdv_file_include_key(sample, str(record["repeat"]), str(record["relative_path"]))
+                        if plot_df is None:
+                            st.session_state[key] = False
+                        all_loaded_entries[sample].append((record, plot_df, cycle_summary, summary_row, error))
+                        status.write(f"Reading {idx}/{len(all_jobs)}: {record['source_file']}")
+                        progress.progress(idx / len(all_jobs))
+                status.empty()
+                progress.empty()
+                st.session_state["dqdv_bulk_preview_cache"] = {"signature": bulk_signature, "entries": all_loaded_entries}
+
+            total_files = sum(len(entries) for entries in all_loaded_entries.values())
+            total_valid = sum(1 for entries in all_loaded_entries.values() for entry in entries if entry[1] is not None)
+            total_invalid = total_files - total_valid
+            st.success(f"Loaded {total_files} files across {len(selected_samples)} samples. Valid: {total_valid}; unavailable: {total_invalid}.")
+            if notify_load_complete:
+                notify_load_all_complete(
+                    notification_id=f"dqdv_load_all_complete_{bulk_signature}",
+                    title="dQ/dV data preview loaded",
+                    body=f"Loaded {total_files} dQ/dV files across {len(selected_samples)} samples.",
+                    enabled=True,
+                )
+            b1, b2, b3 = st.columns([1, 1, 2])
+            with b1:
+                if st.button("Select all valid", use_container_width=True, key="dqdv_bulk_select_valid"):
+                    for sample, entries in all_loaded_entries.items():
+                        for record, plot_df, _cycle_summary, _summary_row, _error in entries:
+                            st.session_state[dqdv_file_include_key(sample, str(record["repeat"]), str(record["relative_path"]))] = plot_df is not None
+                        save_dqdv_selection_for_sample(sample, records_by_sample[sample])
+                    rerun_streamlit_app()
+            with b2:
+                if st.button("Clear all", use_container_width=True, key="dqdv_bulk_clear_all"):
+                    for sample in selected_samples:
+                        for record in records_by_sample[sample]:
+                            st.session_state[dqdv_file_include_key(sample, str(record["repeat"]), str(record["relative_path"]))] = False
+                        save_dqdv_selection_for_sample(sample, records_by_sample[sample])
+                    rerun_streamlit_app()
+            with b3:
+                selected_total = sum(len(selected_dqdv_paths_for_sample(sample, records_by_sample[sample])) for sample in selected_samples)
+                st.caption(f"Current selection across all samples: {selected_total} / {total_files} files included.")
+
+            summary_frames = []
+            for sample in selected_samples:
+                entries = all_loaded_entries.get(sample, [])
+                selected_count = sum(bool(st.session_state.get(dqdv_file_include_key(sample, str(record["repeat"]), str(record["relative_path"])), False)) for record, *_ in entries)
+                with st.expander(f"{sample} ({selected_count}/{len(entries)} selected)", expanded=True):
+                    file_cols = st.columns(4)
+                    for idx, (record, plot_df, _cycle_summary, summary_row, error) in enumerate(entries):
+                        key = dqdv_file_include_key(sample, str(record["repeat"]), str(record["relative_path"]))
+                        with file_cols[idx % 4]:
+                            render_dqdv_file_preview_card(record, plot_df, summary_row, error, key, default_color_map[sample])
+                    selected_rows = [
+                        summary_row for record, _plot_df, _cycle_summary, summary_row, _error in entries
+                        if bool(st.session_state.get(dqdv_file_include_key(sample, str(record["repeat"]), str(record["relative_path"])), False))
+                    ]
+                    if selected_rows:
+                        current_summary = pd.DataFrame(selected_rows)
+                        summary_frames.append(current_summary)
+                        st.dataframe(current_summary, use_container_width=True, hide_index=True)
+            if summary_frames:
+                selected_summary = pd.concat(summary_frames, ignore_index=True)
+                st.download_button("Download selected dQ/dV summary CSV", data=selected_summary.to_csv(index=False).encode("utf-8"), file_name="selected_dqdv_summary.csv", mime="text/csv", use_container_width=True)
+            st.button("Save selections and continue to cycle/style preview", type="primary", use_container_width=True, on_click=save_all_dqdv_selections_and_go_style, args=(selected_samples, records_by_sample))
+            return
+
+        if st.session_state.get("dqdv_inspect_sample") not in selected_samples:
+            st.session_state["dqdv_inspect_sample"] = selected_samples[0]
+        inspect_sample = st.selectbox("Sample to inspect", options=selected_samples, key="dqdv_inspect_sample")
+        file_records = records_by_sample[inspect_sample]
+        c1, c2, c3 = st.columns([1, 1, 2.2])
+        with c1:
+            if st.button("Select all valid", use_container_width=True, key="dqdv_select_all_valid"):
+                for record in file_records:
+                    plot_df, *_ = load_cached_dqdv_record(record, cycles_override, int(cycle_start), int(cycle_step), charge_step, discharge_step, effective_retention_cutoff, bool(stop_at_retention_cutoff), persistent_cache_dir=dqdv_persistent_cache_dir)
+                    st.session_state[dqdv_file_include_key(inspect_sample, str(record["repeat"]), str(record["relative_path"]))] = plot_df is not None
+                save_dqdv_selection_for_sample(inspect_sample, file_records)
+                rerun_streamlit_app()
+        with c2:
+            if st.button("Clear all", use_container_width=True, key="dqdv_clear_all"):
+                for record in file_records:
+                    st.session_state[dqdv_file_include_key(inspect_sample, str(record["repeat"]), str(record["relative_path"]))] = False
+                save_dqdv_selection_for_sample(inspect_sample, file_records)
+                rerun_streamlit_app()
+        with c3:
+            selected_count = len(selected_dqdv_paths_for_sample(inspect_sample, file_records))
+            st.caption(f"Saved/current selection: {selected_count} / {len(file_records)} files included.")
+
+        loaded_entries = []
+        progress = st.progress(0)
+        status = st.empty()
+        for idx, record in enumerate(file_records, start=1):
+            status.write(f"Reading {idx}/{len(file_records)}: {record['source_file']}")
+            plot_df, cycle_summary, summary_row, error = load_cached_dqdv_record(record, cycles_override, int(cycle_start), int(cycle_step), charge_step, discharge_step, effective_retention_cutoff, bool(stop_at_retention_cutoff), persistent_cache_dir=dqdv_persistent_cache_dir)
+            key = dqdv_file_include_key(inspect_sample, str(record["repeat"]), str(record["relative_path"]))
+            if plot_df is None:
+                st.session_state[key] = False
+            loaded_entries.append((record, plot_df, cycle_summary, summary_row, error))
+            progress.progress(idx / len(file_records))
+        status.empty()
+        progress.empty()
+
+        valid_entries = [entry for entry in loaded_entries if entry[1] is not None]
+        invalid_entries = [entry for entry in loaded_entries if entry[1] is None]
+        st.info(f"Valid: {len(valid_entries)}; unavailable: {len(invalid_entries)}.")
+        file_cols = st.columns(4)
+        for idx, (record, plot_df, _cycle_summary, summary_row, error) in enumerate(valid_entries + invalid_entries):
+            rel = str(record["relative_path"])
+            key = dqdv_file_include_key(inspect_sample, str(record["repeat"]), rel)
+            with file_cols[idx % 4]:
+                render_dqdv_file_preview_card(record, plot_df, summary_row, error, key, default_color_map[inspect_sample])
+
+        current_summary = pd.DataFrame([
+            summary_row for record, _plot_df, _cycle_summary, summary_row, _error in loaded_entries
+            if bool(st.session_state.get(dqdv_file_include_key(inspect_sample, str(record["repeat"]), str(record["relative_path"])), False))
+        ])
+        st.markdown("#### Selected-file summary for this sample")
+        if current_summary.empty:
+            st.info("No files are currently selected for this sample.")
+        else:
+            st.dataframe(current_summary, use_container_width=True, hide_index=True)
+            st.download_button("Download this sample dQ/dV summary CSV", data=current_summary.to_csv(index=False).encode("utf-8"), file_name=f"{safe_filename(inspect_sample)}_dqdv_summary.csv", mime="text/csv", use_container_width=True)
+
+        st.divider()
+        current_idx = selected_samples.index(inspect_sample)
+        button_label = f"Save this sample and continue to {shorten_label(selected_samples[current_idx + 1], 28)}" if current_idx < len(selected_samples) - 1 else "Save this sample and continue to cycle/style preview"
+        st.button(button_label, type="primary", use_container_width=True, on_click=save_current_dqdv_selection_and_advance, args=(inspect_sample, selected_samples, records_by_sample))
+        return
+
+    if workflow_view == "2. Cycle & style preview":
+        st.markdown("### Cycle & style preview")
+        if st.session_state.get("dqdv_style_defaults_signature") != dqdv_style_defaults_signature(selected_samples):
+            apply_dqdv_style_defaults_for_preview(selected_samples)
+        style_controls_col, style_preview_col = st.columns([0.9, 1.55], gap="large")
+        with style_controls_col:
+            preview_sample = st.selectbox("Preview sample", options=selected_samples, key="dqdv_preview_sample")
+            preview_records_for_sample = selected_dqdv_records(preview_sample)
+            preview_options = [
+                str(record["relative_path"]) for record in preview_records_for_sample
+            ]
+            preview_rel = st.selectbox("Preview file/repeat", options=preview_options, key="dqdv_preview_relative_path") if preview_options else None
+
+            tab_text, tab_legend, tab_axes, tab_style = st.tabs(["Text", "Legend", "Axes", "Style"])
+            with tab_text:
+                st.text_input("Plot title", key="dqdv_plot_title", help='Use "{sample}", "{repeat}", or "{file}".')
+                st.text_input("X-axis label", key="dqdv_x_label")
+                st.text_input("Y-axis label", key="dqdv_y_label")
+            with tab_legend:
+                st.checkbox("Show legend", key="dqdv_show_legend")
+                show_legend = bool(st.session_state.get("dqdv_show_legend", True))
+                st.selectbox("Legend position", ["Top", "Right", "Inside"], key="dqdv_legend_position", disabled=not show_legend)
+                st.text_input("Legend title", key="dqdv_legend_title", disabled=not show_legend)
+                st.slider("Label length", min_value=8, max_value=80, key="dqdv_legend_label_max_len", disabled=not show_legend)
+                st.slider("Top legend columns", min_value=1, max_value=8, key="dqdv_legend_columns", disabled=not show_legend)
+            with tab_axes:
+                st.checkbox("Auto X-axis upper limit", key="dqdv_auto_x_range")
+                auto_x = bool(st.session_state.get("dqdv_auto_x_range", True))
+                a1, a2 = st.columns(2)
+                with a1:
+                    st.number_input("X min", step=0.1, key="dqdv_x_min", disabled=auto_x)
+                    st.number_input("Y min", step=0.1, key="dqdv_y_min")
+                with a2:
+                    st.number_input("X max", step=0.5, key="dqdv_x_max", disabled=auto_x)
+                    st.number_input("Y max", step=0.1, key="dqdv_y_max")
+            with tab_style:
+                st.selectbox("Default color palette", ["Set2 + Dark2 + tab20", "Set2", "Dark2", "tab10", "tab20", "tab20 + tab20b"], key="dqdv_palette_name")
+                st.slider("Line width", min_value=0.5, max_value=5.0, step=0.1, key="dqdv_linewidth")
+                f1, f2 = st.columns(2)
+                with f1:
+                    st.number_input("Figure width", min_value=3.0, max_value=20.0, key="dqdv_fig_width", step=0.5)
+                    st.number_input("DPI", min_value=72, max_value=600, key="dqdv_dpi", step=50)
+                with f2:
+                    st.number_input("Figure height", min_value=3.0, max_value=15.0, key="dqdv_fig_height", step=0.5)
+                style = current_dqdv_style()
+                colors = palette_to_hex_colors(str(style["palette_name"]), len(sample_names))
+                palette_color_map = {sample: colors[i] for i, sample in enumerate(sample_names)}
+                with st.expander("Sample colors", expanded=False):
+                    for i, sample in enumerate(selected_samples, start=1):
+                        st.color_picker(compact_widget_label("Color", i, sample, max_len=18), value=st.session_state.get(f"dqdv_color_{safe_filename(sample)}", palette_color_map[sample]), key=f"dqdv_color_{safe_filename(sample)}")
+            st.button("Generate final outputs", type="primary", use_container_width=True, on_click=set_dqdv_workflow_step, args=("3. Final output",))
+
+        with style_preview_col:
+            st.markdown("### Live style preview")
+            style = current_dqdv_style()
+            sample_colors = current_dqdv_colors(style)
+            preview_record = next((record for record in preview_records_for_sample if str(record["relative_path"]) == str(preview_rel)), None)
+            if preview_record is None:
+                st.warning("No selected dQ/dV file found for this preview.")
+            else:
+                preview_plot_df, preview_summary, preview_cycles = load_dqdv_records_for_plot([preview_record])
+                if preview_plot_df is None:
+                    st.warning("No valid dQ/dV data found for this preview.")
+                    st.dataframe(preview_summary, use_container_width=True, hide_index=True)
+                else:
+                    effective_limits, _numeric_df, adjusted = dqdv_figure_limits(preview_plot_df, style)
+                    fig = make_dqdv_figure(
+                        plot_df=preview_plot_df,
+                        sample_name=str(preview_record["sample"]),
+                        repeat_name=str(preview_record["repeat"]),
+                        source_file=str(preview_record["source_file"]),
+                        color_hex=sample_colors.get(str(preview_record["sample"]), "#4E79A7"),
+                        plot_title=str(style["plot_title"]),
+                        x_label=str(style["x_label"]),
+                        y_label=str(style["y_label"]),
+                        legend_title=str(style["legend_title"]),
+                        show_legend=bool(style["show_legend"]),
+                        x_min=float(effective_limits["x_min"]),
+                        x_max=float(effective_limits["x_max"]),
+                        y_min=float(effective_limits["y_min"]),
+                        y_max=float(effective_limits["y_max"]),
+                        linewidth=float(style["linewidth"]),
+                        fig_width=float(style["fig_width"]),
+                        fig_height=float(style["fig_height"]),
+                        legend_position=str(style["legend_position"]),
+                        legend_label_max_len=int(style["legend_label_max_len"]),
+                        legend_columns=int(style["legend_columns"]),
+                    )
+                    st.pyplot(fig, clear_figure=True)
+                    plt.close(fig)
+                    if adjusted:
+                        st.caption("Axis range was expanded to keep data visible.")
+                    st.dataframe(preview_summary, use_container_width=True, hide_index=True)
+                    if not preview_cycles.empty:
+                        with st.expander("Cycle summary", expanded=False):
+                            st.dataframe(preview_cycles, use_container_width=True, hide_index=True)
+        return
+
+    st.markdown("### Final output")
+    style = current_dqdv_style()
+    sample_colors = current_dqdv_colors(style)
+    selected_paths = {s: selected_dqdv_paths_for_sample(s, records_by_sample[s]) for s in selected_samples}
+    signature = hashlib.sha1(
+        repr(
+            {
+                "root_dir": str(root_dir),
+                "output_dir": str(output_dir),
+                "selected_samples": selected_samples,
+                "selected_paths": selected_paths,
+                "files": {sample: [file_record_signature(record) for record in records_by_sample[sample]] for sample in selected_samples},
+                "cycles_override": cycles_override,
+                "cycle_start": int(cycle_start),
+                "cycle_step": int(cycle_step),
+                "charge_step": charge_step,
+                "discharge_step": discharge_step,
+                "retention_cutoff": effective_retention_cutoff,
+                "stop_at_retention_cutoff": bool(stop_at_retention_cutoff),
+                "style": style,
+                "colors": sample_colors,
+                "implementation": "dqdv_final_v1",
+            }
+        ).encode("utf-8")
+    ).hexdigest()
+    cached = st.session_state.get("dqdv_final_output_cache")
+    if cached and cached.get("signature") == signature:
+        if st.button("Regenerate final outputs", type="primary"):
+            st.session_state.pop("dqdv_final_output_cache", None)
+        else:
+            grid_cols = st.columns(2)
+            for idx, item in enumerate(cached["rendered_outputs"]):
+                safe_item_key = safe_filename(str(item["title"]))
+                with grid_cols[idx % 2]:
+                    st.markdown(f"#### {item['title']}")
+                    fig = make_dqdv_figure(**item["figure_kwargs"])
+                    st.pyplot(fig, clear_figure=True)
+                    plt.close(fig)
+                    c1, c2 = st.columns(2)
+                    c1.download_button("CSV", data=item["csv_bytes"], file_name=item["csv_file_name"], mime="text/csv", key=f"dqdv_csv_{idx}_{safe_item_key}")
+                    c2.download_button("PNG", data=item["png_bytes"], file_name=item["png_file_name"], mime="image/png", key=f"dqdv_png_{idx}_{safe_item_key}")
+            st.success(f"Batch dQ/dV analysis completed. Results saved to: `{cached['output_dir']}`")
+            st.dataframe(cached["summary_df"], use_container_width=True, hide_index=True)
+            st.download_button("Download all dQ/dV results ZIP", data=cached["zip_bytes"], file_name="dqdv_results.zip", mime="application/zip")
+            return
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    figures_dir = output_dir / "figures_by_file"
+    data_dir = output_dir / "plot_data_by_file"
+    figures_dir.mkdir(parents=True, exist_ok=True)
+    data_dir.mkdir(parents=True, exist_ok=True)
+    rendered_outputs = []
+    summary_frames = []
+    cycle_frames = []
+    zip_buffer = io.BytesIO()
+    output_records = [record for sample in selected_samples for record in selected_dqdv_records(sample)]
+
+    progress = st.progress(0)
+    status = st.empty()
+    with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zipf:
+        for idx, record in enumerate(output_records, start=1):
+            title = f"{record['sample']} / {record['repeat']} / {record['source_file']}"
+            status.write(f"Processing {title} ({idx}/{len(output_records)})...")
+            plot_df, summary_df, cycle_summary = load_dqdv_records_for_plot([record])
+            if not summary_df.empty:
+                summary_frames.append(summary_df)
+            if not cycle_summary.empty:
+                cycle_frames.append(cycle_summary)
+            if plot_df is None:
+                st.warning(f"No valid dQ/dV data found for `{title}`.")
+                progress.progress(idx / max(1, len(output_records)))
+                continue
+            safe_name = f"{safe_filename(str(record['sample']))}__{safe_filename(str(record['repeat']))}__{safe_filename(Path(str(record['source_file'])).stem)}"
+            csv_path = data_dir / f"{safe_name}_plot_data.csv"
+            png_path = figures_dir / f"{safe_name}_dqdv.png"
+            summary_path = data_dir / f"{safe_name}_summary.csv"
+            cycles_path = data_dir / f"{safe_name}_cycle_summary.csv"
+            plot_df.to_csv(csv_path, index=False)
+            summary_df.to_csv(summary_path, index=False)
+            cycle_summary.to_csv(cycles_path, index=False)
+            effective_limits, numeric_df, adjusted = dqdv_figure_limits(plot_df, style)
+            figure_kwargs = dict(
+                plot_df=plot_df,
+                sample_name=str(record["sample"]),
+                repeat_name=str(record["repeat"]),
+                source_file=str(record["source_file"]),
+                color_hex=sample_colors.get(str(record["sample"]), "#4E79A7"),
+                plot_title=str(style["plot_title"]),
+                x_label=str(style["x_label"]),
+                y_label=str(style["y_label"]),
+                legend_title=str(style["legend_title"]),
+                show_legend=bool(style["show_legend"]),
+                x_min=float(effective_limits["x_min"]),
+                x_max=float(effective_limits["x_max"]),
+                y_min=float(effective_limits["y_min"]),
+                y_max=float(effective_limits["y_max"]),
+                linewidth=float(style["linewidth"]),
+                fig_width=float(style["fig_width"]),
+                fig_height=float(style["fig_height"]),
+                legend_position=str(style["legend_position"]),
+                legend_label_max_len=int(style["legend_label_max_len"]),
+                legend_columns=int(style["legend_columns"]),
+            )
+            fig = make_dqdv_figure(**figure_kwargs)
+            fig.canvas.draw()
+            fig.savefig(png_path, dpi=int(style["dpi"]), bbox_inches="tight")
+            png_buffer = io.BytesIO()
+            fig.savefig(png_buffer, format="png", dpi=int(style["dpi"]), bbox_inches="tight")
+            png_buffer.seek(0)
+            png_bytes = png_buffer.getvalue()
+            plt.close(fig)
+            csv_bytes = plot_df.to_csv(index=False).encode("utf-8")
+            summary_bytes = summary_df.to_csv(index=False).encode("utf-8")
+            cycle_bytes = cycle_summary.to_csv(index=False).encode("utf-8")
+            zipf.writestr(f"{safe_name}/{safe_name}_plot_data.csv", csv_bytes)
+            zipf.writestr(f"{safe_name}/{safe_name}_summary.csv", summary_bytes)
+            zipf.writestr(f"{safe_name}/{safe_name}_cycle_summary.csv", cycle_bytes)
+            zipf.writestr(f"{safe_name}/{safe_name}_dqdv.png", png_bytes)
+            rendered_outputs.append(
+                {
+                    "title": title,
+                    "csv_bytes": csv_bytes,
+                    "png_bytes": png_bytes,
+                    "csv_file_name": f"{safe_name}_plot_data.csv",
+                    "png_file_name": f"{safe_name}_dqdv.png",
+                    "figure_kwargs": figure_kwargs,
+                    "adjusted_limits": adjusted,
+                    "numeric_points": len(numeric_df),
+                }
+            )
+            progress.progress(idx / max(1, len(output_records)))
+
+    status.empty()
+    progress.empty()
+    if not rendered_outputs:
+        st.warning("No valid dQ/dV results were generated.")
+        return
+
+    summary_df = pd.concat(summary_frames, ignore_index=True) if summary_frames else pd.DataFrame()
+    cycle_summary_df = pd.concat(cycle_frames, ignore_index=True) if cycle_frames else pd.DataFrame()
+    summary_df.to_csv(output_dir / "summary_by_file.csv", index=False)
+    cycle_summary_df.to_csv(output_dir / "cycle_summary_by_file.csv", index=False)
+    zip_buffer.seek(0)
+    cache = {
+        "signature": signature,
+        "output_dir": str(output_dir),
+        "rendered_outputs": rendered_outputs,
+        "summary_df": summary_df,
+        "zip_bytes": zip_buffer.getvalue(),
+    }
+    st.session_state["dqdv_final_output_cache"] = cache
+    rerun_streamlit_app()
+
+
 def render_placeholder_page(title: str) -> None:
     st.title(title)
     st.info("This module can be added later without changing the EIS fitting logic.")
@@ -6198,7 +7484,7 @@ def main() -> None:
     elif tool == "Stripping Overpotential":
         render_stripping_analysis_page()
     elif tool == "dQ/dV Analysis":
-        render_placeholder_page("dQ/dV Analysis")
+        render_dqdv_analysis_page()
 
 
 if __name__ == "__main__":
