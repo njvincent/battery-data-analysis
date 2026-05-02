@@ -18,10 +18,13 @@ from __future__ import annotations
 import os
 import re
 import io
+import json
 import html
+import importlib.util
 import tempfile
 import zipfile
 import hashlib
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -887,6 +890,245 @@ def read_one_capacity_file_silent(
     return out, None
 
 
+def parsed_excel_cache_dir(output_dir: Path, analysis_kind: str) -> Path:
+    return output_dir / ".streamlit_parsed_excel_cache" / analysis_kind
+
+
+def persistent_cache_key(payload: dict[str, object]) -> str:
+    encoded = json.dumps(payload, sort_keys=True, default=str).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def json_safe_value(value: object) -> object:
+    if isinstance(value, dict):
+        return {str(k): json_safe_value(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [json_safe_value(v) for v in value]
+    if isinstance(value, tuple):
+        return [json_safe_value(v) for v in value]
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, np.generic):
+        value = value.item()
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        try:
+            if pd.isna(value):
+                return None
+        except TypeError:
+            pass
+        return value
+    try:
+        if pd.isna(value):
+            return None
+    except (TypeError, ValueError):
+        pass
+    return str(value)
+
+
+def dataframe_cache_paths(cache_dir: Path, cache_key: str) -> dict[str, Path]:
+    return {
+        "meta": cache_dir / f"{cache_key}.json",
+        "parquet": cache_dir / f"{cache_key}.parquet",
+        "csv": cache_dir / f"{cache_key}.csv",
+    }
+
+
+def parquet_cache_available() -> bool:
+    return (
+        importlib.util.find_spec("pyarrow") is not None
+        or importlib.util.find_spec("fastparquet") is not None
+    )
+
+
+def read_persistent_dataframe_cache(
+    cache_dir: Path,
+    cache_key: str,
+) -> tuple[bool, pd.DataFrame | None, dict[str, object]]:
+    paths = dataframe_cache_paths(cache_dir, cache_key)
+    if not paths["meta"].exists():
+        return False, None, {}
+    try:
+        meta = json.loads(paths["meta"].read_text(encoding="utf-8"))
+    except Exception:
+        return False, None, {}
+
+    if not bool(meta.get("ok", False)):
+        return True, None, meta
+
+    cache_format = str(meta.get("format") or "")
+    read_order = [cache_format] if cache_format in {"parquet", "csv"} else ["parquet", "csv"]
+    for fmt in read_order:
+        path = paths.get(fmt)
+        if path is None or not path.exists():
+            continue
+        try:
+            if fmt == "parquet":
+                return True, pd.read_parquet(path), meta
+            return True, pd.read_csv(path), meta
+        except Exception:
+            continue
+    return False, None, {}
+
+
+def write_persistent_dataframe_cache(
+    cache_dir: Path,
+    cache_key: str,
+    df: pd.DataFrame | None,
+    error: str | None,
+    extra_meta: dict[str, object] | None = None,
+) -> None:
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    paths = dataframe_cache_paths(cache_dir, cache_key)
+    meta: dict[str, object] = {
+        "ok": df is not None,
+        "error": error,
+        "format": None,
+    }
+    if extra_meta:
+        meta.update(json_safe_value(extra_meta))
+
+    if df is not None:
+        if parquet_cache_available():
+            try:
+                df.to_parquet(paths["parquet"], index=False)
+                meta["format"] = "parquet"
+            except Exception:
+                df.to_csv(paths["csv"], index=False)
+                meta["format"] = "csv"
+        else:
+            df.to_csv(paths["csv"], index=False)
+            meta["format"] = "csv"
+
+    paths["meta"].write_text(json.dumps(json_safe_value(meta), indent=2, sort_keys=True), encoding="utf-8")
+
+
+def normalize_capacity_cache_df(df: pd.DataFrame | None) -> pd.DataFrame | None:
+    if df is None:
+        return None
+    out = df.copy()
+    for col in [
+        "cycle_index",
+        "discharge_capacity_mAh",
+        "capacity_retention_percent",
+        "coulombic_efficiency_percent",
+    ]:
+        if col in out.columns:
+            out[col] = pd.to_numeric(out[col], errors="coerce")
+    return out
+
+
+def filter_capacity_retention(
+    raw_df: pd.DataFrame | None,
+    min_capacity_retention: float | None,
+) -> tuple[pd.DataFrame | None, str | None]:
+    if raw_df is None:
+        return None, "No valid numeric data."
+    out = raw_df.copy()
+    if min_capacity_retention is not None:
+        out = out[
+            pd.to_numeric(out["capacity_retention_percent"], errors="coerce") >= float(min_capacity_retention)
+        ].reset_index(drop=True)
+    if out.empty:
+        return None, "No data after filtering."
+    return out, None
+
+
+def capacity_raw_cache_key(
+    file_path: Path,
+    sample_name: str,
+    root_dir: Path,
+    sheet_name: str,
+    capacity_col: str,
+    efficiency_col: str,
+    skip_initial_rows: int,
+) -> str:
+    stat = file_path.stat()
+    try:
+        relative_path = str(file_path.relative_to(root_dir))
+    except ValueError:
+        relative_path = file_path.name
+    return persistent_cache_key(
+        {
+            "kind": "cycling_raw_v1",
+            "file_path": str(file_path),
+            "relative_path": relative_path,
+            "sample_name": sample_name,
+            "root_dir": str(root_dir),
+            "sheet_name": sheet_name,
+            "capacity_col": capacity_col,
+            "efficiency_col": efficiency_col,
+            "skip_initial_rows": int(skip_initial_rows),
+            "file_size": int(stat.st_size),
+            "file_mtime": float(stat.st_mtime),
+        }
+    )
+
+
+def load_persistent_capacity_raw_file(
+    file_path: Path,
+    sample_name: str,
+    root_dir: Path,
+    sheet_name: str,
+    capacity_col: str,
+    efficiency_col: str,
+    skip_initial_rows: int,
+    cache_dir: Path,
+) -> tuple[pd.DataFrame | None, str | None]:
+    cache_key = capacity_raw_cache_key(
+        file_path=file_path,
+        sample_name=sample_name,
+        root_dir=root_dir,
+        sheet_name=sheet_name,
+        capacity_col=capacity_col,
+        efficiency_col=efficiency_col,
+        skip_initial_rows=int(skip_initial_rows),
+    )
+    hit, cached_df, meta = read_persistent_dataframe_cache(cache_dir, cache_key)
+    if hit:
+        return normalize_capacity_cache_df(cached_df), meta.get("error") if isinstance(meta, dict) else None
+
+    raw_df, error = read_one_capacity_file_silent(
+        file_path=file_path,
+        sample_name=sample_name,
+        root_dir=root_dir,
+        sheet_name=sheet_name,
+        capacity_col=capacity_col,
+        efficiency_col=efficiency_col,
+        skip_initial_rows=int(skip_initial_rows),
+        min_capacity_retention=None,
+    )
+    raw_df = normalize_capacity_cache_df(raw_df)
+    write_persistent_dataframe_cache(cache_dir, cache_key, raw_df, error)
+    return raw_df, error
+
+
+def load_persistent_capacity_file(
+    file_path: Path,
+    sample_name: str,
+    root_dir: Path,
+    sheet_name: str,
+    capacity_col: str,
+    efficiency_col: str,
+    skip_initial_rows: int,
+    min_retention: float | None,
+    cache_dir: Path,
+) -> tuple[pd.DataFrame | None, str | None]:
+    raw_df, raw_error = load_persistent_capacity_raw_file(
+        file_path=file_path,
+        sample_name=sample_name,
+        root_dir=root_dir,
+        sheet_name=sheet_name,
+        capacity_col=capacity_col,
+        efficiency_col=efficiency_col,
+        skip_initial_rows=int(skip_initial_rows),
+        cache_dir=cache_dir,
+    )
+    if raw_df is None:
+        return None, raw_error
+    filtered_df, filter_error = filter_capacity_retention(raw_df, min_retention)
+    return filtered_df, filter_error
+
+
 @st.cache_data(show_spinner=False)
 def cached_read_capacity_file(
     file_path_str: str,
@@ -928,7 +1170,21 @@ def load_cached_capacity_file(
     efficiency_col: str,
     skip_initial_rows: int,
     min_retention: float | None,
+    persistent_cache_dir: Path | None = None,
 ) -> tuple[pd.DataFrame | None, str | None]:
+    if persistent_cache_dir is not None:
+        return load_persistent_capacity_file(
+            file_path=file_path,
+            sample_name=sample_name,
+            root_dir=root_dir,
+            sheet_name=sheet_name,
+            capacity_col=capacity_col,
+            efficiency_col=efficiency_col,
+            skip_initial_rows=int(skip_initial_rows),
+            min_retention=min_retention,
+            cache_dir=persistent_cache_dir,
+        )
+
     stat = file_path.stat()
     return cached_read_capacity_file(
         file_path_str=str(file_path),
@@ -946,6 +1202,23 @@ def load_cached_capacity_file(
 
 def stable_key_part(text: str) -> str:
     return hashlib.sha1(str(text).encode("utf-8")).hexdigest()[:12]
+
+
+def file_record_signature(record: dict[str, object]) -> dict[str, object]:
+    """Return stable file identity for bulk-preview cache invalidation."""
+    path = Path(record["path"])
+    try:
+        stat = path.stat()
+        size = int(stat.st_size)
+        mtime = float(stat.st_mtime)
+    except Exception:
+        size = -1
+        mtime = -1.0
+    return {
+        "relative_path": str(record.get("relative_path", path.name)),
+        "size": size,
+        "mtime": mtime,
+    }
 
 
 def cycling_file_include_key(sample_name: str, relative_path: str) -> str:
@@ -1031,6 +1304,16 @@ def save_selection_for_sample(sample_name: str, file_records: list[dict[str, obj
     st.session_state["cycling_saved_selection"][sample_name] = saved
 
 
+def sync_cycling_checkbox_to_saved(sample_name: str, relative_path: str, checkbox_key: str) -> None:
+    """Persist one cycling checkbox immediately so page navigation does not lose it."""
+    ensure_cycling_selection_store()
+    all_saved = dict(st.session_state["cycling_saved_selection"])
+    saved = dict(all_saved.get(sample_name, {}))
+    saved[relative_path] = bool(st.session_state.get(checkbox_key, True))
+    all_saved[sample_name] = saved
+    st.session_state["cycling_saved_selection"] = all_saved
+
+
 def restore_saved_selection_for_sample(sample_name: str, file_records: list[dict[str, object]]) -> bool:
     """Restore saved checkbox values for one sample. Returns True if restored."""
     ensure_cycling_selection_store()
@@ -1059,6 +1342,23 @@ def saved_selection_summary(sample_name: str, file_records: list[dict[str, objec
     selected = sum(bool(saved.get(str(record["relative_path"]), True)) for record in file_records)
     return f"Saved: {selected} / {total} files included."
 
+
+CYCLING_PLOT_MODE_SINGLE = "Single sample repeat overlay"
+CYCLING_PLOT_MODE_COMPARE = "Compare all selected samples"
+CYCLING_COMPARE_MODE_ALIASES = {
+    CYCLING_PLOT_MODE_COMPARE,
+    "Compare samples by one repeat",
+}
+
+
+def is_cycling_compare_mode(plot_mode: object) -> bool:
+    return str(plot_mode) in CYCLING_COMPARE_MODE_ALIASES
+
+
+def normalize_cycling_plot_mode(plot_mode: object) -> str:
+    return CYCLING_PLOT_MODE_COMPARE if is_cycling_compare_mode(plot_mode) else CYCLING_PLOT_MODE_SINGLE
+
+
 def save_current_cycling_selection_and_advance(
     current_sample: str,
     selected_samples: list[str],
@@ -1085,12 +1385,72 @@ def save_current_cycling_selection_and_advance(
         st.session_state["cycling_inspect_sample"] = selected_samples[current_index + 1]
         st.session_state["cycling_workflow_step"] = "1. Data preview & file selection"
     else:
+        apply_cycling_style_defaults_for_preview(selected_samples)
         st.session_state["cycling_workflow_step"] = "2. Style preview"
 
 
 def set_cycling_workflow_step(step: str) -> None:
     """Set the cycling workflow step from a button callback."""
     st.session_state["cycling_workflow_step"] = step
+
+
+def save_all_cycling_selections_and_go_style(
+    selected_samples: list[str],
+    folder_map: dict[str, Path],
+    root_dir: Path,
+) -> None:
+    """Save all currently visible cycling selections and advance to style preview."""
+    ensure_cycling_selection_store()
+    for sample in selected_samples:
+        if sample in folder_map:
+            save_selection_for_sample(sample, capacity_file_records(sample, folder_map[sample], root_dir))
+    apply_cycling_style_defaults_for_preview(selected_samples)
+    st.session_state["cycling_workflow_step"] = "2. Style preview"
+
+
+def reset_cycling_visual_style_defaults() -> None:
+    """Keep cycling plot-mode changes from carrying stale visual styling."""
+    defaults = {
+        "cycling_plot_title": "{sample}",
+        "cycling_x_label": "Cycle Index",
+        "cycling_cap_y_label": "Capacity Retention (%)",
+        "cycling_ce_y_label": "Coulombic Efficiency (%)",
+        "cycling_show_legend": True,
+        "cycling_legend_position": "Top",
+        "cycling_legend_title": "Files",
+        "cycling_legend_label_max_len": 24,
+        "cycling_legend_columns": 3,
+        "cycling_auto_x_range": True,
+        "cycling_x_min": 0.0,
+        "cycling_x_max": 500.0,
+        "cycling_cap_y_min": 75.0,
+        "cycling_cap_y_max": 110.0,
+        "cycling_ce_y_min": 90.0,
+        "cycling_ce_y_max": 100.5,
+        "cycling_palette_name": "Set2 + Dark2 + tab20",
+        "cycling_marker_size": 80,
+        "cycling_fig_width": 9.5,
+        "cycling_fig_height": 5.8,
+        "cycling_dpi": 300,
+    }
+    for key, value in defaults.items():
+        st.session_state[key] = value
+
+
+def cycling_style_defaults_signature(selected_samples: list[str]) -> str:
+    return hashlib.sha1(
+        repr(
+            {
+                "selected_samples": list(selected_samples),
+                "defaults_version": "cycling_visual_defaults_v3",
+            }
+        ).encode("utf-8")
+    ).hexdigest()
+
+
+def apply_cycling_style_defaults_for_preview(selected_samples: list[str]) -> None:
+    reset_cycling_visual_style_defaults()
+    st.session_state["cycling_style_defaults_signature"] = cycling_style_defaults_signature(selected_samples)
 
 
 def rerun_streamlit_app() -> None:
@@ -1126,8 +1486,9 @@ def save_cycling_style_and_go_final(selected_samples: list[str], all_sample_name
         "ce_y_min": float(st.session_state.get("cycling_ce_y_min", 90.0)),
         "ce_y_max": float(st.session_state.get("cycling_ce_y_max", 100.5)),
         "palette_name": st.session_state.get("cycling_palette_name", "Set2 + Dark2 + tab20"),
-        "plot_mode": st.session_state.get("cycling_plot_mode", "Single sample repeat overlay"),
+        "plot_mode": normalize_cycling_plot_mode(st.session_state.get("cycling_plot_mode", CYCLING_PLOT_MODE_SINGLE)),
         "compare_repeat": st.session_state.get("cycling_compare_repeat", ""),
+        "compare_samples": list(st.session_state.get("cycling_compare_samples", selected_samples)),
         "marker_size": int(st.session_state.get("cycling_marker_size", 80)),
         "fig_width": float(st.session_state.get("cycling_fig_width", 9.5)),
         "fig_height": float(st.session_state.get("cycling_fig_height", 5.8)),
@@ -1385,6 +1746,7 @@ def load_raw_capacity_metrics_df(
     capacity_col: str,
     efficiency_col: str,
     skip_initial_rows: int,
+    persistent_cache_dir: Path | None = None,
 ) -> tuple[pd.DataFrame | None, str | None]:
     """Load unfiltered data for metrics such as 80±2% cycle life."""
     return load_cached_capacity_file(
@@ -1396,6 +1758,7 @@ def load_raw_capacity_metrics_df(
         efficiency_col=efficiency_col,
         skip_initial_rows=int(skip_initial_rows),
         min_retention=None,
+        persistent_cache_dir=persistent_cache_dir,
     )
 
 
@@ -1408,6 +1771,7 @@ def load_capacity_sample_file_summary(
     efficiency_col: str,
     skip_initial_rows: int,
     selected_relative_paths: list[str] | None,
+    persistent_cache_dir: Path | None = None,
 ) -> pd.DataFrame:
     """Build a per-file metric summary for selected files in one sample."""
     records = capacity_file_records(sample_name, sample_dir, root_dir)
@@ -1425,6 +1789,7 @@ def load_capacity_sample_file_summary(
             capacity_col=capacity_col,
             efficiency_col=efficiency_col,
             skip_initial_rows=int(skip_initial_rows),
+            persistent_cache_dir=persistent_cache_dir,
         )
         row = compute_capacity_selection_metrics(raw_df, record)
         if error and not row.get("Note"):
@@ -1460,6 +1825,7 @@ def load_capacity_all_selected_file_summary(
     capacity_col: str,
     efficiency_col: str,
     skip_initial_rows: int,
+    persistent_cache_dir: Path | None = None,
 ) -> pd.DataFrame:
     """Build a summary table for every selected file across selected samples."""
     frames = []
@@ -1479,6 +1845,7 @@ def load_capacity_all_selected_file_summary(
             efficiency_col=efficiency_col,
             skip_initial_rows=int(skip_initial_rows),
             selected_relative_paths=selected_paths,
+            persistent_cache_dir=persistent_cache_dir,
         )
         if not frame.empty:
             frames.append(frame)
@@ -1498,6 +1865,7 @@ def load_capacity_sample_plot_data(
     min_retention: float | None,
     top_n_value: int | None,
     selected_relative_paths: list[str] | None = None,
+    persistent_cache_dir: Path | None = None,
 ) -> tuple[pd.DataFrame | None, int]:
     """
     Load and optionally filter Excel cycling files for one sample.
@@ -1530,6 +1898,7 @@ def load_capacity_sample_plot_data(
             efficiency_col=efficiency_col,
             skip_initial_rows=int(skip_initial_rows),
             min_retention=min_retention,
+            persistent_cache_dir=persistent_cache_dir,
         )
 
         if one_df is not None:
@@ -1607,6 +1976,27 @@ def hex_to_rgb_tuple(hex_color: str) -> tuple[float, float, float]:
     """
     hex_color = hex_color.lstrip("#")
     return tuple(int(hex_color[i:i + 2], 16) / 255 for i in (0, 2, 4))
+
+
+COMMON_PLOT_RCPARAMS = {
+    "font.family": "sans-serif",
+    "font.sans-serif": ["Arial", "Helvetica", "DejaVu Sans"],
+    "axes.unicode_minus": False,
+    "figure.autolayout": False,
+    "figure.constrained_layout.use": False,
+    "axes.titlesize": 18,
+    "axes.labelsize": 18,
+    "xtick.labelsize": 15,
+    "ytick.labelsize": 15,
+    "legend.fontsize": 10,
+    "legend.title_fontsize": 12,
+}
+
+
+def apply_common_plot_style() -> None:
+    """Reset Matplotlib defaults before every rendered figure."""
+    plt.rcdefaults()
+    plt.rcParams.update(COMMON_PLOT_RCPARAMS)
 
 
 def keep_twin_axes_points_visible(ax1, ax2) -> None:
@@ -1769,9 +2159,7 @@ def make_capacity_figure(
     - Right legend uses a figure-level legend and reserves a dedicated right band.
     - This avoids overlap with the title and the right y-axis.
     """
-    plt.rcParams["font.family"] = "sans-serif"
-    plt.rcParams["font.sans-serif"] = ["Arial", "Helvetica", "DejaVu Sans"]
-    plt.rcParams["axes.unicode_minus"] = False
+    apply_common_plot_style()
 
     # Make plotting robust across files whose Excel columns may have been read
     # as object/string dtype. If these values are not coerced here, Matplotlib
@@ -1894,14 +2282,11 @@ def make_capacity_figure(
     handles, labels = ax1.get_legend_handles_labels()
     n_labels = max(1, len(labels))
     ncol = max(1, min(int(legend_columns), n_labels))
-    legend_rows = int(np.ceil(n_labels / ncol))
 
     # Avoid tight_layout here. It often cannot correctly reserve space for a
     # figure-level legend together with a twinx right y-axis.
     if legend_position == "Top":
-        title_space = 0.08 if title.strip() else 0.0
-        legend_space = min(0.22, 0.075 + 0.045 * legend_rows)
-        top = max(0.58, 1.0 - title_space - legend_space - 0.02)
+        top = 0.74 if title.strip() else 0.80
         fig.subplots_adjust(left=0.11, right=0.88, bottom=0.14, top=top)
 
         # Put title inside the axes area and legend above it. This creates a
@@ -1983,9 +2368,7 @@ def make_capacity_sample_comparison_figure(
     legend_columns: int = 3,
 ):
     """Make one cycling comparison figure for the same repeat across samples."""
-    plt.rcParams["font.family"] = "sans-serif"
-    plt.rcParams["font.sans-serif"] = ["Arial", "Helvetica", "DejaVu Sans"]
-    plt.rcParams["axes.unicode_minus"] = False
+    apply_common_plot_style()
 
     plot_df = plot_df.copy()
     for numeric_col in [
@@ -2084,12 +2467,9 @@ def make_capacity_sample_comparison_figure(
     handles, labels = ax1.get_legend_handles_labels()
     n_labels = max(1, len(labels))
     ncol = max(1, min(int(legend_columns), n_labels))
-    legend_rows = int(np.ceil(n_labels / ncol))
 
     if legend_position == "Top":
-        title_space = 0.08 if title.strip() else 0.0
-        legend_space = min(0.22, 0.075 + 0.045 * legend_rows)
-        top = max(0.58, 1.0 - title_space - legend_space - 0.02)
+        top = 0.74 if title.strip() else 0.80
         fig.subplots_adjust(left=0.11, right=0.88, bottom=0.14, top=top)
         fig.legend(
             handles,
@@ -2156,9 +2536,7 @@ def make_single_file_capacity_preview_figure(
     compact layout so that a long list of file previews looks aligned in
     Streamlit.
     """
-    plt.rcParams["font.family"] = "sans-serif"
-    plt.rcParams["font.sans-serif"] = ["Arial", "Helvetica", "DejaVu Sans"]
-    plt.rcParams["axes.unicode_minus"] = False
+    apply_common_plot_style()
 
     df = file_df.sort_values("cycle_index").copy()
     color_rgb = hex_to_rgb_tuple(color_hex)
@@ -2254,9 +2632,7 @@ def make_empty_single_file_capacity_preview_figure(
     fig_height: float = 2.25,
 ):
     """Create an empty preview figure with the same footprint as valid file previews."""
-    plt.rcParams["font.family"] = "sans-serif"
-    plt.rcParams["font.sans-serif"] = ["Arial", "Helvetica", "DejaVu Sans"]
-    plt.rcParams["axes.unicode_minus"] = False
+    apply_common_plot_style()
 
     fig, ax = plt.subplots(figsize=(fig_width, fig_height))
     ax.set_axis_off()
@@ -2315,6 +2691,7 @@ def render_file_preview_card(
             key=checkbox_key,
             help=rel,
         )
+        sync_cycling_checkbox_to_saved(str(record["sample"]), rel, checkbox_key)
 
         if file_df is not None and not file_df.empty:
             fig = make_single_file_capacity_preview_figure(
@@ -2408,6 +2785,31 @@ def get_or_create_uploaded_zip_root(uploaded_zip) -> Path:
             return root
 
     extract_dir = Path(tempfile.mkdtemp(prefix="battery_cycling_zip_"))
+    safe_extract_zip_to_dir(uploaded_zip, extract_dir)
+    root_dir = infer_cycling_root_after_unzip(extract_dir)
+
+    st.session_state[state_key] = {
+        "signature": upload_sig,
+        "extract_dir": str(extract_dir),
+        "root_dir": str(root_dir),
+    }
+    return root_dir
+
+
+def get_or_create_uploaded_stripping_zip_root(uploaded_zip) -> Path:
+    """
+    Extract an uploaded stripping ZIP once per session and return the inferred root.
+    """
+    upload_sig = hashlib.sha1(uploaded_zip.getvalue()).hexdigest()[:16]
+    state_key = "stripping_uploaded_zip_state"
+    current = st.session_state.get(state_key)
+
+    if current and current.get("signature") == upload_sig:
+        root = Path(current["root_dir"])
+        if root.exists():
+            return root
+
+    extract_dir = Path(tempfile.mkdtemp(prefix="battery_stripping_zip_"))
     safe_extract_zip_to_dir(uploaded_zip, extract_dir)
     root_dir = infer_cycling_root_after_unzip(extract_dir)
 
@@ -2531,6 +2933,43 @@ def render_cycling_analysis_page() -> None:
 
     with st.sidebar:
         root_dir, output_dir, input_mode = resolve_cycling_input_root_from_sidebar()
+        if not bool(st.session_state.get("cycling_bulk_preview_default_migrated", False)):
+            st.session_state["cycling_bulk_preview"] = True
+            st.session_state["cycling_bulk_preview_default_migrated"] = True
+        cycling_bulk_preview = st.checkbox(
+            "Load all selected samples at once in data preview",
+            value=True,
+            key="cycling_bulk_preview",
+            help="Read all selected samples in one pass, then review and select files without stepping sample-by-sample.",
+        )
+        cycling_parallel_load = st.checkbox(
+            "Parallel file loading (experimental)",
+            value=False,
+            key="cycling_parallel_load",
+            disabled=not cycling_bulk_preview,
+            help=(
+                "Experimental. Reads multiple Excel files at the same time during load-all preview. "
+                "This can use much more CPU, memory, and disk/network bandwidth, and may be less stable with very large files, cloud drives, or openpyxl."
+            ),
+        )
+        cycling_parallel_workers = int(
+            st.number_input(
+                "Parallel workers",
+                min_value=1,
+                max_value=64,
+                value=12,
+                step=1,
+                key="cycling_parallel_workers",
+                disabled=not cycling_parallel_load,
+                help="Maximum Excel files to parse at the same time when parallel loading is enabled. Higher values can increase CPU, RAM, and disk/cloud-drive pressure.",
+            )
+        )
+        cycling_use_parsed_cache = st.checkbox(
+            "Cache parsed Excel data",
+            value=True,
+            key="cycling_use_parsed_excel_cache",
+            help="Store parsed per-file data as parquet when available, otherwise CSV. Preview, style preview, and final output reuse this cache until the Excel file or read settings change.",
+        )
 
         st.header("Data settings")
 
@@ -2568,24 +3007,15 @@ def render_cycling_analysis_page() -> None:
             disabled=not use_retention_filter,
         )
 
-        top_n_enabled = st.checkbox(
-            "Only plot top N included files per sample",
-            value=False,
-            help="Applied after manual file selection. Files are ranked by the sum of capacity retention.",
-        )
-
-        top_n = st.number_input(
-            "Top N files",
-            min_value=1,
-            max_value=50,
-            value=3,
-            step=1,
-            disabled=not top_n_enabled,
-        )
-
     if root_dir is None or output_dir is None:
         st.info(input_mode)
         return
+
+    cycling_persistent_cache_dir = (
+        parsed_excel_cache_dir(output_dir, "cycling")
+        if bool(cycling_use_parsed_cache)
+        else None
+    )
 
     if not root_dir.exists():
         st.error(
@@ -2611,7 +3041,7 @@ def render_cycling_analysis_page() -> None:
     default_color_map = {sample: default_colors[i] for i, sample in enumerate(sample_names)}
 
     min_retention = float(min_capacity_retention) if use_retention_filter else None
-    top_n_value = int(top_n) if top_n_enabled else None
+    top_n_value = None
 
     st.subheader("Cycling workflow")
     workflow_options = [
@@ -2682,8 +3112,9 @@ def render_cycling_analysis_page() -> None:
         "cycling_ce_y_min": 90.0,
         "cycling_ce_y_max": 100.5,
         "cycling_palette_name": "Set2 + Dark2 + tab20",
-        "cycling_plot_mode": "Single sample repeat overlay",
+        "cycling_plot_mode": CYCLING_PLOT_MODE_SINGLE,
         "cycling_compare_repeat": "",
+        "cycling_compare_samples": selected_samples,
         "cycling_marker_size": 80,
         "cycling_fig_width": 9.5,
         "cycling_fig_height": 5.8,
@@ -2691,6 +3122,15 @@ def render_cycling_analysis_page() -> None:
     }
     for key, value in style_defaults.items():
         st.session_state.setdefault(key, value)
+    st.session_state["cycling_plot_mode"] = normalize_cycling_plot_mode(
+        st.session_state.get("cycling_plot_mode", CYCLING_PLOT_MODE_SINGLE)
+    )
+    if not isinstance(st.session_state.get("cycling_compare_samples"), list):
+        st.session_state["cycling_compare_samples"] = selected_samples
+    st.session_state["cycling_compare_samples"] = [
+        sample for sample in st.session_state.get("cycling_compare_samples", selected_samples)
+        if sample in selected_samples
+    ] or list(selected_samples)
 
     # Older versions of this app could leave these text fields as empty strings
     # in session_state. Refill only blank text labels so the Text tab always
@@ -2736,8 +3176,9 @@ def render_cycling_analysis_page() -> None:
             "ce_y_min": float(st.session_state.get("cycling_ce_y_min", 90.0)),
             "ce_y_max": float(st.session_state.get("cycling_ce_y_max", 100.5)),
             "palette_name": st.session_state.get("cycling_palette_name", "Set2 + Dark2 + tab20"),
-            "plot_mode": st.session_state.get("cycling_plot_mode", "Single sample repeat overlay"),
+            "plot_mode": normalize_cycling_plot_mode(st.session_state.get("cycling_plot_mode", CYCLING_PLOT_MODE_SINGLE)),
             "compare_repeat": st.session_state.get("cycling_compare_repeat", ""),
+            "compare_samples": list(st.session_state.get("cycling_compare_samples", selected_samples)),
             "marker_size": int(st.session_state.get("cycling_marker_size", 80)),
             "fig_width": float(st.session_state.get("cycling_fig_width", 9.5)),
             "fig_height": float(st.session_state.get("cycling_fig_height", 5.8)),
@@ -2773,6 +3214,13 @@ def render_cycling_analysis_page() -> None:
                     continue
                 repeats.add(str(record.get("repeat") or "repeat"))
         return sorted(repeats)
+
+    def cycling_comparison_samples_from_style(style: dict[str, object]) -> list[str]:
+        compare_samples = [
+            sample for sample in list(style.get("compare_samples", selected_samples))
+            if sample in selected_samples
+        ]
+        return compare_samples or list(selected_samples)
 
     def render_final_output_cache(cache: dict[str, object]) -> None:
         rendered_outputs = cache["rendered_outputs"]
@@ -2857,6 +3305,239 @@ def render_cycling_analysis_page() -> None:
             "Each Excel file is shown as its own cycling plot. Valid files are shown first; unreadable or unusable files are moved to the end and unchecked by default. Save the current sample to continue to the next sample."
         )
 
+        preview_axis_mode = "Fixed common range"
+        preview_min_retention = min_retention
+
+        if cycling_bulk_preview:
+            if use_retention_filter:
+                st.caption(f"Current retention cutoff: {float(min_capacity_retention):g}%. The same cutoff is applied to file previews, final sample plots, and exported CSV files.")
+            else:
+                st.caption("Retention cutoff is disabled. File previews, final sample plots, and exported CSV files will keep all valid points.")
+
+            all_loaded_entries: dict[str, list[tuple[dict[str, object], pd.DataFrame | None, pd.DataFrame | None, str | None]]] = {}
+            total_files = sum(len(capacity_file_records(sample, folder_map[sample], root_dir)) for sample in selected_samples)
+            all_jobs = [
+                (sample, record)
+                for sample in selected_samples
+                for record in capacity_file_records(sample, folder_map[sample], root_dir)
+            ]
+            bulk_signature = hashlib.sha1(
+                repr(
+                    {
+                        "root_dir": str(root_dir),
+                        "selected_samples": selected_samples,
+                        "files": {
+                            sample: [file_record_signature(record) for record in capacity_file_records(sample, folder_map[sample], root_dir)]
+                            for sample in selected_samples
+                        },
+                        "sheet_name": sheet_name,
+                        "capacity_col": capacity_col,
+                        "efficiency_col": efficiency_col,
+                        "skip_initial_rows": int(skip_initial_rows),
+                        "preview_min_retention": preview_min_retention,
+                        "implementation": "cycling_bulk_preview_v1",
+                    }
+                ).encode("utf-8")
+            ).hexdigest()
+            cached_bulk = st.session_state.get("cycling_bulk_preview_cache")
+            cache_is_current = bool(cached_bulk and cached_bulk.get("signature") == bulk_signature)
+            reload_col, cache_col = st.columns([1, 3])
+            with reload_col:
+                if st.button("Reload preview data", key="cycling_reload_bulk_preview", use_container_width=True):
+                    st.session_state.pop("cycling_bulk_preview_cache", None)
+                    cached_bulk = None
+                    cache_is_current = False
+            with cache_col:
+                st.caption("Preview data is reused while files and data settings stay unchanged.")
+
+            sample_default_state = {
+                sample: (
+                    sample in st.session_state.get("cycling_saved_selection", {}),
+                    f"cycling_valid_defaults_applied_{stable_key_part(sample)}",
+                    bool(st.session_state.get(f"cycling_valid_defaults_applied_{stable_key_part(sample)}", False)),
+                )
+                for sample in selected_samples
+            }
+
+            def read_cycling_preview_job(job: tuple[str, dict[str, object]]):
+                sample, record = job
+                if cycling_parallel_load and cycling_persistent_cache_dir is None:
+                    file_df, error = read_one_capacity_file_silent(
+                        file_path=record["path"],
+                        sample_name=sample,
+                        root_dir=root_dir,
+                        sheet_name=sheet_name,
+                        capacity_col=capacity_col,
+                        efficiency_col=efficiency_col,
+                        skip_initial_rows=int(skip_initial_rows),
+                        min_capacity_retention=preview_min_retention,
+                    )
+                    raw_df, raw_error = read_one_capacity_file_silent(
+                        file_path=record["path"],
+                        sample_name=sample,
+                        root_dir=root_dir,
+                        sheet_name=sheet_name,
+                        capacity_col=capacity_col,
+                        efficiency_col=efficiency_col,
+                        skip_initial_rows=int(skip_initial_rows),
+                        min_capacity_retention=None,
+                    )
+                else:
+                    file_df, error = load_cached_capacity_file(
+                        file_path=record["path"],
+                        sample_name=sample,
+                        root_dir=root_dir,
+                        sheet_name=sheet_name,
+                        capacity_col=capacity_col,
+                        efficiency_col=efficiency_col,
+                        skip_initial_rows=int(skip_initial_rows),
+                        min_retention=preview_min_retention,
+                        persistent_cache_dir=cycling_persistent_cache_dir,
+                    )
+                    raw_df, raw_error = load_raw_capacity_metrics_df(
+                        record=record,
+                        sample_name=sample,
+                        root_dir=root_dir,
+                        sheet_name=sheet_name,
+                        capacity_col=capacity_col,
+                        efficiency_col=efficiency_col,
+                        skip_initial_rows=int(skip_initial_rows),
+                        persistent_cache_dir=cycling_persistent_cache_dir,
+                    )
+                return sample, record, file_df, raw_df, error or raw_error
+
+            if cache_is_current:
+                all_loaded_entries = cached_bulk["all_loaded_entries"]
+            else:
+                completed = 0
+                preview_progress = st.progress(0)
+                preview_status = st.empty()
+                if cycling_parallel_load and all_jobs:
+                    max_workers = min(cycling_parallel_workers, len(all_jobs))
+                    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                        futures = [executor.submit(read_cycling_preview_job, job) for job in all_jobs]
+                        for future in as_completed(futures):
+                            sample, record, file_df, raw_df, combined_error = future.result()
+                            completed += 1
+                            preview_status.write(f"Reading {completed}/{total_files}: {sample} / {record['source_file']}")
+                            saved_selection_exists, _default_marker_key, defaults_already_applied = sample_default_state[sample]
+                            key = cycling_file_include_key(sample, str(record["relative_path"]))
+                            if file_df is None:
+                                st.session_state[key] = False
+                            elif not saved_selection_exists and not defaults_already_applied:
+                                st.session_state[key] = True
+                            all_loaded_entries.setdefault(sample, []).append((record, file_df, raw_df, combined_error))
+                            preview_progress.progress(completed / max(1, total_files))
+                else:
+                    for job in all_jobs:
+                        sample, record, file_df, raw_df, combined_error = read_cycling_preview_job(job)
+                        completed += 1
+                        preview_status.write(f"Reading {completed}/{total_files}: {sample} / {record['source_file']}")
+                        saved_selection_exists, _default_marker_key, defaults_already_applied = sample_default_state[sample]
+                        key = cycling_file_include_key(sample, str(record["relative_path"]))
+                        if file_df is None:
+                            st.session_state[key] = False
+                        elif not saved_selection_exists and not defaults_already_applied:
+                            st.session_state[key] = True
+                        all_loaded_entries.setdefault(sample, []).append((record, file_df, raw_df, combined_error))
+                        preview_progress.progress(completed / max(1, total_files))
+
+                for sample in selected_samples:
+                    saved_selection_exists, default_marker_key, defaults_already_applied = sample_default_state[sample]
+                    if not saved_selection_exists and not defaults_already_applied:
+                        st.session_state[default_marker_key] = True
+                    order = {str(record["relative_path"]): i for i, record in enumerate(capacity_file_records(sample, folder_map[sample], root_dir))}
+                    all_loaded_entries[sample] = sorted(
+                        all_loaded_entries.get(sample, []),
+                        key=lambda entry: order.get(str(entry[0]["relative_path"]), 10**9),
+                    )
+                st.session_state["cycling_bulk_preview_cache"] = {
+                    "signature": bulk_signature,
+                    "all_loaded_entries": all_loaded_entries,
+                }
+                preview_status.empty()
+                preview_progress.empty()
+
+            total_valid = sum(1 for entries in all_loaded_entries.values() for entry in entries if entry[1] is not None)
+            total_invalid = total_files - total_valid
+            selected_total = sum(len(selected_relative_paths_for_sample_saved_first(sample, folder_map[sample], root_dir, True)) for sample in selected_samples)
+            st.success(f"Loaded {total_files} files across {len(selected_samples)} samples. Valid: {total_valid}; unavailable: {total_invalid}; selected: {selected_total}.")
+
+            b1, b2, b3 = st.columns([1, 1, 2])
+            with b1:
+                if st.button("Select all valid", use_container_width=True, key="cycling_bulk_select_valid"):
+                    for sample, entries in all_loaded_entries.items():
+                        for record, file_df, _raw_df, _error in entries:
+                            st.session_state[cycling_file_include_key(sample, str(record["relative_path"]))] = file_df is not None
+                        save_selection_for_sample(sample, capacity_file_records(sample, folder_map[sample], root_dir))
+                    rerun_streamlit_app()
+            with b2:
+                if st.button("Clear all", use_container_width=True, key="cycling_bulk_clear_all"):
+                    for sample in selected_samples:
+                        for record in capacity_file_records(sample, folder_map[sample], root_dir):
+                            st.session_state[cycling_file_include_key(sample, str(record["relative_path"]))] = False
+                        save_selection_for_sample(sample, capacity_file_records(sample, folder_map[sample], root_dir))
+                    rerun_streamlit_app()
+            with b3:
+                st.caption(f"Current selection across all samples: {selected_total} / {total_files} files included.")
+
+            summary_frames = []
+            for sample in selected_samples:
+                entries = all_loaded_entries[sample]
+                selected_count = sum(
+                    bool(st.session_state.get(cycling_file_include_key(sample, str(record["relative_path"])), False))
+                    for record, _file_df, _raw_df, _error in entries
+                )
+                with st.expander(f"{sample} ({selected_count}/{len(entries)} selected)", expanded=True):
+                    valid_entries = [entry for entry in entries if entry[1] is not None]
+                    invalid_entries = [entry for entry in entries if entry[1] is None]
+                    file_cols = st.columns(4)
+                    for i, (record, file_df, raw_df, row_error) in enumerate(valid_entries + invalid_entries):
+                        rel = str(record["relative_path"])
+                        key = cycling_file_include_key(sample, rel)
+                        with file_cols[i % 4]:
+                            render_file_preview_card(
+                                record=record,
+                                file_df=file_df,
+                                raw_df=raw_df,
+                                error=row_error,
+                                checkbox_key=key,
+                                color_hex=default_color_map[sample],
+                                preview_axis_mode=preview_axis_mode,
+                                cap_y_min=75,
+                                cap_y_max=110,
+                                ce_y_min=90,
+                                ce_y_max=100.5,
+                            )
+                    current_summary = load_capacity_current_sample_summary_from_entries(entries)
+                    if not current_summary.empty:
+                        summary_frames.append(current_summary)
+                        display_cols = ["Repeat", "ICE (%)", "Cycle Life", "ACE (%)", "ACE cycle", "Time", "Operator", "File name", "Note"]
+                        st.dataframe(
+                            format_selected_file_summary_for_display(current_summary[display_cols]),
+                            use_container_width=True,
+                            hide_index=True,
+                        )
+
+            if summary_frames:
+                all_summary = pd.concat(summary_frames, ignore_index=True)
+                st.download_button(
+                    "Download selected-file summary CSV",
+                    data=all_summary.to_csv(index=False).encode("utf-8"),
+                    file_name="capacity_selected_file_summary.csv",
+                    mime="text/csv",
+                    use_container_width=True,
+                )
+
+            st.button(
+                "Save all selections and continue to style preview",
+                type="primary",
+                use_container_width=True,
+                on_click=save_all_cycling_selections_and_go_style,
+                args=(selected_samples, folder_map, root_dir),
+            )
+            return
+
         inspect_sample = st.selectbox(
             "Sample to inspect",
             options=selected_samples,
@@ -2884,6 +3565,7 @@ def render_cycling_analysis_page() -> None:
                         efficiency_col=efficiency_col,
                         skip_initial_rows=int(skip_initial_rows),
                         min_retention=min_retention,
+                        persistent_cache_dir=cycling_persistent_cache_dir,
                     )
                     st.session_state[key] = file_df is not None
                 save_selection_for_sample(inspect_sample, file_records)
@@ -2896,9 +3578,6 @@ def render_cycling_analysis_page() -> None:
                 st.rerun()
         with control_col3:
             st.caption(saved_selection_summary(inspect_sample, file_records))
-
-        preview_axis_mode = "Fixed common range"
-        preview_min_retention = min_retention
 
         if use_retention_filter:
             st.caption(f"Current retention cutoff: {float(min_capacity_retention):g}%. The same cutoff is applied to file previews, final sample plots, and exported CSV files.")
@@ -2923,6 +3602,7 @@ def render_cycling_analysis_page() -> None:
                 efficiency_col=efficiency_col,
                 skip_initial_rows=int(skip_initial_rows),
                 min_retention=preview_min_retention,
+                persistent_cache_dir=cycling_persistent_cache_dir,
             )
             raw_df, raw_error = load_raw_capacity_metrics_df(
                 record=record,
@@ -2932,6 +3612,7 @@ def render_cycling_analysis_page() -> None:
                 capacity_col=capacity_col,
                 efficiency_col=efficiency_col,
                 skip_initial_rows=int(skip_initial_rows),
+                persistent_cache_dir=cycling_persistent_cache_dir,
             )
             combined_error = error or raw_error
             # Invalid/unusable files are always moved to the end and unchecked
@@ -3063,6 +3744,8 @@ def render_cycling_analysis_page() -> None:
     if workflow_view == "2. Style preview":
         st.markdown("### Style preview")
         st.caption("Tune figure style on the left. The preview on the right always uses real selected files after the retention cutoff.")
+        if st.session_state.get("cycling_style_defaults_signature") != cycling_style_defaults_signature(selected_samples):
+            apply_cycling_style_defaults_for_preview(selected_samples)
 
         unsaved_samples = [
             sample for sample in selected_samples
@@ -3078,26 +3761,31 @@ def render_cycling_analysis_page() -> None:
         style_controls_col, style_preview_col = st.columns([0.9, 1.55], gap="large")
 
         with style_controls_col:
+            compare_mode_enabled = is_cycling_compare_mode(st.session_state.get("cycling_plot_mode"))
             preview_sample = st.selectbox(
                 "Preview sample",
                 options=selected_samples,
                 key="cycling_preview_sample",
-                help="This preview always uses real selected files. Final output processes all selected samples.",
+                disabled=compare_mode_enabled,
+                help="Disabled in compare mode because the preview is the single combined comparison figure.",
             )
             repeat_options = available_repeats_for_selected_paths()
             if repeat_options and st.session_state.get("cycling_compare_repeat") not in repeat_options:
                 st.session_state["cycling_compare_repeat"] = repeat_options[0]
             st.selectbox(
                 "Plot mode",
-                ["Single sample repeat overlay", "Compare samples by one repeat"],
+                [CYCLING_PLOT_MODE_SINGLE, CYCLING_PLOT_MODE_COMPARE],
                 key="cycling_plot_mode",
-                help="Use the first mode for all repeats/files within one sample, or compare the same repeat across selected samples.",
+                on_change=reset_cycling_visual_style_defaults,
+                help="Changing mode resets visual style to the same default so only the plotted data grouping changes.",
             )
-            st.selectbox(
-                "Repeat to compare",
-                options=repeat_options or [""],
-                key="cycling_compare_repeat",
-                disabled=st.session_state.get("cycling_plot_mode") != "Compare samples by one repeat",
+            compare_mode_enabled = is_cycling_compare_mode(st.session_state.get("cycling_plot_mode"))
+            st.multiselect(
+                "Samples in comparison",
+                options=selected_samples,
+                key="cycling_compare_samples",
+                disabled=not compare_mode_enabled,
+                help="In comparison mode, preview and final output combine all selected files from these samples into one figure.",
             )
 
             control_tab_1, control_tab_2, control_tab_3, control_tab_4 = st.tabs(
@@ -3200,17 +3888,16 @@ def render_cycling_analysis_page() -> None:
             style = current_style_values()
             sample_colors = current_sample_colors(style)
             selected_preview_paths = selected_paths_for_output(preview_sample)
-            plot_mode = str(style.get("plot_mode", "Single sample repeat overlay"))
-            compare_repeat = str(style.get("compare_repeat", ""))
+            plot_mode = str(style.get("plot_mode", CYCLING_PLOT_MODE_SINGLE))
 
-            if plot_mode == "Compare samples by one repeat":
+            if is_cycling_compare_mode(plot_mode):
                 preview_frames = []
                 preview_file_count = 0
-                for sample in selected_samples:
+                for sample in cycling_comparison_samples_from_style(style):
                     selected_paths = selected_paths_for_output(sample)
                     if selected_paths is not None and len(selected_paths) == 0:
                         continue
-                    with st.spinner(f"Loading {compare_repeat} for {sample}..."):
+                    with st.spinner(f"Loading selected files for {sample}..."):
                         sample_df, sample_file_count = load_capacity_sample_plot_data(
                             sample_name=sample,
                             sample_dir=folder_map[sample],
@@ -3222,12 +3909,11 @@ def render_cycling_analysis_page() -> None:
                             min_retention=min_retention,
                             top_n_value=None,
                             selected_relative_paths=selected_paths,
+                            persistent_cache_dir=cycling_persistent_cache_dir,
                         )
                     preview_file_count += sample_file_count
-                    if sample_df is not None and "repeat" in sample_df.columns:
-                        filtered = sample_df[sample_df["repeat"].astype(str) == compare_repeat].copy()
-                        if not filtered.empty:
-                            preview_frames.append(filtered)
+                    if sample_df is not None and not sample_df.empty:
+                        preview_frames.append(sample_df)
                 preview_df = pd.concat(preview_frames, ignore_index=True) if preview_frames else None
             else:
                 if selected_preview_paths is not None and len(selected_preview_paths) == 0:
@@ -3245,6 +3931,7 @@ def render_cycling_analysis_page() -> None:
                             min_retention=min_retention,
                             top_n_value=top_n_value,
                             selected_relative_paths=selected_preview_paths,
+                            persistent_cache_dir=cycling_persistent_cache_dir,
                         )
 
             if preview_file_count == 0:
@@ -3252,10 +3939,10 @@ def render_cycling_analysis_page() -> None:
             elif preview_df is None:
                 st.warning("No valid cycling data found for this preview.")
             else:
-                if plot_mode == "Compare samples by one repeat":
+                if is_cycling_compare_mode(plot_mode):
                     preview_fig = make_capacity_sample_comparison_figure(
                         plot_df=preview_df,
-                        repeat_name=compare_repeat,
+                        repeat_name="Selected sample comparison",
                         sample_colors=sample_colors,
                         plot_title=str(style["plot_title"]),
                         x_label=str(style["x_label"]),
@@ -3325,6 +4012,10 @@ def render_cycling_analysis_page() -> None:
                 "output_dir": str(output_dir),
                 "selected_samples": selected_samples,
                 "selected_paths": selected_paths_by_sample,
+                "files": {
+                    sample: [file_record_signature(record) for record in capacity_file_records(sample, folder_map[sample], root_dir)]
+                    for sample in selected_samples
+                },
                 "sheet_name": sheet_name,
                 "capacity_col": capacity_col,
                 "efficiency_col": efficiency_col,
@@ -3333,6 +4024,7 @@ def render_cycling_analysis_page() -> None:
                 "top_n_value": top_n_value,
                 "style": style,
                 "sample_colors": sample_colors,
+                "implementation": "cycling_compare_all_bulk_v2",
             }
         ).encode("utf-8")
     ).hexdigest()
@@ -3380,29 +4072,28 @@ def render_cycling_analysis_page() -> None:
 
     progress = st.progress(0)
     status = st.empty()
-    plot_mode = str(style.get("plot_mode", "Single sample repeat overlay"))
-    compare_repeat = str(style.get("compare_repeat", ""))
+    plot_mode = str(style.get("plot_mode", CYCLING_PLOT_MODE_SINGLE))
 
     with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zipf:
-        if plot_mode == "Compare samples by one repeat":
+        if is_cycling_compare_mode(plot_mode):
             comparison_frames = []
             total_files_found = 0
-            for idx, sample_name in enumerate(selected_samples, start=1):
-                status.write(f"Processing {sample_name} ({idx}/{len(selected_samples)})...")
+            compare_samples = cycling_comparison_samples_from_style(style)
+            for idx, sample_name in enumerate(compare_samples, start=1):
+                status.write(f"Processing {sample_name} ({idx}/{len(compare_samples)})...")
                 selected_paths = selected_paths_by_sample[sample_name]
                 selected_paths_set = set(selected_paths) if selected_paths is not None else None
 
                 for record in capacity_file_records(sample_name, folder_map[sample_name], root_dir):
                     rel = str(record["relative_path"])
                     included = selected_paths_set is None or rel in selected_paths_set
-                    repeat_match = str(record.get("repeat", "")) == compare_repeat
                     selection_rows.append(
                         {
                             "sample": sample_name,
                             "repeat": record.get("repeat", ""),
                             "source_file": record["source_file"],
                             "relative_path": rel,
-                            "included": included and repeat_match,
+                            "included": included,
                         }
                     )
 
@@ -3417,6 +4108,7 @@ def render_cycling_analysis_page() -> None:
                     min_retention=min_retention,
                     top_n_value=None,
                     selected_relative_paths=selected_paths,
+                    persistent_cache_dir=cycling_persistent_cache_dir,
                 )
                 total_files_found += excel_file_count
 
@@ -3429,19 +4121,18 @@ def render_cycling_analysis_page() -> None:
                     efficiency_col=efficiency_col,
                     skip_initial_rows=int(skip_initial_rows),
                     selected_relative_paths=selected_paths,
+                    persistent_cache_dir=cycling_persistent_cache_dir,
                 )
                 if not sample_file_summary_df.empty:
                     selected_file_summary_frames.append(sample_file_summary_df)
 
-                if plot_df is not None and "repeat" in plot_df.columns:
-                    filtered = plot_df[plot_df["repeat"].astype(str) == compare_repeat].copy()
-                    if not filtered.empty:
-                        comparison_frames.append(filtered)
-                progress.progress(idx / len(selected_samples))
+                if plot_df is not None and not plot_df.empty:
+                    comparison_frames.append(plot_df)
+                progress.progress(idx / len(compare_samples))
 
             if comparison_frames:
                 plot_df = pd.concat(comparison_frames, ignore_index=True)
-                safe_name = safe_filename(f"repeat_{compare_repeat}_sample_comparison")
+                safe_name = safe_filename("selected_sample_comparison")
                 csv_path = output_dir / f"{safe_name}_plot_data.csv"
                 png_path = output_dir / f"{safe_name}_capacity_summary.png"
                 plot_df.to_csv(csv_path, index=False)
@@ -3449,7 +4140,7 @@ def render_cycling_analysis_page() -> None:
 
                 figure_kwargs = dict(
                     plot_df=plot_df,
-                    repeat_name=compare_repeat,
+                    repeat_name="Selected sample comparison",
                     sample_colors=sample_colors,
                     plot_title=str(style["plot_title"]),
                     x_label=str(style["x_label"]),
@@ -3488,7 +4179,7 @@ def render_cycling_analysis_page() -> None:
                 rendered_outputs.append(
                     {
                         "plot_kind": "sample_comparison",
-                        "repeat": f"Repeat comparison: {compare_repeat}",
+                        "repeat": "Selected sample comparison",
                         "csv_bytes": csv_bytes,
                         "png_bytes": png_bytes,
                         "csv_file_name": f"{safe_name}_plot_data.csv",
@@ -3505,7 +4196,7 @@ def render_cycling_analysis_page() -> None:
                 summary_rows.append(
                     {
                         "sample": "sample comparison",
-                        "repeat": compare_repeat,
+                        "repeat": "all selected",
                         "files_found": total_files_found,
                         "files_plotted": rendered_outputs[-1]["files_plotted"],
                         "points_plotted": len(plot_df),
@@ -3515,9 +4206,9 @@ def render_cycling_analysis_page() -> None:
                     }
                 )
             else:
-                st.warning(f"No selected cycling data found for repeat `{compare_repeat}`.")
+                st.warning("No selected cycling data found for the selected comparison samples.")
 
-        samples_to_process = [] if plot_mode == "Compare samples by one repeat" else selected_samples
+        samples_to_process = [] if is_cycling_compare_mode(plot_mode) else selected_samples
         for idx, sample_name in enumerate(samples_to_process, start=1):
             status.write(f"Processing {sample_name} ({idx}/{len(selected_samples)})...")
 
@@ -3547,6 +4238,7 @@ def render_cycling_analysis_page() -> None:
                 min_retention=min_retention,
                 top_n_value=top_n_value,
                 selected_relative_paths=selected_paths,
+                persistent_cache_dir=cycling_persistent_cache_dir,
             )
 
             if excel_file_count == 0:
@@ -3568,6 +4260,7 @@ def render_cycling_analysis_page() -> None:
                 efficiency_col=efficiency_col,
                 skip_initial_rows=int(skip_initial_rows),
                 selected_relative_paths=selected_paths,
+                persistent_cache_dir=cycling_persistent_cache_dir,
             )
             if not sample_file_summary_df.empty:
                 selected_file_summary_frames.append(sample_file_summary_df)
@@ -3768,6 +4461,16 @@ def save_stripping_selection_for_sample(sample_name: str, file_records: list[dic
     st.session_state["stripping_saved_selection"][sample_name] = saved
 
 
+def sync_stripping_checkbox_to_saved(sample_name: str, relative_path: str, checkbox_key: str) -> None:
+    """Persist one stripping checkbox immediately so page navigation does not lose it."""
+    ensure_stripping_selection_store()
+    all_saved = dict(st.session_state["stripping_saved_selection"])
+    saved = dict(all_saved.get(sample_name, {}))
+    saved[relative_path] = bool(st.session_state.get(checkbox_key, True))
+    all_saved[sample_name] = saved
+    st.session_state["stripping_saved_selection"] = all_saved
+
+
 def save_current_stripping_selection_and_advance(
     current_sample: str,
     selected_samples: list[str],
@@ -3784,6 +4487,7 @@ def save_current_stripping_selection_and_advance(
         st.session_state["stripping_inspect_sample"] = selected_samples[current_idx + 1]
         st.session_state["stripping_workflow_step"] = "1. Data preview & file selection"
     else:
+        apply_stripping_style_defaults_for_preview(selected_samples)
         st.session_state["stripping_workflow_step"] = "2. Style preview"
 
 
@@ -3828,6 +4532,23 @@ def reset_stripping_visual_style_defaults() -> None:
         st.session_state[key] = value
 
 
+def stripping_style_defaults_signature(selected_samples: list[str]) -> str:
+    return hashlib.sha1(
+        repr(
+            {
+                "selected_samples": list(selected_samples),
+                "normalization": st.session_state.get("stripping_normalization", "area"),
+                "defaults_version": "stripping_visual_defaults_v3",
+            }
+        ).encode("utf-8")
+    ).hexdigest()
+
+
+def apply_stripping_style_defaults_for_preview(selected_samples: list[str]) -> None:
+    reset_stripping_visual_style_defaults()
+    st.session_state["stripping_style_defaults_signature"] = stripping_style_defaults_signature(selected_samples)
+
+
 def save_all_stripping_selections_and_go_style(
     selected_samples: list[str],
     records_by_sample: dict[str, list[dict[str, object]]],
@@ -3837,6 +4558,7 @@ def save_all_stripping_selections_and_go_style(
     for sample in selected_samples:
         if sample in records_by_sample:
             save_stripping_selection_for_sample(sample, records_by_sample[sample])
+    apply_stripping_style_defaults_for_preview(selected_samples)
     st.session_state["stripping_workflow_step"] = "2. Style preview"
 
 
@@ -3857,8 +4579,7 @@ def stripping_summary_is_short(summary_row: dict[str, object]) -> bool:
     return "short" in str(summary_row.get("Status", "")).lower()
 
 
-@st.cache_data(show_spinner=False)
-def cached_read_stripping_file(
+def read_stripping_file_uncached(
     file_path_str: str,
     sample: str,
     repeat: str,
@@ -3868,10 +4589,7 @@ def cached_read_stripping_file(
     step_type: str,
     valley_window: int,
     short_capacity_threshold: float,
-    file_size: int,
-    file_mtime: float,
 ) -> tuple[pd.DataFrame | None, dict[str, object], str | None]:
-    _ = file_size, file_mtime
     file_info = stripping.FileInfo(path=Path(file_path_str), sample=sample, repeat=repeat)
     metadata = stripping.read_metadata(file_info.path, area=float(area), default_operator=operator)
     try:
@@ -3927,6 +4645,141 @@ def cached_read_stripping_file(
     }, None
 
 
+@st.cache_data(show_spinner=False)
+def cached_read_stripping_file(
+    file_path_str: str,
+    sample: str,
+    repeat: str,
+    area: float,
+    operator: str,
+    normalization: str,
+    step_type: str,
+    valley_window: int,
+    short_capacity_threshold: float,
+    file_size: int,
+    file_mtime: float,
+) -> tuple[pd.DataFrame | None, dict[str, object], str | None]:
+    _ = file_size, file_mtime
+    return read_stripping_file_uncached(
+        file_path_str=file_path_str,
+        sample=sample,
+        repeat=repeat,
+        area=area,
+        operator=operator,
+        normalization=normalization,
+        step_type=step_type,
+        valley_window=valley_window,
+        short_capacity_threshold=short_capacity_threshold,
+    )
+
+
+def normalize_stripping_cache_df(df: pd.DataFrame | None) -> pd.DataFrame | None:
+    if df is None:
+        return None
+    out = df.copy()
+    for col in ["Capacity (mAh)", "Voltage (V)", "Plot x", "Plot y"]:
+        if col in out.columns:
+            out[col] = pd.to_numeric(out[col], errors="coerce")
+    return out
+
+
+def stripping_cache_key(
+    record: dict[str, object],
+    area: float,
+    operator: str,
+    normalization: str,
+    step_type: str,
+    valley_window: int,
+    short_capacity_threshold: float,
+) -> str:
+    path = Path(record["path"])
+    stat = path.stat()
+    return persistent_cache_key(
+        {
+            "kind": "stripping_plot_v1",
+            "file_path": str(path),
+            "relative_path": str(record.get("relative_path", path.name)),
+            "sample": str(record["sample"]),
+            "repeat": str(record["repeat"]),
+            "area": float(area),
+            "operator": operator,
+            "normalization": normalization,
+            "step_type": step_type,
+            "valley_window": int(valley_window),
+            "short_capacity_threshold": float(short_capacity_threshold),
+            "file_size": int(stat.st_size),
+            "file_mtime": float(stat.st_mtime),
+        }
+    )
+
+
+def invalid_stripping_summary_row(
+    record: dict[str, object],
+    status: str,
+) -> dict[str, object]:
+    return {
+        "Sample": str(record.get("sample", "")),
+        "Repeat": str(record.get("repeat", "")),
+        "Nucleation (ohm)": "N/A",
+        "Plateau (mV)": "N/A",
+        "Overp. (mV)": "N/A",
+        "Cap. (mAh/cm2)": "N/A",
+        "Time": "",
+        "Operator": "",
+        "File name": str(record.get("source_file", "")),
+        "Source path": str(record.get("path", "")),
+        "Status": status,
+    }
+
+
+def load_persistent_stripping_file(
+    record: dict[str, object],
+    area: float,
+    operator: str,
+    normalization: str,
+    step_type: str,
+    valley_window: int,
+    short_capacity_threshold: float,
+    cache_dir: Path,
+) -> tuple[pd.DataFrame | None, dict[str, object], str | None]:
+    cache_key = stripping_cache_key(
+        record=record,
+        area=float(area),
+        operator=operator,
+        normalization=normalization,
+        step_type=step_type,
+        valley_window=int(valley_window),
+        short_capacity_threshold=float(short_capacity_threshold),
+    )
+    hit, cached_df, meta = read_persistent_dataframe_cache(cache_dir, cache_key)
+    if hit:
+        summary_row = meta.get("summary_row") if isinstance(meta, dict) else None
+        if not isinstance(summary_row, dict):
+            summary_row = invalid_stripping_summary_row(record, str(meta.get("error") or "cache error"))
+        return normalize_stripping_cache_df(cached_df), summary_row, meta.get("error") if isinstance(meta, dict) else None
+
+    plot_df, summary_row, error = read_stripping_file_uncached(
+        file_path_str=str(record["path"]),
+        sample=str(record["sample"]),
+        repeat=str(record["repeat"]),
+        area=float(area),
+        operator=operator,
+        normalization=normalization,
+        step_type=step_type,
+        valley_window=int(valley_window),
+        short_capacity_threshold=float(short_capacity_threshold),
+    )
+    plot_df = normalize_stripping_cache_df(plot_df)
+    write_persistent_dataframe_cache(
+        cache_dir,
+        cache_key,
+        plot_df,
+        error,
+        extra_meta={"summary_row": summary_row},
+    )
+    return plot_df, summary_row, error
+
+
 def load_cached_stripping_file(
     record: dict[str, object],
     area: float,
@@ -3935,7 +4788,20 @@ def load_cached_stripping_file(
     step_type: str,
     valley_window: int,
     short_capacity_threshold: float,
+    persistent_cache_dir: Path | None = None,
 ) -> tuple[pd.DataFrame | None, dict[str, object], str | None]:
+    if persistent_cache_dir is not None:
+        return load_persistent_stripping_file(
+            record=record,
+            area=float(area),
+            operator=operator,
+            normalization=normalization,
+            step_type=step_type,
+            valley_window=int(valley_window),
+            short_capacity_threshold=float(short_capacity_threshold),
+            cache_dir=persistent_cache_dir,
+        )
+
     path = Path(record["path"])
     stat = path.stat()
     return cached_read_stripping_file(
@@ -4023,6 +4889,7 @@ def make_stripping_figure(
     legend_label_max_len: int = 28,
     legend_columns: int = 3,
 ):
+    apply_common_plot_style()
     df = clean_stripping_plot_df(plot_df)
     fig, ax = plt.subplots(figsize=(fig_width, fig_height))
 
@@ -4089,6 +4956,7 @@ def make_stripping_figure(
 def make_single_stripping_preview_figure(plot_df: pd.DataFrame | None, color_hex: str, fig_width: float = 3.7, fig_height: float = 2.25):
     if plot_df is None or plot_df.empty:
         return make_empty_single_file_capacity_preview_figure("No valid preview", fig_width=fig_width, fig_height=fig_height)
+    apply_common_plot_style()
     df = clean_stripping_plot_df(plot_df)
     fig, ax = plt.subplots(figsize=(fig_width, fig_height))
     if not df.empty:
@@ -4135,6 +5003,7 @@ def render_stripping_file_preview_card(
             key=checkbox_key,
             help=rel,
         )
+        sync_stripping_checkbox_to_saved(str(record["sample"]), rel, checkbox_key)
 
         fig = make_single_stripping_preview_figure(
             plot_df=plot_df,
@@ -4162,23 +5031,100 @@ def render_stripping_analysis_page() -> None:
 
     with st.sidebar:
         st.header("Stripping input")
-        root_dir_str = st.text_input(
-            "Root data directory on this machine/server",
-            value="",
-            help="Folder containing one first-level folder per sample.",
-            key="stripping_root_dir",
+        stripping_input_mode = st.radio(
+            "Data access mode",
+            ["Local/server folder path", "Demo ZIP upload only"],
+            index=0,
+            key="stripping_input_mode",
+            help=(
+                "Use Local/server folder path for real datasets. "
+                "ZIP upload is only for small demo datasets."
+            ),
         )
-        if not root_dir_str.strip():
-            st.info("Enter a root data directory to start.")
-            return
-        root_dir = Path(root_dir_str).expanduser().resolve()
-        output_dir_str = st.text_input(
-            "Output directory",
-            value="",
-            help="Leave empty to save to <root_dir>/stripping_outputs.",
-            key="stripping_output_dir",
+        if stripping_input_mode == "Local/server folder path":
+            root_dir_str = st.text_input(
+                "Root data directory on this machine/server",
+                value="",
+                help="Folder containing one first-level folder per sample.",
+                key="stripping_root_dir",
+            )
+            root_dir = Path(root_dir_str).expanduser().resolve() if root_dir_str.strip() else None
+            output_dir_str = st.text_input(
+                "Output directory",
+                value="",
+                help="Leave empty to save to <root_dir>/stripping_outputs.",
+                key="stripping_output_dir",
+            )
+            if output_dir_str.strip():
+                output_dir = Path(output_dir_str).expanduser().resolve()
+            elif root_dir is not None:
+                output_dir = root_dir / "stripping_outputs"
+            else:
+                output_dir = None
+            input_message = "Enter a root data directory to start."
+        else:
+            st.warning("ZIP upload is for small demo data only. For larger datasets, use Local/server folder path.")
+            uploaded_zip = st.file_uploader(
+                "Upload a small demo ZIP containing sample folders",
+                type=["zip"],
+                accept_multiple_files=False,
+                key="stripping_uploaded_zip",
+            )
+            if uploaded_zip is None:
+                root_dir = None
+                output_dir = None
+                input_message = "Upload a small demo ZIP to start, or switch to Local/server folder path."
+            else:
+                try:
+                    root_dir = get_or_create_uploaded_stripping_zip_root(uploaded_zip)
+                    output_dir = root_dir / "stripping_outputs"
+                    input_message = f"Temporary extracted root: `{root_dir}`"
+                    st.caption(input_message)
+                except Exception as exc:
+                    st.error(f"Could not extract ZIP: {exc}")
+                    root_dir = None
+                    output_dir = None
+                    input_message = "ZIP extraction failed."
+
+        if root_dir is not None and output_dir is None:
+            output_dir = root_dir / "stripping_outputs"
+        if not bool(st.session_state.get("stripping_bulk_preview_default_migrated", False)):
+            st.session_state["stripping_bulk_preview"] = True
+            st.session_state["stripping_bulk_preview_default_migrated"] = True
+        bulk_preview = st.checkbox(
+            "Load all selected samples at once in data preview",
+            value=True,
+            key="stripping_bulk_preview",
+            help="Read all selected samples in one pass, then review and select files without stepping sample-by-sample.",
         )
-        output_dir = Path(output_dir_str).expanduser().resolve() if output_dir_str.strip() else root_dir / "stripping_outputs"
+        stripping_parallel_load = st.checkbox(
+            "Parallel file loading (experimental)",
+            value=False,
+            key="stripping_parallel_load",
+            disabled=not bulk_preview,
+            help=(
+                "Experimental. Reads multiple Excel files at the same time during load-all preview. "
+                "This can use much more CPU, memory, and disk/network bandwidth, and may be less stable with very large files, cloud drives, or openpyxl."
+            ),
+        )
+        stripping_parallel_workers = int(
+            st.number_input(
+                "Parallel workers",
+                min_value=1,
+                max_value=64,
+                value=12,
+                step=1,
+                key="stripping_parallel_workers",
+                disabled=not stripping_parallel_load,
+                help="Maximum Excel files to parse at the same time when parallel loading is enabled. Higher values can increase CPU, RAM, and disk/cloud-drive pressure.",
+            )
+        )
+        stripping_use_parsed_cache = st.checkbox(
+            "Cache parsed Excel data",
+            value=True,
+            key="stripping_use_parsed_excel_cache",
+            help="Store parsed per-file plot data as parquet when available, otherwise CSV. Preview, style preview, and final output reuse this cache until the Excel file or read settings change.",
+        )
 
         st.header("Data settings")
         area = st.number_input("Electrode area (cm2)", min_value=0.0001, value=1.27, step=0.01, key="stripping_area")
@@ -4193,12 +5139,16 @@ def render_stripping_analysis_page() -> None:
         step_type = st.text_input("Record Step Type for plotting", value="CC DChg", key="stripping_step_type")
         valley_window = st.number_input("Valley detection window", min_value=1, max_value=25, value=3, step=1, key="stripping_valley_window")
         short_capacity_threshold = st.number_input("Short capacity threshold", min_value=0.1, value=7.5, step=0.5, key="stripping_short_capacity_threshold")
-        bulk_preview = st.checkbox(
-            "Load all selected samples at once in data preview",
-            value=False,
-            key="stripping_bulk_preview",
-            help="Read all selected samples in one pass, then review and select files without stepping sample-by-sample.",
-        )
+
+    if root_dir is None or output_dir is None:
+        st.info(input_message)
+        return
+
+    stripping_persistent_cache_dir = (
+        parsed_excel_cache_dir(output_dir, "stripping")
+        if bool(stripping_use_parsed_cache)
+        else None
+    )
 
     if not root_dir.exists() or not root_dir.is_dir():
         st.error(f"Root path is not a directory on this runtime machine: `{root_dir}`")
@@ -4365,6 +5315,7 @@ def render_stripping_analysis_page() -> None:
                 step_type=step_type,
                 valley_window=int(valley_window),
                 short_capacity_threshold=float(short_capacity_threshold),
+                persistent_cache_dir=stripping_persistent_cache_dir,
             )
             summary_rows.append(summary_row)
             if plot_df is not None and not plot_df.empty:
@@ -4378,17 +5329,65 @@ def render_stripping_analysis_page() -> None:
             st.caption("All selected samples are loaded in one pass. Short files are unchecked by default on first load.")
             all_loaded_entries: dict[str, list[tuple[dict[str, object], pd.DataFrame | None, dict[str, object], str | None]]] = {}
             total_files = sum(len(records_by_sample[sample]) for sample in selected_samples)
-            completed = 0
-            progress = st.progress(0)
-            status = st.empty()
-            for sample in selected_samples:
-                sample_entries = []
-                saved_selection_exists = sample in st.session_state.get("stripping_saved_selection", {})
-                default_marker_key = f"stripping_valid_defaults_applied_{stable_key_part(sample)}"
-                defaults_already_applied = bool(st.session_state.get(default_marker_key, False))
-                for record in records_by_sample[sample]:
-                    completed += 1
-                    status.write(f"Reading {completed}/{total_files}: {sample} / {record['source_file']}")
+            all_jobs = [
+                (sample, record)
+                for sample in selected_samples
+                for record in records_by_sample[sample]
+            ]
+            bulk_signature = hashlib.sha1(
+                repr(
+                    {
+                        "root_dir": str(root_dir),
+                        "selected_samples": selected_samples,
+                        "files": {
+                            sample: [file_record_signature(record) for record in records_by_sample[sample]]
+                            for sample in selected_samples
+                        },
+                        "area": float(area),
+                        "operator": operator,
+                        "normalization": normalization,
+                        "step_type": step_type,
+                        "valley_window": int(valley_window),
+                        "short_capacity_threshold": float(short_capacity_threshold),
+                        "implementation": "stripping_bulk_preview_v1",
+                    }
+                ).encode("utf-8")
+            ).hexdigest()
+            cached_bulk = st.session_state.get("stripping_bulk_preview_cache")
+            cache_is_current = bool(cached_bulk and cached_bulk.get("signature") == bulk_signature)
+            reload_col, cache_col = st.columns([1, 3])
+            with reload_col:
+                if st.button("Reload preview data", key="stripping_reload_bulk_preview", use_container_width=True):
+                    st.session_state.pop("stripping_bulk_preview_cache", None)
+                    cached_bulk = None
+                    cache_is_current = False
+            with cache_col:
+                st.caption("Preview data is reused while files and data settings stay unchanged.")
+
+            sample_default_state = {
+                sample: (
+                    sample in st.session_state.get("stripping_saved_selection", {}),
+                    f"stripping_valid_defaults_applied_{stable_key_part(sample)}",
+                    bool(st.session_state.get(f"stripping_valid_defaults_applied_{stable_key_part(sample)}", False)),
+                )
+                for sample in selected_samples
+            }
+
+            def read_stripping_preview_job(job: tuple[str, dict[str, object]]):
+                sample, record = job
+                if stripping_parallel_load and stripping_persistent_cache_dir is None:
+                    plot_df, summary_row, error = read_stripping_file_uncached(
+                        file_path_str=str(record["path"]),
+                        sample=str(record["sample"]),
+                        repeat=str(record["repeat"]),
+                        area=float(area),
+                        operator=operator,
+                        normalization=normalization,
+                        step_type=step_type,
+                        valley_window=int(valley_window),
+                        short_capacity_threshold=float(short_capacity_threshold),
+                    )
+                else:
                     plot_df, summary_row, error = load_cached_stripping_file(
                         record,
                         float(area),
@@ -4397,19 +5396,61 @@ def render_stripping_analysis_page() -> None:
                         step_type,
                         int(valley_window),
                         float(short_capacity_threshold),
+                        persistent_cache_dir=stripping_persistent_cache_dir,
                     )
-                    key = stripping_file_include_key(sample, str(record["repeat"]), str(record["relative_path"]))
-                    if plot_df is None:
-                        st.session_state[key] = False
-                    elif not saved_selection_exists and not defaults_already_applied and stripping_summary_is_short(summary_row):
-                        st.session_state[key] = False
-                    sample_entries.append((record, plot_df, summary_row, error))
-                    progress.progress(completed / max(1, total_files))
-                if not saved_selection_exists and not defaults_already_applied:
-                    st.session_state[default_marker_key] = True
-                all_loaded_entries[sample] = sample_entries
-            status.empty()
-            progress.empty()
+                return sample, record, plot_df, summary_row, error
+
+            if cache_is_current:
+                all_loaded_entries = cached_bulk["all_loaded_entries"]
+            else:
+                completed = 0
+                progress = st.progress(0)
+                status = st.empty()
+                if stripping_parallel_load and all_jobs:
+                    max_workers = min(stripping_parallel_workers, len(all_jobs))
+                    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                        futures = [executor.submit(read_stripping_preview_job, job) for job in all_jobs]
+                        for future in as_completed(futures):
+                            sample, record, plot_df, summary_row, error = future.result()
+                            completed += 1
+                            status.write(f"Reading {completed}/{total_files}: {sample} / {record['source_file']}")
+                            saved_selection_exists, _default_marker_key, defaults_already_applied = sample_default_state[sample]
+                            key = stripping_file_include_key(sample, str(record["repeat"]), str(record["relative_path"]))
+                            if plot_df is None:
+                                st.session_state[key] = False
+                            elif not saved_selection_exists and not defaults_already_applied and stripping_summary_is_short(summary_row):
+                                st.session_state[key] = False
+                            all_loaded_entries.setdefault(sample, []).append((record, plot_df, summary_row, error))
+                            progress.progress(completed / max(1, total_files))
+                else:
+                    for job in all_jobs:
+                        sample, record, plot_df, summary_row, error = read_stripping_preview_job(job)
+                        completed += 1
+                        status.write(f"Reading {completed}/{total_files}: {sample} / {record['source_file']}")
+                        saved_selection_exists, _default_marker_key, defaults_already_applied = sample_default_state[sample]
+                        key = stripping_file_include_key(sample, str(record["repeat"]), str(record["relative_path"]))
+                        if plot_df is None:
+                            st.session_state[key] = False
+                        elif not saved_selection_exists and not defaults_already_applied and stripping_summary_is_short(summary_row):
+                            st.session_state[key] = False
+                        all_loaded_entries.setdefault(sample, []).append((record, plot_df, summary_row, error))
+                        progress.progress(completed / max(1, total_files))
+
+                for sample in selected_samples:
+                    saved_selection_exists, default_marker_key, defaults_already_applied = sample_default_state[sample]
+                    if not saved_selection_exists and not defaults_already_applied:
+                        st.session_state[default_marker_key] = True
+                    order = {str(record["relative_path"]): i for i, record in enumerate(records_by_sample[sample])}
+                    all_loaded_entries[sample] = sorted(
+                        all_loaded_entries.get(sample, []),
+                        key=lambda entry: order.get(str(entry[0]["relative_path"]), 10**9),
+                    )
+                st.session_state["stripping_bulk_preview_cache"] = {
+                    "signature": bulk_signature,
+                    "all_loaded_entries": all_loaded_entries,
+                }
+                status.empty()
+                progress.empty()
 
             total_valid = sum(1 for entries in all_loaded_entries.values() for entry in entries if entry[1] is not None)
             total_short = sum(1 for entries in all_loaded_entries.values() for entry in entries if entry[1] is not None and stripping_summary_is_short(entry[2]))
@@ -4443,7 +5484,7 @@ def render_stripping_analysis_page() -> None:
                     bool(st.session_state.get(stripping_file_include_key(sample, str(record["repeat"]), str(record["relative_path"])), False))
                     for record, _plot_df, _summary_row, _error in entries
                 )
-                with st.expander(f"{sample} ({selected_count}/{len(entries)} selected)", expanded=(sample == selected_samples[0])):
+                with st.expander(f"{sample} ({selected_count}/{len(entries)} selected)", expanded=True):
                     file_cols = st.columns(4)
                     valid_entries = [entry for entry in entries if entry[1] is not None]
                     invalid_entries = [entry for entry in entries if entry[1] is None]
@@ -4494,7 +5535,16 @@ def render_stripping_analysis_page() -> None:
         with c1:
             if st.button("Select all valid", use_container_width=True, key="stripping_select_all_valid"):
                 for record in file_records:
-                    plot_df, summary_row, _error = load_cached_stripping_file(record, float(area), operator, normalization, step_type, int(valley_window), float(short_capacity_threshold))
+                    plot_df, summary_row, _error = load_cached_stripping_file(
+                        record,
+                        float(area),
+                        operator,
+                        normalization,
+                        step_type,
+                        int(valley_window),
+                        float(short_capacity_threshold),
+                        persistent_cache_dir=stripping_persistent_cache_dir,
+                    )
                     st.session_state[stripping_file_include_key(inspect_sample, str(record["repeat"]), str(record["relative_path"]))] = (
                         plot_df is not None and not stripping_summary_is_short(summary_row)
                     )
@@ -4518,7 +5568,16 @@ def render_stripping_analysis_page() -> None:
         status = st.empty()
         for idx, record in enumerate(file_records, start=1):
             status.write(f"Reading {idx}/{len(file_records)}: {record['source_file']}")
-            plot_df, summary_row, error = load_cached_stripping_file(record, float(area), operator, normalization, step_type, int(valley_window), float(short_capacity_threshold))
+            plot_df, summary_row, error = load_cached_stripping_file(
+                record,
+                float(area),
+                operator,
+                normalization,
+                step_type,
+                int(valley_window),
+                float(short_capacity_threshold),
+                persistent_cache_dir=stripping_persistent_cache_dir,
+            )
             key = stripping_file_include_key(inspect_sample, str(record["repeat"]), str(record["relative_path"]))
             if plot_df is None:
                 st.session_state[key] = False
@@ -4584,6 +5643,8 @@ def render_stripping_analysis_page() -> None:
 
     if workflow_view == "2. Style preview":
         st.markdown("### Style preview")
+        if st.session_state.get("stripping_style_defaults_signature") != stripping_style_defaults_signature(selected_samples):
+            apply_stripping_style_defaults_for_preview(selected_samples)
         style_controls_col, style_preview_col = st.columns([0.9, 1.55], gap="large")
         with style_controls_col:
             compare_mode_enabled = is_stripping_compare_mode(st.session_state.get("stripping_plot_mode"))
@@ -4718,6 +5779,10 @@ def render_stripping_analysis_page() -> None:
                 "output_dir": str(output_dir),
                 "selected_samples": selected_samples,
                 "selected_paths": {s: selected_stripping_paths_for_sample(s, records_by_sample[s]) for s in selected_samples},
+                "files": {
+                    sample: [file_record_signature(record) for record in records_by_sample[sample]]
+                    for sample in selected_samples
+                },
                 "settings": [area, operator, normalization, step_type, valley_window, short_capacity_threshold],
                 "style": style,
                 "colors": sample_colors,
