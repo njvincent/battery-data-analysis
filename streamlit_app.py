@@ -16,15 +16,18 @@ Run locally:
 from __future__ import annotations
 
 import os
+import platform
 import re
+import shutil
 import io
 import json
 import html
 import importlib.util
+import subprocess
 import tempfile
 import zipfile
 import hashlib
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -32,6 +35,7 @@ import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 import streamlit as st
+import streamlit.components.v1 as components
 from matplotlib.ticker import AutoMinorLocator
 
 # Use the files that actually exist in your repo.
@@ -1453,6 +1457,84 @@ def apply_cycling_style_defaults_for_preview(selected_samples: list[str]) -> Non
     st.session_state["cycling_style_defaults_signature"] = cycling_style_defaults_signature(selected_samples)
 
 
+def applescript_string(value: str) -> str:
+    return '"' + str(value).replace("\\", "\\\\").replace('"', '\\"').replace("\n", " ") + '"'
+
+
+def send_system_notification(title: str, body: str) -> bool:
+    """Best-effort OS notification on the machine running Streamlit."""
+    system = platform.system()
+    try:
+        if system == "Darwin":
+            script = f"display notification {applescript_string(body)} with title {applescript_string(title)}"
+            subprocess.run(["osascript", "-e", script], check=False, timeout=5)
+            return True
+        if system == "Linux" and shutil.which("notify-send"):
+            subprocess.run(["notify-send", title, body], check=False, timeout=5)
+            return True
+    except Exception:
+        return False
+    return False
+
+
+def notify_load_all_complete(
+    notification_id: str,
+    title: str,
+    body: str,
+    enabled: bool = True,
+) -> None:
+    """Show a one-time Streamlit toast plus best-effort OS/browser notifications."""
+    if not enabled or st.session_state.get(notification_id):
+        return
+    st.session_state[notification_id] = True
+
+    if hasattr(st, "toast"):
+        st.toast(body, icon="✅")
+
+    send_system_notification(title, body)
+
+    title_json = json.dumps(title)
+    body_json = json.dumps(body)
+    notification_id_json = json.dumps(notification_id)
+    components.html(
+        f"""
+        <script>
+        (function() {{
+          const id = {notification_id_json};
+          const title = {title_json};
+          const body = {body_json};
+          const storageKey = "streamlit_load_notification_" + id;
+          if (window.sessionStorage && window.sessionStorage.getItem(storageKey)) {{
+            return;
+          }}
+          if (window.sessionStorage) {{
+            window.sessionStorage.setItem(storageKey, "1");
+          }}
+          if (!("Notification" in window)) {{
+            return;
+          }}
+          function showNotification() {{
+            try {{
+              new Notification(title, {{ body: body }});
+            }} catch (err) {{}}
+          }}
+          if (Notification.permission === "granted") {{
+            showNotification();
+          }} else if (Notification.permission !== "denied") {{
+            Notification.requestPermission().then(function(permission) {{
+              if (permission === "granted") {{
+                showNotification();
+              }}
+            }});
+          }}
+        }})();
+        </script>
+        """,
+        height=0,
+        width=0,
+    )
+
+
 def rerun_streamlit_app() -> None:
     """Rerun the app across Streamlit versions."""
     if hasattr(st, "rerun"):
@@ -1924,6 +2006,80 @@ def load_capacity_sample_plot_data(
         return None, excel_file_count
 
     return plot_df, excel_file_count
+
+
+def read_cycling_preview_job_worker(
+    args: tuple[
+        str,
+        dict[str, object],
+        Path,
+        str,
+        str,
+        str,
+        int,
+        float | None,
+        Path | None,
+    ],
+) -> tuple[str, dict[str, object], pd.DataFrame | None, pd.DataFrame | None, str | None]:
+    """Pickle-safe cycling preview worker for both threads and processes."""
+    (
+        sample,
+        record,
+        root_dir,
+        sheet_name,
+        capacity_col,
+        efficiency_col,
+        skip_initial_rows,
+        preview_min_retention,
+        persistent_cache_dir,
+    ) = args
+
+    if persistent_cache_dir is None:
+        file_df, error = read_one_capacity_file_silent(
+            file_path=Path(record["path"]),
+            sample_name=sample,
+            root_dir=root_dir,
+            sheet_name=sheet_name,
+            capacity_col=capacity_col,
+            efficiency_col=efficiency_col,
+            skip_initial_rows=int(skip_initial_rows),
+            min_capacity_retention=preview_min_retention,
+        )
+        raw_df, raw_error = read_one_capacity_file_silent(
+            file_path=Path(record["path"]),
+            sample_name=sample,
+            root_dir=root_dir,
+            sheet_name=sheet_name,
+            capacity_col=capacity_col,
+            efficiency_col=efficiency_col,
+            skip_initial_rows=int(skip_initial_rows),
+            min_capacity_retention=None,
+        )
+    else:
+        file_df, error = load_cached_capacity_file(
+            file_path=Path(record["path"]),
+            sample_name=sample,
+            root_dir=root_dir,
+            sheet_name=sheet_name,
+            capacity_col=capacity_col,
+            efficiency_col=efficiency_col,
+            skip_initial_rows=int(skip_initial_rows),
+            min_retention=preview_min_retention,
+            persistent_cache_dir=persistent_cache_dir,
+        )
+        raw_df, raw_error = load_raw_capacity_metrics_df(
+            record=record,
+            sample_name=sample,
+            root_dir=root_dir,
+            sheet_name=sheet_name,
+            capacity_col=capacity_col,
+            efficiency_col=efficiency_col,
+            skip_initial_rows=int(skip_initial_rows),
+            persistent_cache_dir=persistent_cache_dir,
+        )
+
+    return sample, record, file_df, raw_df, error or raw_error
+
 
 def capacity_auto_x_limit(max_cycle: float) -> int:
     """
@@ -2952,6 +3108,16 @@ def render_cycling_analysis_page() -> None:
                 "This can use much more CPU, memory, and disk/network bandwidth, and may be less stable with very large files, cloud drives, or openpyxl."
             ),
         )
+        cycling_parallel_backend = st.selectbox(
+            "Parallel backend",
+            ["Threads", "Processes"],
+            key="cycling_parallel_backend",
+            disabled=not cycling_parallel_load,
+            help=(
+                "Threads are lighter but Python Excel parsing may not fully use all CPU cores. "
+                "Processes use true multi-core parallelism, but use more memory and can stress disk/cloud storage."
+            ),
+        )
         cycling_parallel_workers = int(
             st.number_input(
                 "Parallel workers",
@@ -2969,6 +3135,13 @@ def render_cycling_analysis_page() -> None:
             value=True,
             key="cycling_use_parsed_excel_cache",
             help="Store parsed per-file data as parquet when available, otherwise CSV. Preview, style preview, and final output reuse this cache until the Excel file or read settings change.",
+        )
+        cycling_notify_load_complete = st.checkbox(
+            "Notify when load-all preview finishes",
+            value=True,
+            key="cycling_notify_load_complete",
+            disabled=not cycling_bulk_preview,
+            help="Shows a Streamlit toast and attempts a browser notification after the load-all data preview finishes. Browser notifications may require permission.",
         )
 
         st.header("Data settings")
@@ -3341,12 +3514,14 @@ def render_cycling_analysis_page() -> None:
             ).hexdigest()
             cached_bulk = st.session_state.get("cycling_bulk_preview_cache")
             cache_is_current = bool(cached_bulk and cached_bulk.get("signature") == bulk_signature)
+            loaded_from_cache = cache_is_current
             reload_col, cache_col = st.columns([1, 3])
             with reload_col:
                 if st.button("Reload preview data", key="cycling_reload_bulk_preview", use_container_width=True):
                     st.session_state.pop("cycling_bulk_preview_cache", None)
                     cached_bulk = None
                     cache_is_current = False
+                    loaded_from_cache = False
             with cache_col:
                 st.caption("Preview data is reused while files and data settings stay unchanged.")
 
@@ -3359,52 +3534,19 @@ def render_cycling_analysis_page() -> None:
                 for sample in selected_samples
             }
 
-            def read_cycling_preview_job(job: tuple[str, dict[str, object]]):
+            def cycling_worker_args(job: tuple[str, dict[str, object]]):
                 sample, record = job
-                if cycling_parallel_load and cycling_persistent_cache_dir is None:
-                    file_df, error = read_one_capacity_file_silent(
-                        file_path=record["path"],
-                        sample_name=sample,
-                        root_dir=root_dir,
-                        sheet_name=sheet_name,
-                        capacity_col=capacity_col,
-                        efficiency_col=efficiency_col,
-                        skip_initial_rows=int(skip_initial_rows),
-                        min_capacity_retention=preview_min_retention,
-                    )
-                    raw_df, raw_error = read_one_capacity_file_silent(
-                        file_path=record["path"],
-                        sample_name=sample,
-                        root_dir=root_dir,
-                        sheet_name=sheet_name,
-                        capacity_col=capacity_col,
-                        efficiency_col=efficiency_col,
-                        skip_initial_rows=int(skip_initial_rows),
-                        min_capacity_retention=None,
-                    )
-                else:
-                    file_df, error = load_cached_capacity_file(
-                        file_path=record["path"],
-                        sample_name=sample,
-                        root_dir=root_dir,
-                        sheet_name=sheet_name,
-                        capacity_col=capacity_col,
-                        efficiency_col=efficiency_col,
-                        skip_initial_rows=int(skip_initial_rows),
-                        min_retention=preview_min_retention,
-                        persistent_cache_dir=cycling_persistent_cache_dir,
-                    )
-                    raw_df, raw_error = load_raw_capacity_metrics_df(
-                        record=record,
-                        sample_name=sample,
-                        root_dir=root_dir,
-                        sheet_name=sheet_name,
-                        capacity_col=capacity_col,
-                        efficiency_col=efficiency_col,
-                        skip_initial_rows=int(skip_initial_rows),
-                        persistent_cache_dir=cycling_persistent_cache_dir,
-                    )
-                return sample, record, file_df, raw_df, error or raw_error
+                return (
+                    sample,
+                    record,
+                    root_dir,
+                    sheet_name,
+                    capacity_col,
+                    efficiency_col,
+                    int(skip_initial_rows),
+                    preview_min_retention,
+                    cycling_persistent_cache_dir,
+                )
 
             if cache_is_current:
                 all_loaded_entries = cached_bulk["all_loaded_entries"]
@@ -3414,8 +3556,14 @@ def render_cycling_analysis_page() -> None:
                 preview_status = st.empty()
                 if cycling_parallel_load and all_jobs:
                     max_workers = min(cycling_parallel_workers, len(all_jobs))
-                    with ThreadPoolExecutor(max_workers=max_workers) as executor:
-                        futures = [executor.submit(read_cycling_preview_job, job) for job in all_jobs]
+                    executor_cls = ProcessPoolExecutor if cycling_parallel_backend == "Processes" else ThreadPoolExecutor
+
+                    def consume_cycling_executor(executor) -> None:
+                        nonlocal completed
+                        futures = [
+                            executor.submit(read_cycling_preview_job_worker, cycling_worker_args(job))
+                            for job in all_jobs
+                        ]
                         for future in as_completed(futures):
                             sample, record, file_df, raw_df, combined_error = future.result()
                             completed += 1
@@ -3428,9 +3576,21 @@ def render_cycling_analysis_page() -> None:
                                 st.session_state[key] = True
                             all_loaded_entries.setdefault(sample, []).append((record, file_df, raw_df, combined_error))
                             preview_progress.progress(completed / max(1, total_files))
+
+                    try:
+                        with executor_cls(max_workers=max_workers) as executor:
+                            consume_cycling_executor(executor)
+                    except Exception as exc:
+                        if cycling_parallel_backend != "Processes":
+                            raise
+                        st.warning(f"Process backend could not start or complete: {exc}. Falling back to Threads.")
+                        completed = 0
+                        all_loaded_entries = {}
+                        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                            consume_cycling_executor(executor)
                 else:
                     for job in all_jobs:
-                        sample, record, file_df, raw_df, combined_error = read_cycling_preview_job(job)
+                        sample, record, file_df, raw_df, combined_error = read_cycling_preview_job_worker(cycling_worker_args(job))
                         completed += 1
                         preview_status.write(f"Reading {completed}/{total_files}: {sample} / {record['source_file']}")
                         saved_selection_exists, _default_marker_key, defaults_already_applied = sample_default_state[sample]
@@ -3462,6 +3622,13 @@ def render_cycling_analysis_page() -> None:
             total_invalid = total_files - total_valid
             selected_total = sum(len(selected_relative_paths_for_sample_saved_first(sample, folder_map[sample], root_dir, True)) for sample in selected_samples)
             st.success(f"Loaded {total_files} files across {len(selected_samples)} samples. Valid: {total_valid}; unavailable: {total_invalid}; selected: {selected_total}.")
+            if not loaded_from_cache:
+                notify_load_all_complete(
+                    notification_id=f"cycling_load_all_complete_{bulk_signature}",
+                    title="Cycling data preview loaded",
+                    body=f"Loaded {total_files} cycling files across {len(selected_samples)} samples. Valid: {total_valid}; unavailable: {total_invalid}.",
+                    enabled=bool(cycling_notify_load_complete),
+                )
 
             b1, b2, b3 = st.columns([1, 1, 2])
             with b1:
@@ -4819,6 +4986,58 @@ def load_cached_stripping_file(
     )
 
 
+def read_stripping_preview_job_worker(
+    args: tuple[
+        str,
+        dict[str, object],
+        float,
+        str,
+        str,
+        str,
+        int,
+        float,
+        Path | None,
+    ],
+) -> tuple[str, dict[str, object], pd.DataFrame | None, dict[str, object], str | None]:
+    """Pickle-safe stripping preview worker for both threads and processes."""
+    (
+        sample,
+        record,
+        area,
+        operator,
+        normalization,
+        step_type,
+        valley_window,
+        short_capacity_threshold,
+        persistent_cache_dir,
+    ) = args
+
+    if persistent_cache_dir is None:
+        plot_df, summary_row, error = read_stripping_file_uncached(
+            file_path_str=str(record["path"]),
+            sample=str(record["sample"]),
+            repeat=str(record["repeat"]),
+            area=float(area),
+            operator=operator,
+            normalization=normalization,
+            step_type=step_type,
+            valley_window=int(valley_window),
+            short_capacity_threshold=float(short_capacity_threshold),
+        )
+    else:
+        plot_df, summary_row, error = load_cached_stripping_file(
+            record,
+            float(area),
+            operator,
+            normalization,
+            step_type,
+            int(valley_window),
+            float(short_capacity_threshold),
+            persistent_cache_dir=persistent_cache_dir,
+        )
+    return sample, record, plot_df, summary_row, error
+
+
 def stripping_x_axis_label(normalization: str) -> str:
     if normalization == "area":
         return "Capacity (mAh/cm$^2$)"
@@ -5107,6 +5326,16 @@ def render_stripping_analysis_page() -> None:
                 "This can use much more CPU, memory, and disk/network bandwidth, and may be less stable with very large files, cloud drives, or openpyxl."
             ),
         )
+        stripping_parallel_backend = st.selectbox(
+            "Parallel backend",
+            ["Threads", "Processes"],
+            key="stripping_parallel_backend",
+            disabled=not stripping_parallel_load,
+            help=(
+                "Threads are lighter but Python Excel parsing may not fully use all CPU cores. "
+                "Processes use true multi-core parallelism, but use more memory and can stress disk/cloud storage."
+            ),
+        )
         stripping_parallel_workers = int(
             st.number_input(
                 "Parallel workers",
@@ -5124,6 +5353,13 @@ def render_stripping_analysis_page() -> None:
             value=True,
             key="stripping_use_parsed_excel_cache",
             help="Store parsed per-file plot data as parquet when available, otherwise CSV. Preview, style preview, and final output reuse this cache until the Excel file or read settings change.",
+        )
+        stripping_notify_load_complete = st.checkbox(
+            "Notify when load-all preview finishes",
+            value=True,
+            key="stripping_notify_load_complete",
+            disabled=not bulk_preview,
+            help="Shows a Streamlit toast and attempts a browser notification after the load-all data preview finishes. Browser notifications may require permission.",
         )
 
         st.header("Data settings")
@@ -5355,12 +5591,14 @@ def render_stripping_analysis_page() -> None:
             ).hexdigest()
             cached_bulk = st.session_state.get("stripping_bulk_preview_cache")
             cache_is_current = bool(cached_bulk and cached_bulk.get("signature") == bulk_signature)
+            loaded_from_cache = cache_is_current
             reload_col, cache_col = st.columns([1, 3])
             with reload_col:
                 if st.button("Reload preview data", key="stripping_reload_bulk_preview", use_container_width=True):
                     st.session_state.pop("stripping_bulk_preview_cache", None)
                     cached_bulk = None
                     cache_is_current = False
+                    loaded_from_cache = False
             with cache_col:
                 st.caption("Preview data is reused while files and data settings stay unchanged.")
 
@@ -5373,32 +5611,19 @@ def render_stripping_analysis_page() -> None:
                 for sample in selected_samples
             }
 
-            def read_stripping_preview_job(job: tuple[str, dict[str, object]]):
+            def stripping_worker_args(job: tuple[str, dict[str, object]]):
                 sample, record = job
-                if stripping_parallel_load and stripping_persistent_cache_dir is None:
-                    plot_df, summary_row, error = read_stripping_file_uncached(
-                        file_path_str=str(record["path"]),
-                        sample=str(record["sample"]),
-                        repeat=str(record["repeat"]),
-                        area=float(area),
-                        operator=operator,
-                        normalization=normalization,
-                        step_type=step_type,
-                        valley_window=int(valley_window),
-                        short_capacity_threshold=float(short_capacity_threshold),
-                    )
-                else:
-                    plot_df, summary_row, error = load_cached_stripping_file(
-                        record,
-                        float(area),
-                        operator,
-                        normalization,
-                        step_type,
-                        int(valley_window),
-                        float(short_capacity_threshold),
-                        persistent_cache_dir=stripping_persistent_cache_dir,
-                    )
-                return sample, record, plot_df, summary_row, error
+                return (
+                    sample,
+                    record,
+                    float(area),
+                    operator,
+                    normalization,
+                    step_type,
+                    int(valley_window),
+                    float(short_capacity_threshold),
+                    stripping_persistent_cache_dir,
+                )
 
             if cache_is_current:
                 all_loaded_entries = cached_bulk["all_loaded_entries"]
@@ -5408,8 +5633,14 @@ def render_stripping_analysis_page() -> None:
                 status = st.empty()
                 if stripping_parallel_load and all_jobs:
                     max_workers = min(stripping_parallel_workers, len(all_jobs))
-                    with ThreadPoolExecutor(max_workers=max_workers) as executor:
-                        futures = [executor.submit(read_stripping_preview_job, job) for job in all_jobs]
+                    executor_cls = ProcessPoolExecutor if stripping_parallel_backend == "Processes" else ThreadPoolExecutor
+
+                    def consume_stripping_executor(executor) -> None:
+                        nonlocal completed
+                        futures = [
+                            executor.submit(read_stripping_preview_job_worker, stripping_worker_args(job))
+                            for job in all_jobs
+                        ]
                         for future in as_completed(futures):
                             sample, record, plot_df, summary_row, error = future.result()
                             completed += 1
@@ -5422,9 +5653,21 @@ def render_stripping_analysis_page() -> None:
                                 st.session_state[key] = False
                             all_loaded_entries.setdefault(sample, []).append((record, plot_df, summary_row, error))
                             progress.progress(completed / max(1, total_files))
+
+                    try:
+                        with executor_cls(max_workers=max_workers) as executor:
+                            consume_stripping_executor(executor)
+                    except Exception as exc:
+                        if stripping_parallel_backend != "Processes":
+                            raise
+                        st.warning(f"Process backend could not start or complete: {exc}. Falling back to Threads.")
+                        completed = 0
+                        all_loaded_entries = {}
+                        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                            consume_stripping_executor(executor)
                 else:
                     for job in all_jobs:
-                        sample, record, plot_df, summary_row, error = read_stripping_preview_job(job)
+                        sample, record, plot_df, summary_row, error = read_stripping_preview_job_worker(stripping_worker_args(job))
                         completed += 1
                         status.write(f"Reading {completed}/{total_files}: {sample} / {record['source_file']}")
                         saved_selection_exists, _default_marker_key, defaults_already_applied = sample_default_state[sample]
@@ -5456,6 +5699,13 @@ def render_stripping_analysis_page() -> None:
             total_short = sum(1 for entries in all_loaded_entries.values() for entry in entries if entry[1] is not None and stripping_summary_is_short(entry[2]))
             total_invalid = total_files - total_valid
             st.success(f"Loaded {total_files} files across {len(selected_samples)} samples. Valid: {total_valid}; short/default unchecked: {total_short}; unavailable: {total_invalid}.")
+            if not loaded_from_cache:
+                notify_load_all_complete(
+                    notification_id=f"stripping_load_all_complete_{bulk_signature}",
+                    title="Stripping data preview loaded",
+                    body=f"Loaded {total_files} stripping files across {len(selected_samples)} samples. Valid: {total_valid}; unavailable: {total_invalid}.",
+                    enabled=bool(stripping_notify_load_complete),
+                )
 
             b1, b2, b3 = st.columns([1, 1, 2])
             with b1:
