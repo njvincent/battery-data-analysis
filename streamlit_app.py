@@ -53,6 +53,8 @@ from eis_fit import (
 import stripping_batch as stripping
 import dqdv_batch as dqdv
 
+EIS_INPUT_SUFFIXES = {".mpr", ".csv", ".txt"}
+
 
 # -----------------------------------------------------------------------------
 # Data containers and wrappers around eis_fit.py
@@ -94,6 +96,17 @@ def read_uploaded_eis(uploaded_file) -> pd.DataFrame:
             pass
 
 
+def read_eis_path(path: str | Path) -> pd.DataFrame:
+    """Read a local/server EIS file with the same parser used for uploads."""
+    path = Path(path)
+    suffix = path.suffix.lower()
+    if suffix == ".mpr":
+        return read_biologic_mpr_eis(path)
+    if suffix in {".csv", ".txt"}:
+        return read_csv_eis(path)
+    raise ValueError(f"Unsupported EIS file type: {path.suffix}")
+
+
 def read_zfit_xml_uploaded(xml_file) -> dict[str, float]:
     if xml_file is None:
         return {}
@@ -105,6 +118,37 @@ def read_zfit_xml_uploaded(xml_file) -> dict[str, float]:
             tmp_path.unlink(missing_ok=True)
         except Exception:
             pass
+
+
+def split_file_patterns(pattern_text: str) -> list[str]:
+    patterns = [
+        part.strip()
+        for part in re.split(r"[,;\n]+", str(pattern_text or ""))
+        if part.strip()
+    ]
+    return patterns or ["*.mpr", "*.csv", "*.txt"]
+
+
+def find_local_eis_files(root: Path, pattern_text: str, recursive: bool) -> list[Path]:
+    root = root.expanduser().resolve()
+    if root.is_file():
+        if root.suffix.lower() not in EIS_INPUT_SUFFIXES:
+            raise ValueError(f"Unsupported EIS file type: {root.suffix}")
+        return [root]
+    if not root.exists():
+        raise FileNotFoundError(f"Local data path does not exist: {root}")
+    if not root.is_dir():
+        raise NotADirectoryError(f"Local data path is not a directory: {root}")
+
+    globber = root.rglob if recursive else root.glob
+    files: list[Path] = []
+    for pattern in split_file_patterns(pattern_text):
+        files.extend(
+            path
+            for path in globber(pattern)
+            if path.is_file() and path.suffix.lower() in EIS_INPUT_SUFFIXES
+        )
+    return sorted(set(files))
 
 
 def make_fit_bundle(name: str, df: pd.DataFrame, p0: np.ndarray, weight: str) -> FitResultBundle:
@@ -421,7 +465,7 @@ def make_zip_download(bundles: list[FitResultBundle]) -> bytes:
 
 
 def sidebar_fit_options(key_prefix: str):
-    st.sidebar.header("Fit options")
+    st.sidebar.header("Fit settings")
     weight = st.sidebar.selectbox(
         "Primary weighting",
         ["unit", "sqrt_modulus", "modulus"],
@@ -446,7 +490,7 @@ def sidebar_fit_options(key_prefix: str):
         format="%.6g",
         key=f"{key_prefix}_low_cutoff",
     )
-    with st.sidebar.expander("Tick customization", expanded=False):
+    with st.sidebar.expander("Plot ticks", expanded=False):
         st.caption("Set a value above 0 to force fixed tick spacing. Leave 0 for Matplotlib auto ticks.")
         c1, c2 = st.columns(2)
         with c1:
@@ -465,9 +509,15 @@ def sidebar_fit_options(key_prefix: str):
     return weight, compare_weights, show_low_freq_labels, float(low_freq_cutoff), plot_options
 
 
-def sidebar_initial_params(xml_file, key_prefix: str) -> np.ndarray:
+def sidebar_initial_params(xml_file=None, key_prefix: str = "fit", xml_path: Path | None = None) -> np.ndarray:
     xml_params = {}
-    if xml_file is not None:
+    if xml_path is not None:
+        try:
+            xml_params = read_zfit_xml(xml_path)
+            st.sidebar.success(f"Loaded {len(xml_params)} XML initial parameters.")
+        except Exception as exc:
+            st.sidebar.warning(f"Could not read XML: {exc}")
+    elif xml_file is not None:
         try:
             xml_params = read_zfit_xml_uploaded(xml_file)
             st.sidebar.success(f"Loaded {len(xml_params)} XML initial parameters.")
@@ -502,131 +552,91 @@ def weights_to_run(primary_weight: str, compare_weights: bool) -> list[str]:
 
 def render_eis_fit_page() -> None:
     st.title("EIS Fit")
-    st.caption("Single-file EIS fitting using the model in `eis_fit.py`: R1 + Q2/R2 + Q3/R3 + Q4/(R4 + W4).")
+    st.caption("Batch EIS fitting with local/server paths or browser uploads.")
 
     with st.sidebar:
         st.header("Input")
-        data_file = st.file_uploader(
-            "EIS data file (.mpr, .csv, .txt)",
-            type=["mpr", "csv", "txt"],
-            accept_multiple_files=False,
-            key="single_data_file",
+        input_mode = st.radio(
+            "Data access",
+            ["Local/server folder path", "Upload files"],
+            index=0,
+            key="eis_input_mode",
+            help="Use local/server paths when files are already mounted on the Streamlit machine.",
         )
-        xml_file = st.file_uploader(
-            "Optional EC-Lab ZFit XML for initial values",
-            type=["xml"],
-            accept_multiple_files=False,
-            key="single_xml_file",
-        )
-        weight, compare_weights, show_low_freq_labels, low_freq_cutoff, plot_options = sidebar_fit_options("single")
-        p0 = sidebar_initial_params(xml_file, "single")
 
-    if data_file is None:
-        st.info("Upload one `.mpr`, `.csv`, or `.txt` EIS file to start.")
-        st.markdown(
-            """
-            **Current model**
+        local_root: Path | None = None
+        local_files: list[Path] = []
+        uploaded_files = []
+        xml_file = None
+        xml_path: Path | None = None
+        input_message = ""
 
-            `R1 + Q2/R2 + Q3/R3 + Q4/(R4 + W4)`
+        if input_mode == "Local/server folder path":
+            root_str = st.text_input(
+                "Local data root directory",
+                value="",
+                key="eis_local_root",
+                help="Folder or single file visible to the machine/server running Streamlit.",
+            )
+            pattern_text = st.text_input(
+                "Filename pattern",
+                value="*.mpr, *.csv, *.txt",
+                key="eis_local_pattern",
+            )
+            recursive = st.checkbox("Search subfolders", value=True, key="eis_local_recursive")
+            xml_path_str = st.text_input(
+                "Initial parameter XML",
+                value="",
+                key="eis_local_xml_path",
+                help="Optional EC-Lab ZFit XML path on this machine/server.",
+            )
+            xml_path = Path(xml_path_str).expanduser().resolve() if xml_path_str.strip() else None
+            if root_str.strip():
+                local_root = Path(root_str).expanduser().resolve()
+                try:
+                    local_files = find_local_eis_files(local_root, pattern_text, recursive)
+                    input_message = f"Found {len(local_files)} EIS file(s)."
+                except Exception as exc:
+                    st.error(str(exc))
+                    input_message = "Fix the local data path to start."
+            else:
+                input_message = "Enter a local data root directory to start."
+        else:
+            uploaded_files = st.file_uploader(
+                "EIS files (.mpr, .csv, .txt)",
+                type=["mpr", "csv", "txt"],
+                accept_multiple_files=True,
+                key="eis_upload_files",
+            ) or []
+            xml_file = st.file_uploader(
+                "Initial parameter XML",
+                type=["xml"],
+                accept_multiple_files=False,
+                key="eis_upload_xml_file",
+            )
+            input_message = "Upload one or more EIS files to start."
 
-            The third arc should be treated as an effective low-frequency descriptor when the Warburg term is weak or poorly constrained.
-            """
-        )
-        return
+        weight, compare_weights, show_low_freq_labels, low_freq_cutoff, plot_options = sidebar_fit_options("eis")
+        p0 = sidebar_initial_params(xml_file=xml_file, key_prefix="eis", xml_path=xml_path)
 
-    try:
-        df = read_uploaded_eis(data_file).sort_values("freq_hz", ascending=False).reset_index(drop=True)
-    except Exception as exc:
-        st.error(f"Could not read `{data_file.name}`: {exc}")
-        return
-
-    weights = weights_to_run(weight, compare_weights)
-    bundles: list[FitResultBundle] = []
-    with st.spinner(f"Fitting {data_file.name}..."):
-        for w in weights:
+    input_records: list[dict[str, object]] = []
+    if input_mode == "Local/server folder path":
+        base_root = local_root if local_root is not None and local_root.is_dir() else None
+        for path in local_files:
             try:
-                bundles.append(make_fit_bundle(data_file.name, df, p0, w))
-            except Exception as exc:
-                st.error(f"Fit failed with weight={w}: {exc}")
+                name = str(path.relative_to(base_root)) if base_root is not None else path.name
+            except ValueError:
+                name = path.name
+            input_records.append({"name": name, "source": path, "kind": "local"})
+    else:
+        input_records = [
+            {"name": uploaded.name, "source": uploaded, "kind": "upload"}
+            for uploaded in uploaded_files
+        ]
 
-    if not bundles:
-        return
-
-    primary = next((b for b in bundles if b.weight == weight), bundles[0])
-    display_metric_strip(primary, df, low_freq_cutoff)
-
-    tab_plot, tab_params, tab_metrics, tab_data = st.tabs(["Preview", "Fit parameters", "Arc/fusion metrics", "Data & downloads"])
-
-    with tab_plot:
-        label_overrides = collect_legend_label_overrides("single")
-        highlighted_layer = st.session_state.get("single_highlight_layer_raw")
-        plot_options["legend_label_overrides"] = label_overrides
-        plot_options["highlight_label_raw"] = highlighted_layer
-        c1, c2 = st.columns([1.25, 1.0])
-        with c1:
-            st.pyplot(make_nyquist_figure(df, bundles, show_low_freq_labels, plot_options=plot_options), clear_figure=True)
-        with c2:
-            st.pyplot(make_low_freq_figure(df, bundles, low_freq_cutoff, plot_options=plot_options), clear_figure=True)
-        label_overrides, _highlighted_layer = render_legend_layer_editor("single", eis_legend_layers(bundles))
-
-    with tab_params:
-        selected_weight = st.selectbox("Select weighting", [b.weight for b in bundles], index=[b.weight for b in bundles].index(primary.weight))
-        b = next(x for x in bundles if x.weight == selected_weight)
-        st.dataframe(b.params_df, use_container_width=True)
-
-    with tab_metrics:
-        selected_weight = st.selectbox("Select weighting for metrics", [b.weight for b in bundles], index=[b.weight for b in bundles].index(primary.weight))
-        b = next(x for x in bundles if x.weight == selected_weight)
-        c1, c2 = st.columns(2)
-        with c1:
-            st.caption("Arc geometry descriptors")
-            st.dataframe(b.arc_df, use_container_width=True)
-        with c2:
-            st.caption("Fusion descriptors")
-            st.dataframe(b.fusion_df, use_container_width=True)
-
-    with tab_data:
-        st.dataframe(primary.curve_df, use_container_width=True)
-        c1, c2 = st.columns(2)
-        with c1:
-            st.download_button(
-                "Download primary fit curve CSV",
-                data=primary.curve_df.to_csv(index=False),
-                file_name=f"{Path(data_file.name).stem}_{primary.weight}_fit_curve.csv",
-                mime="text/csv",
-            )
-        with c2:
-            st.download_button(
-                "Download all outputs ZIP",
-                data=make_zip_download(bundles),
-                file_name=f"{Path(data_file.name).stem}_eis_fit_outputs.zip",
-                mime="application/zip",
-            )
-
-
-def render_eis_fit_batch_page() -> None:
-    st.title("EIS Fit Batch")
-    st.caption("Upload multiple EIS files. The page fits each file and shows a compact summary first, then lets you preview one selected file.")
-
-    with st.sidebar:
-        st.header("Input")
-        data_files = st.file_uploader(
-            "EIS data files (.mpr, .csv, .txt)",
-            type=["mpr", "csv", "txt"],
-            accept_multiple_files=True,
-            key="batch_data_files",
-        )
-        xml_file = st.file_uploader(
-            "Optional EC-Lab ZFit XML for initial values",
-            type=["xml"],
-            accept_multiple_files=False,
-            key="batch_xml_file",
-        )
-        weight, compare_weights, show_low_freq_labels, low_freq_cutoff, plot_options = sidebar_fit_options("batch")
-        p0 = sidebar_initial_params(xml_file, "batch")
-
-    if not data_files:
-        st.info("Upload multiple `.mpr`, `.csv`, or `.txt` files to run batch fitting.")
+    if not input_records:
+        st.info(input_message)
+        st.markdown("Open **Usage** for folder structure and upload guidance.")
         return
 
     weights = weights_to_run(weight, compare_weights)
@@ -638,22 +648,26 @@ def render_eis_fit_batch_page() -> None:
     progress = st.progress(0)
     status = st.empty()
 
-    for i, uploaded in enumerate(data_files, start=1):
-        status.write(f"Fitting {uploaded.name} ({i}/{len(data_files)})...")
+    for i, record in enumerate(input_records, start=1):
+        file_name = str(record["name"])
+        status.write(f"Fitting {file_name} ({i}/{len(input_records)})...")
         try:
-            df = read_uploaded_eis(uploaded).sort_values("freq_hz", ascending=False).reset_index(drop=True)
-            data_by_name[uploaded.name] = df
+            if record["kind"] == "local":
+                df = read_eis_path(Path(record["source"])).sort_values("freq_hz", ascending=False).reset_index(drop=True)
+            else:
+                df = read_uploaded_eis(record["source"]).sort_values("freq_hz", ascending=False).reset_index(drop=True)
+            data_by_name[file_name] = df
             file_bundles: list[FitResultBundle] = []
             for w in weights:
-                b = make_fit_bundle(uploaded.name, df, p0, w)
+                b = make_fit_bundle(file_name, df, p0, w)
                 file_bundles.append(b)
                 all_bundles.append(b)
-                summary_rows.append(summary_row(uploaded.name, df, b, low_freq_cutoff))
-            bundles_by_name[uploaded.name] = file_bundles
+                summary_rows.append(summary_row(file_name, df, b, low_freq_cutoff))
+            bundles_by_name[file_name] = file_bundles
         except Exception as exc:
             summary_rows.append(
                 {
-                    "file": uploaded.name,
+                    "file": file_name,
                     "weight": ",".join(weights),
                     "success": False,
                     "points": np.nan,
@@ -673,21 +687,21 @@ def render_eis_fit_batch_page() -> None:
                     "note": f"read/fit failed: {exc}",
                 }
             )
-        progress.progress(i / len(data_files))
+        progress.progress(i / len(input_records))
 
     status.empty()
     progress.empty()
 
     summary_df = pd.DataFrame(summary_rows)
-    st.subheader("Batch summary")
+    st.subheader("Fit summary")
     st.dataframe(format_summary_table(summary_df), use_container_width=True)
 
     c1, c2 = st.columns(2)
     with c1:
         st.download_button(
-            "Download batch summary CSV",
+            "Download fit summary CSV",
             data=summary_df.to_csv(index=False),
-            file_name="eis_batch_summary.csv",
+            file_name="eis_fit_summary.csv",
             mime="text/csv",
         )
     with c2:
@@ -695,7 +709,7 @@ def render_eis_fit_batch_page() -> None:
             st.download_button(
                 "Download all fit outputs ZIP",
                 data=make_zip_download(all_bundles),
-                file_name="eis_batch_fit_outputs.zip",
+                file_name="eis_fit_outputs.zip",
                 mime="application/zip",
             )
 
@@ -712,8 +726,8 @@ def render_eis_fit_batch_page() -> None:
 
     tab_plot, tab_params, tab_metrics, tab_data = st.tabs(["Preview", "Fit parameters", "Arc/fusion metrics", "Data"])
     with tab_plot:
-        label_overrides = collect_legend_label_overrides("batch")
-        highlighted_layer = st.session_state.get("batch_highlight_layer_raw")
+        label_overrides = collect_legend_label_overrides("eis")
+        highlighted_layer = st.session_state.get("eis_highlight_layer_raw")
         plot_options["legend_label_overrides"] = label_overrides
         plot_options["highlight_label_raw"] = highlighted_layer
         c1, c2 = st.columns([1.25, 1.0])
@@ -721,15 +735,15 @@ def render_eis_fit_batch_page() -> None:
             st.pyplot(make_nyquist_figure(df, file_bundles, show_low_freq_labels, plot_options=plot_options), clear_figure=True)
         with c2:
             st.pyplot(make_low_freq_figure(df, file_bundles, low_freq_cutoff, plot_options=plot_options), clear_figure=True)
-        label_overrides, _highlighted_layer = render_legend_layer_editor("batch", eis_legend_layers(file_bundles))
+        label_overrides, _highlighted_layer = render_legend_layer_editor("eis", eis_legend_layers(file_bundles))
 
     with tab_params:
-        selected_weight = st.selectbox("Select weighting", [b.weight for b in file_bundles], key="batch_preview_params_weight")
+        selected_weight = st.selectbox("Select weighting", [b.weight for b in file_bundles], key="eis_preview_params_weight")
         b = next(x for x in file_bundles if x.weight == selected_weight)
         st.dataframe(b.params_df, use_container_width=True)
 
     with tab_metrics:
-        selected_weight = st.selectbox("Select weighting for metrics", [b.weight for b in file_bundles], key="batch_preview_metrics_weight")
+        selected_weight = st.selectbox("Select weighting for metrics", [b.weight for b in file_bundles], key="eis_preview_metrics_weight")
         b = next(x for x in file_bundles if x.weight == selected_weight)
         c1, c2 = st.columns(2)
         with c1:
@@ -2835,18 +2849,20 @@ def render_legend_layer_editor(
                 if kind == "line"
                 else f"<span style='display:inline-block;width:16px;height:16px;border-radius:50%;background:{html.escape(color)};border:2px solid white;box-shadow:0 0 0 1px rgba(0,0,0,.25);vertical-align:middle;'></span>"
             )
-            current_custom = str(st.session_state.get(input_key, "") or "").strip()
-            row_label = raw if not current_custom else f"{raw} -> {current_custom}"
-            c0, c1, c2 = st.columns([0.14, 0.88, 0.95])
+            c0, c1, c2, c3 = st.columns([0.10, 1.15, 1.0, 0.32])
             with c0:
                 st.markdown(swatch_html, unsafe_allow_html=True)
             with c1:
-                st.button(
-                    shorten_label(row_label, 58),
-                    key=f"{prefix}_layer_row_{stable_key_part(raw)}",
-                    on_click=set_highlight_layer,
-                    args=(prefix, raw),
-                    use_container_width=True,
+                st.markdown(
+                    (
+                        "<div title='{title}' style='white-space:nowrap;overflow:hidden;"
+                        "text-overflow:ellipsis;font-size:0.92rem;line-height:2.35rem;'>"
+                        "{label}</div>"
+                    ).format(
+                        title=html.escape(raw, quote=True),
+                        label=html.escape(raw),
+                    ),
+                    unsafe_allow_html=True,
                 )
             with c2:
                 st.text_input(
@@ -2856,6 +2872,14 @@ def render_legend_layer_editor(
                     label_visibility="collapsed",
                     on_change=sync_legend_label_input,
                     args=(prefix, raw, input_key),
+                )
+            with c3:
+                st.button(
+                    "Select",
+                    key=f"{prefix}_layer_row_{stable_key_part(raw)}",
+                    on_click=set_highlight_layer,
+                    args=(prefix, raw),
+                    use_container_width=True,
                 )
     highlighted = str(selected) if selected in raw_labels else None
     return collect_legend_label_overrides(prefix), highlighted
@@ -3825,30 +3849,17 @@ def get_or_create_uploaded_stripping_zip_root(uploaded_zip) -> Path:
 
 
 def resolve_cycling_input_root_from_sidebar() -> tuple[Path | None, Path | None, str]:
-    """
-    Resolve the cycling root directory and output directory.
-
-    For very large datasets, use Local/server folder path. The Streamlit process
-    must run on the same machine/server where the data directory exists, or on a
-    server where the data is mounted as a filesystem path.
-    """
-    st.header("Cycling input")
+    """Resolve the cycling root directory and output directory."""
+    st.header("Input")
 
     input_mode = st.radio(
-        "Data access mode",
-        ["Local/server folder path", "Demo ZIP upload only"],
+        "Data access",
+        ["Local/server folder path", "Demo ZIP upload"],
         index=0,
-        help=(
-            "Use Local/server folder path for real 20–50 GB datasets. "
-            "ZIP upload is only for small demo datasets and is not suitable for large private data."
-        ),
+        help="Use local paths for real datasets; upload is for small demos.",
     )
 
     if input_mode == "Local/server folder path":
-        st.info(
-            "For large datasets, do not upload files through the browser. Run Streamlit on the machine/server that can already access the data, then point this field to that folder."
-        )
-
         configured_base = os.environ.get("BATTERY_DATA_ROOT", "").strip()
         use_configured_base = False
 
@@ -3872,12 +3883,9 @@ def resolve_cycling_input_root_from_sidebar() -> tuple[Path | None, Path | None,
             root_dir = (base_path / relative_data_dir).expanduser().resolve()
         else:
             root_dir_str = st.text_input(
-                "Root data directory on this machine/server",
+                "Local data root directory",
                 value="",
-                help=(
-                    "Folder containing sample subfolders. This path must exist on the machine/server running Streamlit, "
-                    "not necessarily on the browser user's computer."
-                ),
+                help="Folder containing sample subfolders on the Streamlit machine/server.",
             )
             if not root_dir_str.strip():
                 return None, None, "Enter a root data directory to start."
@@ -3891,14 +3899,12 @@ def resolve_cycling_input_root_from_sidebar() -> tuple[Path | None, Path | None,
         output_dir = Path(output_dir_str).expanduser().resolve() if output_dir_str.strip() else root_dir / "capacity_batch_results"
         return root_dir, output_dir, input_mode
 
-    st.warning(
-        "ZIP upload is for small demo data only. For 20–50 GB raw datasets, use Local/server folder path on a machine/server where the data is already mounted."
-    )
+    st.warning("Demo ZIP upload only. Use local paths for large datasets.")
     uploaded_zip = st.file_uploader(
         "Upload a small demo ZIP containing sample folders",
         type=["zip"],
         accept_multiple_files=False,
-        help="Do not use this for 20–50 GB datasets.",
+        help="Small demo data only.",
     )
     if uploaded_zip is None:
         return None, None, "Upload a small demo ZIP to start, or switch to Local/server folder path for real data."
@@ -3916,42 +3922,26 @@ def resolve_cycling_input_root_from_sidebar() -> tuple[Path | None, Path | None,
 def render_cycling_analysis_page() -> None:
     st.title("Cycling Analysis")
     st.caption("Batch capacity retention and coulombic efficiency plotting.")
-
-    st.markdown(
-        """
-        This tool treats each direct subfolder under the root directory as one sample.
-
-        Expected structure:
-
-        ```text
-        root_directory/
-            sample_1/
-                file_1.xlsx
-                file_2.xlsx
-            sample_2/
-                file_3.xlsx
-        ```
-        """
-    )
+    st.caption("Folder structure and upload guidance are in Usage.")
 
     with st.sidebar:
         root_dir, output_dir, input_mode = resolve_cycling_input_root_from_sidebar()
+        st.header("Loading")
         if not bool(st.session_state.get("cycling_bulk_preview_default_migrated", False)):
             st.session_state["cycling_bulk_preview"] = True
             st.session_state["cycling_bulk_preview_default_migrated"] = True
         cycling_bulk_preview = st.checkbox(
-            "Load all selected samples at once in data preview",
-            value=True,
+            "Load all at once",
             key="cycling_bulk_preview",
             help="Read all selected samples in one pass, then review and select files without stepping sample-by-sample.",
         )
         cycling_parallel_load = st.checkbox(
-            "Parallel file loading (experimental)",
+            "Parallel file loading",
             value=False,
             key="cycling_parallel_load",
             disabled=not cycling_bulk_preview,
             help=(
-                "Experimental. Reads multiple Excel files at the same time during load-all preview. "
+                "Reads multiple Excel files at the same time during load-all preview. "
                 "This can use much more CPU, memory, and disk/network bandwidth, and may be less stable with very large files, cloud drives, or openpyxl."
             ),
         )
@@ -3977,18 +3967,18 @@ def render_cycling_analysis_page() -> None:
                 help="Maximum Excel files to parse at the same time when parallel loading is enabled. Higher values can increase CPU, RAM, and disk/cloud-drive pressure.",
             )
         )
-        cycling_use_parsed_cache = st.checkbox(
-            "Cache parsed Excel data",
-            value=True,
-            key="cycling_use_parsed_excel_cache",
-            help="Store parsed per-file data as parquet when available, otherwise CSV. Preview, style preview, and final output reuse this cache until the Excel file or read settings change.",
-        )
         cycling_notify_load_complete = st.checkbox(
-            "Notify when load-all preview finishes",
+            "Notify when finish",
             value=True,
             key="cycling_notify_load_complete",
             disabled=not cycling_bulk_preview,
             help="Shows a Streamlit toast and attempts a browser notification after the load-all data preview finishes. Browser notifications may require permission.",
+        )
+        cycling_use_parsed_cache = st.checkbox(
+            "Cache parsed data",
+            value=True,
+            key="cycling_use_parsed_excel_cache",
+            help="Store parsed per-file data as parquet when available, otherwise CSV. Preview, style preview, and final output reuse this cache until the Excel file or read settings change.",
         )
 
         st.header("Data settings")
@@ -4039,9 +4029,7 @@ def render_cycling_analysis_page() -> None:
 
     if not root_dir.exists():
         st.error(
-            f"Root directory does not exist on the Streamlit runtime machine/server: `{root_dir}`\n\n"
-            "If you are using a deployed web app, a path like `/Users/...` refers to the remote server, not your Mac. "
-            "For 20–50 GB datasets, run this app locally or on a server where the data folder is mounted."
+            f"Local data root directory does not exist on the Streamlit machine/server: `{root_dir}`"
         )
         return
 
@@ -6186,20 +6174,17 @@ def render_stripping_analysis_page() -> None:
     st.caption("Batch summary and voltage-capacity plotting for stripping-cell data.")
 
     with st.sidebar:
-        st.header("Stripping input")
+        st.header("Input")
         stripping_input_mode = st.radio(
-            "Data access mode",
-            ["Local/server folder path", "Demo ZIP upload only"],
+            "Data access",
+            ["Local/server folder path", "Demo ZIP upload"],
             index=0,
             key="stripping_input_mode",
-            help=(
-                "Use Local/server folder path for real datasets. "
-                "ZIP upload is only for small demo datasets."
-            ),
+            help="Use local paths for real datasets; upload is for small demos.",
         )
         if stripping_input_mode == "Local/server folder path":
             root_dir_str = st.text_input(
-                "Root data directory on this machine/server",
+                "Local data root directory",
                 value="",
                 help="Folder containing one first-level folder per sample.",
                 key="stripping_root_dir",
@@ -6219,7 +6204,7 @@ def render_stripping_analysis_page() -> None:
                 output_dir = None
             input_message = "Enter a root data directory to start."
         else:
-            st.warning("ZIP upload is for small demo data only. For larger datasets, use Local/server folder path.")
+            st.warning("Demo ZIP upload only. Use local paths for large datasets.")
             uploaded_zip = st.file_uploader(
                 "Upload a small demo ZIP containing sample folders",
                 type=["zip"],
@@ -6244,22 +6229,22 @@ def render_stripping_analysis_page() -> None:
 
         if root_dir is not None and output_dir is None:
             output_dir = root_dir / "stripping_outputs"
+        st.header("Loading")
         if not bool(st.session_state.get("stripping_bulk_preview_default_migrated", False)):
             st.session_state["stripping_bulk_preview"] = True
             st.session_state["stripping_bulk_preview_default_migrated"] = True
         bulk_preview = st.checkbox(
-            "Load all selected samples at once in data preview",
-            value=True,
+            "Load all at once",
             key="stripping_bulk_preview",
             help="Read all selected samples in one pass, then review and select files without stepping sample-by-sample.",
         )
         stripping_parallel_load = st.checkbox(
-            "Parallel file loading (experimental)",
+            "Parallel file loading",
             value=False,
             key="stripping_parallel_load",
             disabled=not bulk_preview,
             help=(
-                "Experimental. Reads multiple Excel files at the same time during load-all preview. "
+                "Reads multiple Excel files at the same time during load-all preview. "
                 "This can use much more CPU, memory, and disk/network bandwidth, and may be less stable with very large files, cloud drives, or openpyxl."
             ),
         )
@@ -6285,18 +6270,18 @@ def render_stripping_analysis_page() -> None:
                 help="Maximum Excel files to parse at the same time when parallel loading is enabled. Higher values can increase CPU, RAM, and disk/cloud-drive pressure.",
             )
         )
-        stripping_use_parsed_cache = st.checkbox(
-            "Cache parsed Excel data",
-            value=True,
-            key="stripping_use_parsed_excel_cache",
-            help="Store parsed per-file plot data as parquet when available, otherwise CSV. Preview, style preview, and final output reuse this cache until the Excel file or read settings change.",
-        )
         stripping_notify_load_complete = st.checkbox(
-            "Notify when load-all preview finishes",
+            "Notify when finish",
             value=True,
             key="stripping_notify_load_complete",
             disabled=not bulk_preview,
             help="Shows a Streamlit toast and attempts a browser notification after the load-all data preview finishes. Browser notifications may require permission.",
+        )
+        stripping_use_parsed_cache = st.checkbox(
+            "Cache parsed data",
+            value=True,
+            key="stripping_use_parsed_excel_cache",
+            help="Store parsed per-file plot data as parquet when available, otherwise CSV. Preview, style preview, and final output reuse this cache until the Excel file or read settings change.",
         )
 
         st.header("Data settings")
@@ -7827,18 +7812,28 @@ def render_dqdv_analysis_page() -> None:
     st.caption("Batch cycle selection and per-repeat V-Q profile plotting using `dqdv_batch.py`.")
 
     with st.sidebar:
-        st.header("dQ/dV input")
+        st.header("Input")
         input_mode = st.radio(
-            "Data access mode",
-            ["Local/server folder path", "Demo ZIP upload only"],
+            "Data access",
+            ["Local/server folder path", "Demo ZIP upload"],
             index=0,
             key="dqdv_input_mode",
-            help="Use Local/server folder path for real datasets. ZIP upload is only for small demo datasets.",
+            help="Use local paths for real datasets; upload is for small demos.",
         )
         if input_mode == "Local/server folder path":
-            root_dir_str = st.text_input("Root data directory on this machine/server", value="", help="Folder containing one first-level folder per sample.", key="dqdv_root_dir")
+            root_dir_str = st.text_input(
+                "Local data root directory",
+                value="",
+                help="Folder containing one first-level folder per sample.",
+                key="dqdv_root_dir",
+            )
             root_dir = Path(root_dir_str).expanduser().resolve() if root_dir_str.strip() else None
-            output_dir_str = st.text_input("Output directory", value="", help="Leave empty to save to <root_dir>/dqdv_analysis_outputs.", key="dqdv_output_dir")
+            output_dir_str = st.text_input(
+                "Output directory",
+                value="",
+                help="Leave empty to save to <root_dir>/dqdv_analysis_outputs.",
+                key="dqdv_output_dir",
+            )
             if output_dir_str.strip():
                 output_dir = Path(output_dir_str).expanduser().resolve()
             elif root_dir is not None:
@@ -7847,8 +7842,13 @@ def render_dqdv_analysis_page() -> None:
                 output_dir = None
             input_message = "Enter a root data directory to start."
         else:
-            st.warning("ZIP upload is for small demo data only. For larger datasets, use Local/server folder path.")
-            uploaded_zip = st.file_uploader("Upload a small demo ZIP containing sample folders", type=["zip"], accept_multiple_files=False, key="dqdv_uploaded_zip")
+            st.warning("Demo ZIP upload only. Use local paths for large datasets.")
+            uploaded_zip = st.file_uploader(
+                "Upload a small demo ZIP containing sample folders",
+                type=["zip"],
+                accept_multiple_files=False,
+                key="dqdv_uploaded_zip",
+            )
             if uploaded_zip is None:
                 root_dir = None
                 output_dir = None
@@ -7868,20 +7868,46 @@ def render_dqdv_analysis_page() -> None:
         if root_dir is not None and output_dir is None:
             output_dir = root_dir / "dqdv_analysis_outputs"
 
-        bulk_preview = st.checkbox("Load all selected samples at once in data preview", value=True, key="dqdv_bulk_preview")
+        st.header("Loading")
+        st.session_state.setdefault("dqdv_bulk_preview", True)
+        bulk_preview = st.checkbox("Load all at once", key="dqdv_bulk_preview")
         parallel_load = st.checkbox(
-            "Parallel file loading (experimental)",
+            "Parallel file loading",
             value=False,
             key="dqdv_parallel_load",
             disabled=not bulk_preview,
             help="Reads multiple Excel files at the same time during load-all preview.",
         )
-        parallel_backend = st.selectbox("Parallel backend", ["Threads", "Processes"], key="dqdv_parallel_backend", disabled=not parallel_load)
-        parallel_workers = int(st.number_input("Parallel workers", min_value=1, max_value=64, value=12, step=1, key="dqdv_parallel_workers", disabled=not parallel_load))
-        use_parsed_cache = st.checkbox("Cache parsed Excel data", value=True, key="dqdv_use_parsed_excel_cache")
-        notify_load_complete = st.checkbox("Notify when load-all preview finishes", value=True, key="dqdv_notify_load_complete", disabled=not bulk_preview)
+        parallel_backend = st.selectbox(
+            "Parallel backend",
+            ["Threads", "Processes"],
+            key="dqdv_parallel_backend",
+            disabled=not parallel_load,
+        )
+        parallel_workers = int(
+            st.number_input(
+                "Parallel workers",
+                min_value=1,
+                max_value=64,
+                value=12,
+                step=1,
+                key="dqdv_parallel_workers",
+                disabled=not parallel_load,
+            )
+        )
+        notify_load_complete = st.checkbox(
+            "Notify when finish",
+            value=True,
+            key="dqdv_notify_load_complete",
+            disabled=not bulk_preview,
+        )
+        use_parsed_cache = st.checkbox(
+            "Cache parsed data",
+            value=True,
+            key="dqdv_use_parsed_excel_cache",
+        )
 
-        st.header("Cycle extraction")
+        st.header("Data settings")
         cycle_start = int(st.number_input("Initial cycle index", min_value=0, value=3, step=1, key="dqdv_cycle_start", help="Also used as the initial discharge capacity reference."))
         st.selectbox("Cycles to plot", ["Interval", "Custom list"], key="dqdv_cycle_mode")
         if st.session_state.get("dqdv_cycle_mode", "Interval") == "Interval":
@@ -8567,31 +8593,119 @@ def render_placeholder_page(title: str) -> None:
     st.info("This module can be added later without changing the EIS fitting logic.")
 
 
+def render_usage_page() -> None:
+    st.title("Usage")
+    st.caption("Data access, folder structure, and practical limits.")
+
+    st.subheader("Data access")
+    st.markdown(
+        """
+        Use **Local/server folder path** for real datasets. The path must exist on
+        the machine or server running Streamlit. For large datasets, run
+        Streamlit where the data is already mounted, then point the local data
+        root directory field to that folder.
+
+        Browser upload is intended for small demo files only. Avoid uploading
+        20-50 GB raw datasets through the browser.
+        """
+    )
+
+    st.subheader("EIS Fit")
+    st.markdown(
+        """
+        EIS Fit accepts `.mpr`, `.csv`, and `.txt` files. Local mode can use a
+        folder, a single file, filename patterns such as `*.mpr`, or recursive
+        subfolder search. Upload mode is best for a few small files.
+
+        Optional EC-Lab ZFit XML files can provide initial parameter values.
+        """
+    )
+
+    st.subheader("Cycling, stripping, and dQ/dV")
+    st.markdown(
+        """
+        These batch pages treat each first-level folder under the root directory
+        as one sample:
+
+        ```text
+        root_directory/
+            sample_1/
+                file_1.xlsx
+                file_2.xlsx
+            sample_2/
+                repeat_a/
+                    file_3.xlsx
+        ```
+
+        Use ZIP upload only for tiny demo data with the same folder structure.
+        """
+    )
+
+    st.subheader("Loading options")
+    st.markdown(
+        """
+        **Load all at once** reads every selected sample during preview. This is
+        convenient for medium datasets but can use more memory.
+
+        **Parallel file loading** reads multiple Excel files at the same time.
+        Start with a modest worker count on cloud drives or shared servers.
+
+        **Notify when finish** shows a toast and attempts a browser or OS
+        notification after load-all preview completes.
+        """
+    )
+
+
 def main() -> None:
     st.set_page_config(page_title="Battery Data Analysis", page_icon="🔋", layout="wide")
 
+    tool_options = [
+        "EIS Fit",
+        "Cycling Analysis",
+        "Stripping Overpotential",
+        "dQ/dV Analysis",
+    ]
+    if "active_page" not in st.session_state:
+        st.session_state["active_page"] = tool_options[0]
+
+    def set_active_analysis_tool() -> None:
+        st.session_state["active_page"] = st.session_state["analysis_tool"]
+
     st.sidebar.title("🔋 Battery Data Analysis")
+    selected_index = (
+        tool_options.index(st.session_state["active_page"])
+        if st.session_state.get("active_page") in tool_options
+        else tool_options.index(st.session_state.get("analysis_tool", tool_options[0]))
+        if st.session_state.get("analysis_tool") in tool_options
+        else 0
+    )
     tool = st.sidebar.selectbox(
         "Choose analysis tool",
-        [
-            "EIS Fit",
-            "EIS Fit Batch",
-            "Cycling Analysis",
-            "Stripping Overpotential",
-            "dQ/dV Analysis",
-        ],
+        tool_options,
+        index=selected_index,
+        key="analysis_tool",
+        on_change=set_active_analysis_tool,
     )
+    st.sidebar.divider()
+    usage_button_label = "Back to analysis" if st.session_state.get("active_page") == "Usage" else "Usage"
+    if st.sidebar.button(usage_button_label, key="usage_page_button", use_container_width=True):
+        if st.session_state.get("active_page") == "Usage":
+            st.session_state["active_page"] = st.session_state.get("analysis_tool", tool_options[0])
+        else:
+            st.session_state["active_page"] = "Usage"
 
-    if tool == "EIS Fit":
+    page = st.session_state.get("active_page", tool)
+
+    if page == "EIS Fit":
         render_eis_fit_page()
-    elif tool == "EIS Fit Batch":
-        render_eis_fit_batch_page()
-    elif tool == "Cycling Analysis":
+    elif page == "Cycling Analysis":
         render_cycling_analysis_page()
-    elif tool == "Stripping Overpotential":
+    elif page == "Stripping Overpotential":
         render_stripping_analysis_page()
-    elif tool == "dQ/dV Analysis":
+    elif page == "dQ/dV Analysis":
         render_dqdv_analysis_page()
+    elif page == "Usage":
+        render_usage_page()
 
 
 if __name__ == "__main__":
