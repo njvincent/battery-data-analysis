@@ -36,7 +36,7 @@ import pandas as pd
 import matplotlib.pyplot as plt
 import streamlit as st
 import streamlit.components.v1 as components
-from matplotlib.ticker import AutoMinorLocator
+from matplotlib.ticker import AutoMinorLocator, MultipleLocator
 
 # Use the files that actually exist in your repo.
 from eis_fit import (
@@ -269,11 +269,59 @@ def format_summary_table(df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
-def make_nyquist_figure(df: pd.DataFrame, bundles: list[FitResultBundle], show_low_freq_labels: bool = False):
+def tab10_hex(index: int) -> str:
+    rgb = plt.cm.tab10.colors[int(index) % len(plt.cm.tab10.colors)]
+    return "#{:02x}{:02x}{:02x}".format(*[int(round(c * 255)) for c in rgb[:3]])
+
+
+def eis_legend_layers(bundles: list[FitResultBundle]) -> list[dict[str, object]]:
+    layers = [{"raw": "data", "color": tab10_hex(0), "kind": "marker"}]
+    for idx, bundle in enumerate(bundles, start=1):
+        layers.append({"raw": f"fit: {bundle.weight}", "color": tab10_hex(idx), "kind": "line"})
+    return layers
+
+
+def make_nyquist_figure(
+    df: pd.DataFrame,
+    bundles: list[FitResultBundle],
+    show_low_freq_labels: bool = False,
+    plot_options: dict[str, object] | None = None,
+):
+    plot_options = plot_options or {}
+    legend_overrides = parse_legend_label_overrides(plot_options.get("legend_label_overrides", ""))
+    highlighted = plot_options.get("highlight_label_raw")
     fig, ax = plt.subplots(figsize=(6.8, 5.2))
-    ax.scatter(df["z_real_ohm"], df["minus_z_imag_ohm"], s=24, label="data")
-    for b in bundles:
-        ax.plot(b.curve_df["fit_z_real_ohm"], b.curve_df["fit_minus_z_imag_ohm"], label=f"fit: {b.weight}")
+    data_highlighted = highlighted == "data"
+    ax.scatter(
+        df["z_real_ohm"],
+        df["minus_z_imag_ohm"],
+        s=38 if data_highlighted else 24,
+        color=tab10_hex(0),
+        edgecolors="#ffb000" if data_highlighted else "none",
+        linewidths=1.8 if data_highlighted else 0.0,
+        zorder=5 if data_highlighted else 3,
+        label=legend_label_from_override("data", legend_overrides, 80),
+    )
+    for idx, b in enumerate(bundles, start=1):
+        raw_label = f"fit: {b.weight}"
+        fit_highlighted = highlighted == raw_label
+        if fit_highlighted:
+            ax.plot(
+                b.curve_df["fit_z_real_ohm"],
+                b.curve_df["fit_minus_z_imag_ohm"],
+                color="#ffb000",
+                linewidth=5.5,
+                alpha=0.45,
+                zorder=4,
+            )
+        ax.plot(
+            b.curve_df["fit_z_real_ohm"],
+            b.curve_df["fit_minus_z_imag_ohm"],
+            color=tab10_hex(idx),
+            linewidth=2.4 if fit_highlighted else 1.5,
+            zorder=5 if fit_highlighted else 3,
+            label=legend_label_from_override(raw_label, legend_overrides, 80),
+        )
 
     if show_low_freq_labels:
         low = df.nsmallest(min(8, len(df)), "freq_hz")
@@ -283,22 +331,72 @@ def make_nyquist_figure(df: pd.DataFrame, bundles: list[FitResultBundle], show_l
     ax.set_title("Nyquist plot")
     ax.set_xlabel("Z' / Ω")
     ax.set_ylabel("-Z'' / Ω")
+    apply_axis_tick_spacing(
+        ax,
+        x_major_step=plot_options.get("x_major_step"),
+        x_minor_step=plot_options.get("x_minor_step"),
+        y_major_step=plot_options.get("y_major_step"),
+        y_minor_step=plot_options.get("y_minor_step"),
+    )
     ax.axis("equal")
     ax.legend(loc="best")
     fig.tight_layout()
     return fig
 
 
-def make_low_freq_figure(df: pd.DataFrame, bundles: list[FitResultBundle], cutoff_hz: float):
+def make_low_freq_figure(
+    df: pd.DataFrame,
+    bundles: list[FitResultBundle],
+    cutoff_hz: float,
+    plot_options: dict[str, object] | None = None,
+):
+    plot_options = plot_options or {}
+    legend_overrides = parse_legend_label_overrides(plot_options.get("legend_label_overrides", ""))
+    highlighted = plot_options.get("highlight_label_raw")
     mask = df["freq_hz"] <= float(cutoff_hz)
     fig, ax = plt.subplots(figsize=(6.8, 4.8))
-    ax.scatter(df.loc[mask, "z_real_ohm"], df.loc[mask, "minus_z_imag_ohm"], s=28, label="data")
-    for b in bundles:
+    data_highlighted = highlighted == "data"
+    ax.scatter(
+        df.loc[mask, "z_real_ohm"],
+        df.loc[mask, "minus_z_imag_ohm"],
+        s=42 if data_highlighted else 28,
+        color=tab10_hex(0),
+        edgecolors="#ffb000" if data_highlighted else "none",
+        linewidths=1.8 if data_highlighted else 0.0,
+        zorder=5 if data_highlighted else 3,
+        label=legend_label_from_override("data", legend_overrides, 80),
+    )
+    for idx, b in enumerate(bundles, start=1):
         cdf = b.curve_df[b.curve_df["freq_hz"] <= float(cutoff_hz)]
-        ax.plot(cdf["fit_z_real_ohm"], cdf["fit_minus_z_imag_ohm"], label=f"fit: {b.weight}")
+        raw_label = f"fit: {b.weight}"
+        fit_highlighted = highlighted == raw_label
+        if fit_highlighted:
+            ax.plot(
+                cdf["fit_z_real_ohm"],
+                cdf["fit_minus_z_imag_ohm"],
+                color="#ffb000",
+                linewidth=5.5,
+                alpha=0.45,
+                zorder=4,
+            )
+        ax.plot(
+            cdf["fit_z_real_ohm"],
+            cdf["fit_minus_z_imag_ohm"],
+            color=tab10_hex(idx),
+            linewidth=2.4 if fit_highlighted else 1.5,
+            zorder=5 if fit_highlighted else 3,
+            label=legend_label_from_override(raw_label, legend_overrides, 80),
+        )
     ax.set_title(f"Low-frequency zoom: f ≤ {cutoff_hz:g} Hz")
     ax.set_xlabel("Z' / Ω")
     ax.set_ylabel("-Z'' / Ω")
+    apply_axis_tick_spacing(
+        ax,
+        x_major_step=plot_options.get("x_major_step"),
+        x_minor_step=plot_options.get("x_minor_step"),
+        y_major_step=plot_options.get("y_major_step"),
+        y_minor_step=plot_options.get("y_minor_step"),
+    )
     ax.axis("equal")
     ax.legend(loc="best")
     fig.tight_layout()
@@ -348,7 +446,23 @@ def sidebar_fit_options(key_prefix: str):
         format="%.6g",
         key=f"{key_prefix}_low_cutoff",
     )
-    return weight, compare_weights, show_low_freq_labels, float(low_freq_cutoff)
+    with st.sidebar.expander("Tick customization", expanded=False):
+        st.caption("Set a value above 0 to force fixed tick spacing. Leave 0 for Matplotlib auto ticks.")
+        c1, c2 = st.columns(2)
+        with c1:
+            x_major_step = st.number_input("X major", min_value=0.0, value=0.0, step=1.0, key=f"{key_prefix}_x_major_step")
+            y_major_step = st.number_input("Y major", min_value=0.0, value=0.0, step=1.0, key=f"{key_prefix}_y_major_step")
+        with c2:
+            x_minor_step = st.number_input("X minor", min_value=0.0, value=0.0, step=0.5, key=f"{key_prefix}_x_minor_step")
+            y_minor_step = st.number_input("Y minor", min_value=0.0, value=0.0, step=0.5, key=f"{key_prefix}_y_minor_step")
+    plot_options = {
+        "legend_label_overrides": collect_legend_label_overrides(key_prefix),
+        "x_major_step": x_major_step,
+        "x_minor_step": x_minor_step,
+        "y_major_step": y_major_step,
+        "y_minor_step": y_minor_step,
+    }
+    return weight, compare_weights, show_low_freq_labels, float(low_freq_cutoff), plot_options
 
 
 def sidebar_initial_params(xml_file, key_prefix: str) -> np.ndarray:
@@ -404,7 +518,7 @@ def render_eis_fit_page() -> None:
             accept_multiple_files=False,
             key="single_xml_file",
         )
-        weight, compare_weights, show_low_freq_labels, low_freq_cutoff = sidebar_fit_options("single")
+        weight, compare_weights, show_low_freq_labels, low_freq_cutoff, plot_options = sidebar_fit_options("single")
         p0 = sidebar_initial_params(xml_file, "single")
 
     if data_file is None:
@@ -444,11 +558,16 @@ def render_eis_fit_page() -> None:
     tab_plot, tab_params, tab_metrics, tab_data = st.tabs(["Preview", "Fit parameters", "Arc/fusion metrics", "Data & downloads"])
 
     with tab_plot:
+        label_overrides = collect_legend_label_overrides("single")
+        highlighted_layer = st.session_state.get("single_highlight_layer_raw")
+        plot_options["legend_label_overrides"] = label_overrides
+        plot_options["highlight_label_raw"] = highlighted_layer
         c1, c2 = st.columns([1.25, 1.0])
         with c1:
-            st.pyplot(make_nyquist_figure(df, bundles, show_low_freq_labels), clear_figure=True)
+            st.pyplot(make_nyquist_figure(df, bundles, show_low_freq_labels, plot_options=plot_options), clear_figure=True)
         with c2:
-            st.pyplot(make_low_freq_figure(df, bundles, low_freq_cutoff), clear_figure=True)
+            st.pyplot(make_low_freq_figure(df, bundles, low_freq_cutoff, plot_options=plot_options), clear_figure=True)
+        label_overrides, _highlighted_layer = render_legend_layer_editor("single", eis_legend_layers(bundles))
 
     with tab_params:
         selected_weight = st.selectbox("Select weighting", [b.weight for b in bundles], index=[b.weight for b in bundles].index(primary.weight))
@@ -503,7 +622,7 @@ def render_eis_fit_batch_page() -> None:
             accept_multiple_files=False,
             key="batch_xml_file",
         )
-        weight, compare_weights, show_low_freq_labels, low_freq_cutoff = sidebar_fit_options("batch")
+        weight, compare_weights, show_low_freq_labels, low_freq_cutoff, plot_options = sidebar_fit_options("batch")
         p0 = sidebar_initial_params(xml_file, "batch")
 
     if not data_files:
@@ -593,11 +712,16 @@ def render_eis_fit_batch_page() -> None:
 
     tab_plot, tab_params, tab_metrics, tab_data = st.tabs(["Preview", "Fit parameters", "Arc/fusion metrics", "Data"])
     with tab_plot:
+        label_overrides = collect_legend_label_overrides("batch")
+        highlighted_layer = st.session_state.get("batch_highlight_layer_raw")
+        plot_options["legend_label_overrides"] = label_overrides
+        plot_options["highlight_label_raw"] = highlighted_layer
         c1, c2 = st.columns([1.25, 1.0])
         with c1:
-            st.pyplot(make_nyquist_figure(df, file_bundles, show_low_freq_labels), clear_figure=True)
+            st.pyplot(make_nyquist_figure(df, file_bundles, show_low_freq_labels, plot_options=plot_options), clear_figure=True)
         with c2:
-            st.pyplot(make_low_freq_figure(df, file_bundles, low_freq_cutoff), clear_figure=True)
+            st.pyplot(make_low_freq_figure(df, file_bundles, low_freq_cutoff, plot_options=plot_options), clear_figure=True)
+        label_overrides, _highlighted_layer = render_legend_layer_editor("batch", eis_legend_layers(file_bundles))
 
     with tab_params:
         selected_weight = st.selectbox("Select weighting", [b.weight for b in file_bundles], key="batch_preview_params_weight")
@@ -1416,6 +1540,7 @@ def save_all_cycling_selections_and_go_style(
 def reset_cycling_visual_style_defaults() -> None:
     """Keep cycling plot-mode changes from carrying stale visual styling."""
     defaults = {
+        "cycling_style_section": "Text",
         "cycling_plot_title": "{sample}",
         "cycling_x_label": "Cycle Index",
         "cycling_cap_y_label": "Capacity Retention (%)",
@@ -1425,6 +1550,7 @@ def reset_cycling_visual_style_defaults() -> None:
         "cycling_legend_title": "Files",
         "cycling_legend_label_max_len": 24,
         "cycling_legend_columns": 3,
+        "cycling_legend_label_overrides": "",
         "cycling_auto_x_range": True,
         "cycling_x_min": 0.0,
         "cycling_x_max": 500.0,
@@ -1432,6 +1558,12 @@ def reset_cycling_visual_style_defaults() -> None:
         "cycling_cap_y_max": 110.0,
         "cycling_ce_y_min": 90.0,
         "cycling_ce_y_max": 100.5,
+        "cycling_x_major_step": 0.0,
+        "cycling_x_minor_step": 0.0,
+        "cycling_cap_y_major_step": 0.0,
+        "cycling_cap_y_minor_step": 0.0,
+        "cycling_ce_y_major_step": 0.0,
+        "cycling_ce_y_minor_step": 0.0,
         "cycling_palette_name": "Set2 + Dark2 + tab20",
         "cycling_marker_size": 80,
         "cycling_fig_width": 9.5,
@@ -1440,6 +1572,7 @@ def reset_cycling_visual_style_defaults() -> None:
     }
     for key, value in defaults.items():
         st.session_state[key] = value
+    remember_style_state("cycling", list(defaults.keys()))
 
 
 def cycling_style_defaults_signature(selected_samples: list[str]) -> str:
@@ -1551,6 +1684,8 @@ def save_cycling_style_and_go_final(selected_samples: list[str], all_sample_name
     sometimes use stale widget values from the previous rerun, which leads to
     incorrect style or axis ranges that hide the points.
     """
+    coerce_legend_control_defaults("cycling", "Top", "Files", 24, 3)
+    persist_registered_plot_axis_widgets("cycling")
     style_snapshot = {
         "plot_title": st.session_state.get("cycling_plot_title", "{sample}"),
         "x_label": st.session_state.get("cycling_x_label", "Cycle Index"),
@@ -1561,6 +1696,7 @@ def save_cycling_style_and_go_final(selected_samples: list[str], all_sample_name
         "legend_title": st.session_state.get("cycling_legend_title", "Files"),
         "legend_label_max_len": int(st.session_state.get("cycling_legend_label_max_len", 24)),
         "legend_columns": int(st.session_state.get("cycling_legend_columns", 3)),
+        "legend_label_overrides": collect_legend_label_overrides("cycling"),
         "auto_x_range": bool(st.session_state.get("cycling_auto_x_range", True)),
         "x_min": float(st.session_state.get("cycling_x_min", 0.0)),
         "x_max": float(st.session_state.get("cycling_x_max", 500.0)),
@@ -1568,6 +1704,12 @@ def save_cycling_style_and_go_final(selected_samples: list[str], all_sample_name
         "cap_y_max": float(st.session_state.get("cycling_cap_y_max", 110.0)),
         "ce_y_min": float(st.session_state.get("cycling_ce_y_min", 90.0)),
         "ce_y_max": float(st.session_state.get("cycling_ce_y_max", 100.5)),
+        "x_major_step": float(st.session_state.get("cycling_x_major_step", 0.0)),
+        "x_minor_step": float(st.session_state.get("cycling_x_minor_step", 0.0)),
+        "cap_y_major_step": float(st.session_state.get("cycling_cap_y_major_step", 0.0)),
+        "cap_y_minor_step": float(st.session_state.get("cycling_cap_y_minor_step", 0.0)),
+        "ce_y_major_step": float(st.session_state.get("cycling_ce_y_major_step", 0.0)),
+        "ce_y_minor_step": float(st.session_state.get("cycling_ce_y_minor_step", 0.0)),
         "palette_name": st.session_state.get("cycling_palette_name", "Set2 + Dark2 + tab20"),
         "plot_mode": normalize_cycling_plot_mode(st.session_state.get("cycling_plot_mode", CYCLING_PLOT_MODE_SINGLE)),
         "compare_repeat": st.session_state.get("cycling_compare_repeat", ""),
@@ -1577,6 +1719,8 @@ def save_cycling_style_and_go_final(selected_samples: list[str], all_sample_name
         "fig_height": float(st.session_state.get("cycling_fig_height", 5.8)),
         "dpi": int(st.session_state.get("cycling_dpi", 300)),
     }
+    style_snapshot = style_with_latest_legend_overrides(style_snapshot, "cycling")
+    style_snapshot["axis_overrides"] = plot_axis_overrides_from_style("cycling")
 
     palette_colors = palette_to_hex_colors(str(style_snapshot["palette_name"]), len(all_sample_names))
     palette_color_map = {sample: palette_colors[i] for i, sample in enumerate(all_sample_names)}
@@ -2135,6 +2279,650 @@ def hex_to_rgb_tuple(hex_color: str) -> tuple[float, float, float]:
     return tuple(int(hex_color[i:i + 2], 16) / 255 for i in (0, 2, 4))
 
 
+def parse_legend_label_overrides(value: object) -> dict[str, str]:
+    """Parse custom legend labels from lines like `original = custom`."""
+    if isinstance(value, dict):
+        return {str(k): str(v) for k, v in value.items() if str(k).strip() and str(v).strip()}
+    overrides: dict[str, str] = {}
+    for line in str(value or "").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if "=" in line:
+            raw, custom = line.split("=", 1)
+        elif ":" in line:
+            raw, custom = line.split(":", 1)
+        else:
+            continue
+        raw = raw.strip()
+        custom = custom.strip()
+        if raw and custom:
+            overrides[raw] = custom
+    return overrides
+
+
+def legend_label_state_key(prefix: str, raw_label: object) -> str:
+    return f"{prefix}_legend_label_{stable_key_part(str(raw_label))}"
+
+
+def persist_legend_label_overrides(prefix: str, overrides: dict[str, str]) -> dict[str, str]:
+    """Keep custom legend labels in one durable session-state map."""
+    cleaned = {
+        str(raw): str(custom).strip()
+        for raw, custom in overrides.items()
+        if str(raw).strip() and str(custom).strip()
+    }
+    st.session_state[f"{prefix}_legend_label_overrides_map"] = cleaned
+    st.session_state[f"{prefix}_legend_label_overrides"] = dict(cleaned)
+    return cleaned
+
+
+def collect_legend_label_overrides(prefix: str) -> dict[str, str]:
+    """Collect custom labels registered by the visual layer editor."""
+    overrides = parse_legend_label_overrides(st.session_state.get(f"{prefix}_legend_label_overrides", ""))
+    direct_map = st.session_state.get(f"{prefix}_legend_label_overrides_map", {})
+    if isinstance(direct_map, dict):
+        for raw_label, custom in direct_map.items():
+            custom = str(custom or "").strip()
+            if custom:
+                overrides[str(raw_label)] = custom
+    registry = st.session_state.get(f"{prefix}_legend_label_registry", {})
+    if isinstance(registry, dict):
+        for key, raw_label in registry.items():
+            if key not in st.session_state:
+                continue
+            raw = str(raw_label)
+            custom = str(st.session_state.get(key, "") or "").strip()
+            if custom:
+                overrides[raw] = custom
+            else:
+                overrides.pop(raw, None)
+    return persist_legend_label_overrides(prefix, overrides)
+
+
+def keep_legend_section_open(prefix: str) -> None:
+    """A layer click should not bounce the style radio away from Legend."""
+    style_section_key = f"{prefix}_style_section"
+    if style_section_key in st.session_state:
+        st.session_state[style_section_key] = "Legend"
+
+
+def keep_legend_visible_for_layer_edit(prefix: str) -> None:
+    """Selecting a legend layer should preserve the current legend visibility."""
+    show_key = f"{prefix}_show_legend"
+    if show_key in st.session_state:
+        st.session_state[show_key] = st.session_state[show_key]
+
+
+def set_highlight_layer(prefix: str, raw_label: object) -> None:
+    st.session_state[f"{prefix}_highlight_layer_raw"] = str(raw_label)
+    keep_legend_visible_for_layer_edit(prefix)
+    keep_legend_section_open(prefix)
+
+
+def sync_legend_label_input(prefix: str, raw_label: object, input_key: str) -> None:
+    """Persist one layer label immediately and highlight the edited layer."""
+    raw = str(raw_label)
+    custom = str(st.session_state.get(input_key, "") or "").strip()
+    override_key = f"{prefix}_legend_label_overrides_map"
+    overrides = dict(st.session_state.get(override_key, {}))
+    if custom:
+        overrides[raw] = custom
+    else:
+        overrides.pop(raw, None)
+    persist_legend_label_overrides(prefix, overrides)
+    set_highlight_layer(prefix, raw)
+
+
+def style_with_latest_legend_overrides(style: dict[str, object], prefix: str) -> dict[str, object]:
+    out = dict(style)
+    out["legend_label_overrides"] = collect_legend_label_overrides(prefix)
+    return out
+
+
+def style_state_store_key(prefix: str) -> str:
+    return f"{prefix}_style_state_store"
+
+
+STYLE_STATE_STORE_VERSION = "style_state_store_v2"
+
+
+def style_keys_with_extras(defaults: dict[str, object], extra_keys: list[str] | tuple[str, ...] = ()) -> list[str]:
+    keys = list(defaults.keys())
+    for key in extra_keys:
+        if key not in keys:
+            keys.append(key)
+    return keys
+
+
+def restore_style_state(
+    prefix: str,
+    defaults: dict[str, object],
+    extra_keys: list[str] | tuple[str, ...] = (),
+) -> list[str]:
+    """Restore style widget values that Streamlit may clean up when a section is hidden."""
+    keys = style_keys_with_extras(defaults, extra_keys)
+    store_key = style_state_store_key(prefix)
+    version_key = f"{prefix}_style_state_store_version"
+    reset_store = st.session_state.get(version_key) != STYLE_STATE_STORE_VERSION
+    stored = {} if reset_store else st.session_state.get(store_key, {})
+    if not isinstance(stored, dict):
+        stored = {}
+
+    for key in keys:
+        if reset_store and key in defaults:
+            st.session_state[key] = defaults[key]
+        elif key in st.session_state:
+            # Self-assignment keeps hidden widget keys from being cleaned up by
+            # Streamlit when another style section is rendered.
+            st.session_state[key] = st.session_state[key]
+        elif key in stored:
+            st.session_state[key] = stored[key]
+        if key in defaults:
+            st.session_state.setdefault(key, defaults[key])
+        elif key in st.session_state:
+            st.session_state[key] = st.session_state[key]
+
+    if reset_store:
+        st.session_state[version_key] = STYLE_STATE_STORE_VERSION
+        st.session_state[store_key] = {
+            key: st.session_state[key]
+            for key in keys
+            if key in st.session_state
+        }
+    return keys
+
+
+def remember_style_state(prefix: str, keys: list[str] | tuple[str, ...]) -> None:
+    """Save current style values outside widget state so reruns keep hidden controls."""
+    stored = dict(st.session_state.get(style_state_store_key(prefix), {}))
+    for key in keys:
+        if key in st.session_state:
+            stored[key] = st.session_state[key]
+    st.session_state[style_state_store_key(prefix)] = stored
+    st.session_state[f"{prefix}_style_state_store_version"] = STYLE_STATE_STORE_VERSION
+
+
+def coerce_bool_state(key: str, default: bool) -> None:
+    if key not in st.session_state:
+        st.session_state[key] = bool(default)
+        return
+    value = st.session_state.get(key)
+    if isinstance(value, bool):
+        return
+    text = str(value).strip().lower()
+    st.session_state[key] = text not in {"0", "false", "hide", "hidden", "no", "off"}
+
+
+def coerce_style_section(prefix: str, allowed_sections: list[str], default: str = "Text") -> None:
+    key = f"{prefix}_style_section"
+    current = str(st.session_state.get(key, default) or default)
+    if current == "Ticks" and "Axes" in allowed_sections:
+        st.session_state[key] = "Axes"
+    elif current not in allowed_sections:
+        st.session_state[key] = default if default in allowed_sections else allowed_sections[0]
+
+
+def plot_axis_store_key(prefix: str) -> str:
+    return f"{prefix}_plot_axis_overrides"
+
+
+def plot_axis_registry_key(prefix: str) -> str:
+    return f"{prefix}_plot_axis_widget_registry"
+
+
+def plot_axis_id(value: object) -> str:
+    return str(value or "plot")
+
+
+def plot_axis_widget_key(prefix: str, axis_id: str, field: str) -> str:
+    return f"{prefix}_axis_{stable_key_part(axis_id)}_{field}"
+
+
+def plot_axis_overrides_from_style(prefix: str, style: dict[str, object] | None = None) -> dict[str, dict[str, object]]:
+    if style is not None and isinstance(style.get("axis_overrides"), dict):
+        source = style.get("axis_overrides", {})
+    else:
+        source = st.session_state.get(plot_axis_store_key(prefix), {})
+    if not isinstance(source, dict):
+        return {}
+    cleaned: dict[str, dict[str, object]] = {}
+    for axis_id, values in source.items():
+        if isinstance(values, dict):
+            cleaned[str(axis_id)] = dict(values)
+    return cleaned
+
+
+def set_plot_axis_values(prefix: str, axis_id: str, values: dict[str, object]) -> None:
+    store = plot_axis_overrides_from_style(prefix)
+    store[plot_axis_id(axis_id)] = dict(values)
+    st.session_state[plot_axis_store_key(prefix)] = store
+
+
+def apply_plot_axis_values_to_all(prefix: str, axis_ids: list[str], values: dict[str, object]) -> None:
+    store = plot_axis_overrides_from_style(prefix)
+    for axis_id in axis_ids:
+        axis_key = plot_axis_id(axis_id)
+        store[axis_key] = dict(values)
+        for field, value in values.items():
+            widget_key = plot_axis_widget_key(prefix, axis_key, str(field))
+            if widget_key in st.session_state:
+                st.session_state[widget_key] = value
+    st.session_state[plot_axis_store_key(prefix)] = store
+
+
+def register_plot_axis_widget(prefix: str, axis_id: str, field: str) -> str:
+    key = plot_axis_widget_key(prefix, axis_id, field)
+    registry = dict(st.session_state.get(plot_axis_registry_key(prefix), {}))
+    registry[key] = {"axis_id": plot_axis_id(axis_id), "field": field}
+    st.session_state[plot_axis_registry_key(prefix)] = registry
+    return key
+
+
+def persist_registered_plot_axis_widgets(prefix: str) -> None:
+    registry = st.session_state.get(plot_axis_registry_key(prefix), {})
+    if not isinstance(registry, dict):
+        return
+    store = plot_axis_overrides_from_style(prefix)
+    for widget_key, meta in registry.items():
+        if not isinstance(meta, dict) or widget_key not in st.session_state:
+            continue
+        axis_id = plot_axis_id(meta.get("axis_id"))
+        field = str(meta.get("field", ""))
+        if not field:
+            continue
+        values = dict(store.get(axis_id, {}))
+        values[field] = st.session_state[widget_key]
+        store[axis_id] = values
+    st.session_state[plot_axis_store_key(prefix)] = store
+
+
+def style_with_plot_axis_overrides(prefix: str, style: dict[str, object], axis_id: str | None) -> dict[str, object]:
+    persist_registered_plot_axis_widgets(prefix)
+    out = dict(style)
+    if axis_id is None:
+        return out
+    overrides = plot_axis_overrides_from_style(prefix, out).get(plot_axis_id(axis_id), {})
+    out.update(overrides)
+    return out
+
+
+def axis_editor_values(prefix: str, axis_id: str, style: dict[str, object], fields: list[str]) -> dict[str, object]:
+    persist_registered_plot_axis_widgets(prefix)
+    overrides = plot_axis_overrides_from_style(prefix, style).get(plot_axis_id(axis_id), {})
+    return {field: overrides.get(field, style.get(field)) for field in fields}
+
+
+def axis_widget_value(prefix: str, axis_id: str, field: str, value: object) -> str:
+    key = register_plot_axis_widget(prefix, axis_id, field)
+    st.session_state.setdefault(key, value)
+    return key
+
+
+def read_axis_widget_values(prefix: str, axis_id: str, fields: list[str]) -> dict[str, object]:
+    return {
+        field: st.session_state.get(plot_axis_widget_key(prefix, axis_id, field))
+        for field in fields
+    }
+
+
+def render_axis_apply_all(prefix: str, axis_id: str, axis_ids: list[str], fields: list[str]) -> None:
+    if st.button("Apply axes/ticks to all plots", key=f"{prefix}_apply_axis_all_{stable_key_part(axis_id)}", use_container_width=True):
+        values = read_axis_widget_values(prefix, axis_id, fields)
+        apply_plot_axis_values_to_all(prefix, axis_ids, values)
+        st.success("Applied current axes/ticks to all output plots.")
+
+
+def render_capacity_axis_editor(axis_id: str, axis_label: str, axis_ids: list[str], style: dict[str, object]) -> None:
+    fields = [
+        "auto_x_range",
+        "x_min",
+        "x_max",
+        "cap_y_min",
+        "cap_y_max",
+        "ce_y_min",
+        "ce_y_max",
+        "x_major_step",
+        "x_minor_step",
+        "cap_y_major_step",
+        "cap_y_minor_step",
+        "ce_y_major_step",
+        "ce_y_minor_step",
+    ]
+    values = axis_editor_values("cycling", axis_id, style, fields)
+    st.caption(f"Editing axes/ticks for: {axis_label}")
+    auto_key = axis_widget_value("cycling", axis_id, "auto_x_range", bool(values["auto_x_range"]))
+    st.checkbox("Auto X-axis range", key=auto_key)
+    auto_x_range = bool(st.session_state.get(auto_key, True))
+    x1, x2 = st.columns(2)
+    with x1:
+        st.number_input("X min", step=10.0, key=axis_widget_value("cycling", axis_id, "x_min", float(values["x_min"])), disabled=auto_x_range)
+    with x2:
+        st.number_input("X max", step=10.0, key=axis_widget_value("cycling", axis_id, "x_max", float(values["x_max"])), disabled=auto_x_range)
+
+    y1, y2 = st.columns(2)
+    with y1:
+        st.number_input("Cap. Y min", step=1.0, key=axis_widget_value("cycling", axis_id, "cap_y_min", float(values["cap_y_min"])))
+        st.number_input("CE Y min", step=0.5, key=axis_widget_value("cycling", axis_id, "ce_y_min", float(values["ce_y_min"])))
+    with y2:
+        st.number_input("Cap. Y max", step=1.0, key=axis_widget_value("cycling", axis_id, "cap_y_max", float(values["cap_y_max"])))
+        st.number_input("CE Y max", step=0.5, key=axis_widget_value("cycling", axis_id, "ce_y_max", float(values["ce_y_max"])))
+
+    st.markdown("##### Ticks")
+    st.caption("Set a value above 0 to force fixed tick spacing. Leave 0 for Matplotlib auto ticks.")
+    tx1, tx2 = st.columns(2)
+    with tx1:
+        st.number_input("X major step", min_value=0.0, step=10.0, key=axis_widget_value("cycling", axis_id, "x_major_step", float(values["x_major_step"])))
+        st.number_input("Cap. Y major step", min_value=0.0, step=1.0, key=axis_widget_value("cycling", axis_id, "cap_y_major_step", float(values["cap_y_major_step"])))
+        st.number_input("CE Y major step", min_value=0.0, step=0.5, key=axis_widget_value("cycling", axis_id, "ce_y_major_step", float(values["ce_y_major_step"])))
+    with tx2:
+        st.number_input("X minor step", min_value=0.0, step=5.0, key=axis_widget_value("cycling", axis_id, "x_minor_step", float(values["x_minor_step"])))
+        st.number_input("Cap. Y minor step", min_value=0.0, step=0.5, key=axis_widget_value("cycling", axis_id, "cap_y_minor_step", float(values["cap_y_minor_step"])))
+        st.number_input("CE Y minor step", min_value=0.0, step=0.1, key=axis_widget_value("cycling", axis_id, "ce_y_minor_step", float(values["ce_y_minor_step"])))
+    set_plot_axis_values("cycling", axis_id, read_axis_widget_values("cycling", axis_id, fields))
+    render_axis_apply_all("cycling", axis_id, axis_ids, fields)
+
+
+def render_xy_axis_editor(
+    prefix: str,
+    axis_id: str,
+    axis_label: str,
+    axis_ids: list[str],
+    style: dict[str, object],
+    include_auto_limits: bool,
+) -> None:
+    fields = ["auto_x_range", "x_min", "x_max", "y_min", "y_max", "x_major_step", "x_minor_step", "y_major_step", "y_minor_step"]
+    if include_auto_limits:
+        fields.extend(["small_capacity_limit", "large_capacity_limit"])
+    values = axis_editor_values(prefix, axis_id, style, fields)
+    st.caption(f"Editing axes/ticks for: {axis_label}")
+    auto_key = axis_widget_value(prefix, axis_id, "auto_x_range", bool(values["auto_x_range"]))
+    st.checkbox("Auto X-axis upper limit", key=auto_key)
+    auto_x = bool(st.session_state.get(auto_key, True))
+    a1, a2 = st.columns(2)
+    with a1:
+        st.number_input("X min", step=0.1, key=axis_widget_value(prefix, axis_id, "x_min", float(values["x_min"])), disabled=(auto_x and not include_auto_limits))
+        st.number_input("X max", step=0.5, key=axis_widget_value(prefix, axis_id, "x_max", float(values["x_max"])), disabled=auto_x)
+        st.number_input("Y min", step=0.1, key=axis_widget_value(prefix, axis_id, "y_min", float(values["y_min"])))
+    with a2:
+        if include_auto_limits:
+            st.number_input("Small capacity limit", step=0.5, key=axis_widget_value(prefix, axis_id, "small_capacity_limit", float(values["small_capacity_limit"])), disabled=not auto_x)
+            st.number_input("Large capacity limit", step=0.5, key=axis_widget_value(prefix, axis_id, "large_capacity_limit", float(values["large_capacity_limit"])), disabled=not auto_x)
+        st.number_input("Y max", step=0.1, key=axis_widget_value(prefix, axis_id, "y_max", float(values["y_max"])))
+
+    st.markdown("##### Ticks")
+    st.caption("Set a value above 0 to force fixed tick spacing. Leave 0 for Matplotlib auto ticks.")
+    t1, t2 = st.columns(2)
+    with t1:
+        st.number_input("X major step", min_value=0.0, step=0.5, key=axis_widget_value(prefix, axis_id, "x_major_step", float(values["x_major_step"])))
+        st.number_input("Y major step", min_value=0.0, step=0.1, key=axis_widget_value(prefix, axis_id, "y_major_step", float(values["y_major_step"])))
+    with t2:
+        st.number_input("X minor step", min_value=0.0, step=0.1, key=axis_widget_value(prefix, axis_id, "x_minor_step", float(values["x_minor_step"])))
+        st.number_input("Y minor step", min_value=0.0, step=0.05, key=axis_widget_value(prefix, axis_id, "y_minor_step", float(values["y_minor_step"])))
+    set_plot_axis_values(prefix, axis_id, read_axis_widget_values(prefix, axis_id, fields))
+    render_axis_apply_all(prefix, axis_id, axis_ids, fields)
+
+
+def coerce_legend_control_defaults(
+    prefix: str,
+    default_position: str,
+    default_title: str,
+    default_label_max_len: int,
+    default_columns: int,
+    max_columns: int = 6,
+) -> None:
+    """Repair stale legend UI state left by earlier app versions."""
+    show_key = f"{prefix}_show_legend"
+    if not isinstance(st.session_state.get(show_key, True), bool):
+        show_text = str(st.session_state.get(show_key, True)).strip().lower()
+        st.session_state[show_key] = show_text not in {"0", "false", "hide", "hidden", "no", "off"}
+
+    position_key = f"{prefix}_legend_position"
+    allowed_positions = {"Top", "Right", "Inside"}
+    position = str(st.session_state.get(position_key, default_position) or "").strip()
+    if position not in allowed_positions:
+        st.session_state[position_key] = default_position
+
+    title_key = f"{prefix}_legend_title"
+    if not str(st.session_state.get(title_key, "") or "").strip():
+        st.session_state[title_key] = default_title
+
+    length_key = f"{prefix}_legend_label_max_len"
+    try:
+        label_len = int(st.session_state.get(length_key, default_label_max_len))
+    except Exception:
+        label_len = default_label_max_len
+    st.session_state[length_key] = min(80, max(8, label_len))
+
+    columns_key = f"{prefix}_legend_columns"
+    try:
+        columns = int(st.session_state.get(columns_key, default_columns))
+    except Exception:
+        columns = default_columns
+    st.session_state[columns_key] = min(max_columns, max(1, columns))
+
+
+def legend_label_from_override(label_raw: object, label_overrides: dict[str, str] | None, max_len: int) -> str:
+    """Return a custom legend label when available, otherwise the shortened raw label."""
+    raw = str(label_raw)
+    custom = (label_overrides or {}).get(raw, raw)
+    return shorten_label(custom, max_len)
+
+
+def positive_step_or_none(value: object) -> float | None:
+    try:
+        step = float(value)
+    except Exception:
+        return None
+    if not np.isfinite(step) or step <= 0:
+        return None
+    return step
+
+
+def apply_axis_tick_spacing(
+    ax,
+    x_major_step: object = None,
+    x_minor_step: object = None,
+    y_major_step: object = None,
+    y_minor_step: object = None,
+    default_x_minor_subdivisions: int | None = None,
+    default_y_minor_subdivisions: int | None = None,
+) -> None:
+    """Apply optional fixed major/minor tick spacing while preserving auto defaults."""
+    x_major = positive_step_or_none(x_major_step)
+    x_minor = positive_step_or_none(x_minor_step)
+    y_major = positive_step_or_none(y_major_step)
+    y_minor = positive_step_or_none(y_minor_step)
+
+    if x_major is not None:
+        ax.xaxis.set_major_locator(MultipleLocator(x_major))
+    if x_minor is not None:
+        ax.xaxis.set_minor_locator(MultipleLocator(x_minor))
+    elif default_x_minor_subdivisions is not None:
+        ax.xaxis.set_minor_locator(AutoMinorLocator(default_x_minor_subdivisions))
+
+    if y_major is not None:
+        ax.yaxis.set_major_locator(MultipleLocator(y_major))
+    if y_minor is not None:
+        ax.yaxis.set_minor_locator(MultipleLocator(y_minor))
+    elif default_y_minor_subdivisions is not None:
+        ax.yaxis.set_minor_locator(AutoMinorLocator(default_y_minor_subdivisions))
+
+
+def capacity_custom_figure_options(style: dict[str, object]) -> dict[str, object]:
+    return {
+        "legend_label_overrides": parse_legend_label_overrides(style.get("legend_label_overrides", "")),
+        "x_major_step": positive_step_or_none(style.get("x_major_step")),
+        "x_minor_step": positive_step_or_none(style.get("x_minor_step")),
+        "cap_y_major_step": positive_step_or_none(style.get("cap_y_major_step")),
+        "cap_y_minor_step": positive_step_or_none(style.get("cap_y_minor_step")),
+        "ce_y_major_step": positive_step_or_none(style.get("ce_y_major_step")),
+        "ce_y_minor_step": positive_step_or_none(style.get("ce_y_minor_step")),
+    }
+
+
+def without_preview_highlight(kwargs: dict[str, object]) -> dict[str, object]:
+    """Remove preview-only highlighting before saving/caching final figures."""
+    out = dict(kwargs)
+    out.pop("highlight_label_raw", None)
+    return out
+
+
+def xy_custom_figure_options(style: dict[str, object]) -> dict[str, object]:
+    return {
+        "legend_label_overrides": parse_legend_label_overrides(style.get("legend_label_overrides", "")),
+        "x_major_step": positive_step_or_none(style.get("x_major_step")),
+        "x_minor_step": positive_step_or_none(style.get("x_minor_step")),
+        "y_major_step": positive_step_or_none(style.get("y_major_step")),
+        "y_minor_step": positive_step_or_none(style.get("y_minor_step")),
+    }
+
+
+def unique_legend_layers(layers: list[dict[str, object]]) -> list[dict[str, object]]:
+    seen: set[str] = set()
+    unique = []
+    for layer in layers:
+        raw = str(layer.get("raw", "")).strip()
+        if not raw or raw in seen:
+            continue
+        seen.add(raw)
+        unique.append(layer)
+    return unique
+
+
+def render_legend_layer_editor(
+    prefix: str,
+    layers: list[dict[str, object]],
+) -> tuple[dict[str, str], str | None]:
+    """Render an intuitive layer list for custom legend labels and preview highlighting."""
+    layers = unique_legend_layers(layers)
+    if not layers:
+        return collect_legend_label_overrides(prefix), None
+
+    st.markdown("#### Legend layers")
+    st.caption("Click a layer row to highlight it; edit the field to rename it in the legend.")
+
+    registry_key = f"{prefix}_legend_label_registry"
+    highlight_key = f"{prefix}_highlight_layer_raw"
+    existing_overrides = collect_legend_label_overrides(prefix)
+    registry: dict[str, str] = {}
+    raw_labels = [str(layer["raw"]) for layer in layers]
+    selected = st.session_state.get(highlight_key)
+    if selected not in raw_labels:
+        selected = None
+        st.session_state[highlight_key] = ""
+
+    for layer in layers:
+        raw = str(layer["raw"])
+        input_key = legend_label_state_key(prefix, raw)
+        registry[input_key] = raw
+        if input_key not in st.session_state:
+            st.session_state[input_key] = existing_overrides.get(raw, "")
+    st.session_state[registry_key] = registry
+
+    for idx, layer in enumerate(layers, start=1):
+        raw = str(layer["raw"])
+        color = str(layer.get("color", "#4E79A7"))
+        kind = str(layer.get("kind", "marker"))
+        input_key = legend_label_state_key(prefix, raw)
+        try:
+            row_ctx = st.container(border=(raw == selected))
+        except TypeError:
+            row_ctx = st.container()
+        with row_ctx:
+            swatch_html = (
+                f"<span style='display:inline-block;width:34px;height:0;border-top:4px solid {html.escape(color)};vertical-align:middle;'></span>"
+                if kind == "line"
+                else f"<span style='display:inline-block;width:16px;height:16px;border-radius:50%;background:{html.escape(color)};border:2px solid white;box-shadow:0 0 0 1px rgba(0,0,0,.25);vertical-align:middle;'></span>"
+            )
+            current_custom = str(st.session_state.get(input_key, "") or "").strip()
+            row_label = raw if not current_custom else f"{raw} -> {current_custom}"
+            c0, c1, c2 = st.columns([0.14, 0.88, 0.95])
+            with c0:
+                st.markdown(swatch_html, unsafe_allow_html=True)
+            with c1:
+                st.button(
+                    shorten_label(row_label, 58),
+                    key=f"{prefix}_layer_row_{stable_key_part(raw)}",
+                    on_click=set_highlight_layer,
+                    args=(prefix, raw),
+                    use_container_width=True,
+                )
+            with c2:
+                st.text_input(
+                    f"Layer {idx} legend name",
+                    key=input_key,
+                    placeholder=raw,
+                    label_visibility="collapsed",
+                    on_change=sync_legend_label_input,
+                    args=(prefix, raw, input_key),
+                )
+    highlighted = str(selected) if selected in raw_labels else None
+    return collect_legend_label_overrides(prefix), highlighted
+
+
+def capacity_legend_layers(
+    plot_df: pd.DataFrame | None,
+    plot_mode: str,
+    sample_colors: dict[str, str],
+    fallback_color: str = "#4E79A7",
+) -> list[dict[str, object]]:
+    if plot_df is None or plot_df.empty:
+        return []
+    layers = []
+    if is_cycling_compare_mode(plot_mode) and "sample" in plot_df.columns:
+        for sample in sorted(plot_df["sample"].dropna().astype(str).unique()):
+            layers.append({"raw": sample, "color": sample_colors.get(sample, fallback_color), "kind": "marker"})
+        return layers
+
+    group_key = "relative_path" if "relative_path" in plot_df.columns else "source_file"
+    for group_id, group in plot_df.groupby(group_key, sort=True):
+        if "source_file" in group.columns and len(group):
+            file_label_raw = Path(str(group["source_file"].iloc[0])).stem
+        else:
+            file_label_raw = Path(str(group_id)).stem
+        if "repeat" in group.columns and len(group):
+            repeat_label = str(group["repeat"].iloc[0])
+            raw = repeat_label if repeat_label == file_label_raw else f"{repeat_label} | {file_label_raw}"
+        else:
+            raw = file_label_raw
+        sample = str(group["sample"].iloc[0]) if "sample" in group.columns and len(group) else ""
+        layers.append({"raw": raw, "color": sample_colors.get(sample, fallback_color), "kind": "marker"})
+    return layers
+
+
+def stripping_legend_layers(plot_df: pd.DataFrame | None, plot_mode: str, sample_colors: dict[str, str]) -> list[dict[str, object]]:
+    df = clean_stripping_plot_df(plot_df)
+    if df.empty:
+        return []
+    layers = []
+    for source_path, group in df.groupby("Source path", sort=True):
+        sample = str(group["Sample"].iloc[0])
+        repeat = str(group["Repeat"].iloc[0])
+        file_stem = Path(str(source_path)).stem
+        raw = sample if is_stripping_compare_mode(plot_mode) else (repeat if repeat == file_stem else f"{repeat} | {file_stem}")
+        layers.append({"raw": raw, "color": sample_colors.get(sample, "#4E79A7"), "kind": "line"})
+    return layers
+
+
+def dqdv_legend_layers(plot_df: pd.DataFrame | None, color_hex: str) -> list[dict[str, object]]:
+    df = clean_dqdv_plot_df(plot_df)
+    if df.empty:
+        return []
+    cycles = sorted(df["cycle_index"].dropna().astype(int).unique())
+    base_color = hex_to_rgb_tuple(color_hex)
+    return [
+        {
+            "raw": str(cycle),
+            "color": "#{:02x}{:02x}{:02x}".format(
+                *[int(round(c * 255)) for c in dqdv.faded_color(base_color, idx, len(cycles))]
+            ),
+            "kind": "line",
+        }
+        for idx, cycle in enumerate(cycles)
+    ]
+
+
 COMMON_PLOT_RCPARAMS = {
     "font.family": "sans-serif",
     "font.sans-serif": ["Arial", "Helvetica", "DejaVu Sans"],
@@ -2307,6 +3095,14 @@ def make_capacity_figure(
     legend_position: str = "Top",
     legend_label_max_len: int = 24,
     legend_columns: int = 3,
+    legend_label_overrides: dict[str, str] | None = None,
+    x_major_step: float | None = None,
+    x_minor_step: float | None = None,
+    cap_y_major_step: float | None = None,
+    cap_y_minor_step: float | None = None,
+    ce_y_major_step: float | None = None,
+    ce_y_minor_step: float | None = None,
+    highlight_label_raw: str | None = None,
 ):
     """
     Make one capacity-retention / coulombic-efficiency plot for one sample.
@@ -2362,29 +3158,32 @@ def make_capacity_figure(
             full_label = repeat_label if repeat_label == file_label_raw else f"{repeat_label} | {file_label_raw}"
         else:
             full_label = file_label_raw
-        file_label = shorten_label(full_label, legend_label_max_len)
+        file_label = legend_label_from_override(full_label, legend_label_overrides, legend_label_max_len)
+        is_highlighted = highlight_label_raw is not None and str(full_label) == str(highlight_label_raw)
 
         ax1.scatter(
             group["cycle_index"].to_numpy(float),
             group["capacity_retention_percent"].to_numpy(float),
             color=color_rgb,
             marker="o",
-            s=marker_size,
+            s=marker_size * (1.45 if is_highlighted else 1.0),
             alpha=1,
-            zorder=3,
+            zorder=5 if is_highlighted else 3,
             label=file_label,
+            edgecolors="#ffb000" if is_highlighted else "none",
+            linewidths=1.8 if is_highlighted else 0.0,
         )
 
         ax2.scatter(
             group["cycle_index"].to_numpy(float),
             group["coulombic_efficiency_percent"].to_numpy(float),
             facecolors="none",
-            edgecolors=color_rgb,
+            edgecolors="#ffb000" if is_highlighted else color_rgb,
             marker="o",
-            s=marker_size,
-            linewidths=1.5,
+            s=marker_size * (1.45 if is_highlighted else 1.0),
+            linewidths=2.2 if is_highlighted else 1.5,
             alpha=1,
-            zorder=3,
+            zorder=5 if is_highlighted else 3,
         )
 
     if auto_x_range:
@@ -2430,9 +3229,21 @@ def make_capacity_figure(
         for spine in ax.spines.values():
             spine.set_linewidth(1.5)
 
-    ax1.xaxis.set_minor_locator(AutoMinorLocator(5))
-    ax1.yaxis.set_minor_locator(AutoMinorLocator(5))
-    ax2.yaxis.set_minor_locator(AutoMinorLocator(2))
+    apply_axis_tick_spacing(
+        ax1,
+        x_major_step=x_major_step,
+        x_minor_step=x_minor_step,
+        y_major_step=cap_y_major_step,
+        y_minor_step=cap_y_minor_step,
+        default_x_minor_subdivisions=5,
+        default_y_minor_subdivisions=5,
+    )
+    apply_axis_tick_spacing(
+        ax2,
+        y_major_step=ce_y_major_step,
+        y_minor_step=ce_y_minor_step,
+        default_y_minor_subdivisions=2,
+    )
 
     legend_position = legend_position if show_legend else "Hide"
 
@@ -2487,11 +3298,13 @@ def make_capacity_figure(
         ax1.legend(
             handles,
             labels,
-            loc="best",
+            loc="lower left",
+            bbox_to_anchor=(0.02, 0.03),
             title=legend_title,
             fontsize=10,
             title_fontsize=12,
             frameon=False,
+            borderaxespad=0.0,
         )
 
     else:
@@ -2523,6 +3336,14 @@ def make_capacity_sample_comparison_figure(
     legend_position: str = "Top",
     legend_label_max_len: int = 24,
     legend_columns: int = 3,
+    legend_label_overrides: dict[str, str] | None = None,
+    x_major_step: float | None = None,
+    x_minor_step: float | None = None,
+    cap_y_major_step: float | None = None,
+    cap_y_minor_step: float | None = None,
+    ce_y_major_step: float | None = None,
+    ce_y_minor_step: float | None = None,
+    highlight_label_raw: str | None = None,
 ):
     """Make one cycling comparison figure for the same repeat across samples."""
     apply_common_plot_style()
@@ -2556,31 +3377,34 @@ def make_capacity_sample_comparison_figure(
     handles_seen: set[str] = set()
     for sample, sample_df in plot_df.groupby("sample", sort=True):
         color_rgb = hex_to_rgb_tuple(sample_colors.get(str(sample), "#4E79A7"))
-        label = shorten_label(str(sample), legend_label_max_len)
+        label = legend_label_from_override(str(sample), legend_label_overrides, legend_label_max_len)
         for _group_id, group in sample_df.groupby("relative_path", sort=True):
             group = group.sort_values("cycle_index")
             legend_label = label if str(sample) not in handles_seen else "_nolegend_"
             handles_seen.add(str(sample))
+            is_highlighted = highlight_label_raw is not None and str(sample) == str(highlight_label_raw)
             ax1.scatter(
                 group["cycle_index"].to_numpy(float),
                 group["capacity_retention_percent"].to_numpy(float),
                 color=color_rgb,
                 marker="o",
-                s=marker_size,
+                s=marker_size * (1.45 if is_highlighted else 1.0),
                 alpha=1,
-                zorder=3,
+                zorder=5 if is_highlighted else 3,
                 label=legend_label,
+                edgecolors="#ffb000" if is_highlighted else "none",
+                linewidths=1.8 if is_highlighted else 0.0,
             )
             ax2.scatter(
                 group["cycle_index"].to_numpy(float),
                 group["coulombic_efficiency_percent"].to_numpy(float),
                 facecolors="none",
-                edgecolors=color_rgb,
+                edgecolors="#ffb000" if is_highlighted else color_rgb,
                 marker="o",
-                s=marker_size,
-                linewidths=1.5,
+                s=marker_size * (1.45 if is_highlighted else 1.0),
+                linewidths=2.2 if is_highlighted else 1.5,
                 alpha=1,
-                zorder=3,
+                zorder=5 if is_highlighted else 3,
             )
 
     if auto_x_range:
@@ -2616,9 +3440,21 @@ def make_capacity_sample_comparison_figure(
         for spine in ax.spines.values():
             spine.set_linewidth(1.5)
 
-    ax1.xaxis.set_minor_locator(AutoMinorLocator(5))
-    ax1.yaxis.set_minor_locator(AutoMinorLocator(5))
-    ax2.yaxis.set_minor_locator(AutoMinorLocator(2))
+    apply_axis_tick_spacing(
+        ax1,
+        x_major_step=x_major_step,
+        x_minor_step=x_minor_step,
+        y_major_step=cap_y_major_step,
+        y_minor_step=cap_y_minor_step,
+        default_x_minor_subdivisions=5,
+        default_y_minor_subdivisions=5,
+    )
+    apply_axis_tick_spacing(
+        ax2,
+        y_major_step=ce_y_major_step,
+        y_minor_step=ce_y_minor_step,
+        default_y_minor_subdivisions=2,
+    )
 
     legend_position = legend_position if show_legend else "Hide"
     handles, labels = ax1.get_legend_handles_labels()
@@ -2659,7 +3495,17 @@ def make_capacity_sample_comparison_figure(
         )
     elif legend_position == "Inside":
         fig.subplots_adjust(left=0.11, right=0.88, bottom=0.14, top=0.88)
-        ax1.legend(handles, labels, loc="best", title=legend_title, fontsize=10, title_fontsize=12, frameon=False)
+        ax1.legend(
+            handles,
+            labels,
+            loc="lower left",
+            bbox_to_anchor=(0.02, 0.03),
+            title=legend_title,
+            fontsize=10,
+            title_fontsize=12,
+            frameon=False,
+            borderaxespad=0.0,
+        )
     else:
         fig.subplots_adjust(left=0.11, right=0.88, bottom=0.14, top=0.90)
 
@@ -3269,6 +4115,7 @@ def render_cycling_analysis_page() -> None:
     # Defaults for plot styling. The widgets in Style preview write to these keys;
     # Final output reads from the same keys, so output can be a separate step.
     style_defaults = {
+        "cycling_style_section": "Text",
         "cycling_plot_title": "{sample}",
         "cycling_x_label": "Cycle Index",
         "cycling_cap_y_label": "Capacity Retention (%)",
@@ -3278,6 +4125,7 @@ def render_cycling_analysis_page() -> None:
         "cycling_legend_title": "Files",
         "cycling_legend_label_max_len": 24,
         "cycling_legend_columns": 3,
+        "cycling_legend_label_overrides": "",
         "cycling_auto_x_range": True,
         "cycling_x_min": 0.0,
         "cycling_x_max": 500.0,
@@ -3285,6 +4133,12 @@ def render_cycling_analysis_page() -> None:
         "cycling_cap_y_max": 110.0,
         "cycling_ce_y_min": 90.0,
         "cycling_ce_y_max": 100.5,
+        "cycling_x_major_step": 0.0,
+        "cycling_x_minor_step": 0.0,
+        "cycling_cap_y_major_step": 0.0,
+        "cycling_cap_y_minor_step": 0.0,
+        "cycling_ce_y_major_step": 0.0,
+        "cycling_ce_y_minor_step": 0.0,
         "cycling_palette_name": "Set2 + Dark2 + tab20",
         "cycling_plot_mode": CYCLING_PLOT_MODE_SINGLE,
         "cycling_compare_repeat": "",
@@ -3294,8 +4148,13 @@ def render_cycling_analysis_page() -> None:
         "cycling_fig_height": 5.8,
         "cycling_dpi": 300,
     }
-    for key, value in style_defaults.items():
-        st.session_state.setdefault(key, value)
+    cycling_style_keys = restore_style_state(
+        "cycling",
+        style_defaults,
+        [f"cycling_color_{safe_filename(sample)}" for sample in sample_names],
+    )
+    coerce_style_section("cycling", ["Text", "Legend", "Axes", "Style"])
+    coerce_bool_state("cycling_auto_x_range", True)
     st.session_state["cycling_plot_mode"] = normalize_cycling_plot_mode(
         st.session_state.get("cycling_plot_mode", CYCLING_PLOT_MODE_SINGLE)
     )
@@ -3319,6 +4178,8 @@ def render_cycling_analysis_page() -> None:
     for key, value in text_style_defaults.items():
         if not str(st.session_state.get(key, "")).strip():
             st.session_state[key] = value
+    coerce_legend_control_defaults("cycling", "Top", "Files", 24, 3)
+    remember_style_state("cycling", cycling_style_keys)
 
     # Guard against stale or invalid axis values from older sessions.
     if float(st.session_state.get("cycling_cap_y_max", 110.0)) <= float(st.session_state.get("cycling_cap_y_min", 75.0)):
@@ -3342,6 +4203,7 @@ def render_cycling_analysis_page() -> None:
             "legend_title": st.session_state.get("cycling_legend_title", "Files"),
             "legend_label_max_len": int(st.session_state.get("cycling_legend_label_max_len", 24)),
             "legend_columns": int(st.session_state.get("cycling_legend_columns", 3)),
+            "legend_label_overrides": collect_legend_label_overrides("cycling"),
             "auto_x_range": bool(st.session_state.get("cycling_auto_x_range", True)),
             "x_min": float(st.session_state.get("cycling_x_min", 0.0)),
             "x_max": float(st.session_state.get("cycling_x_max", 500.0)),
@@ -3349,6 +4211,12 @@ def render_cycling_analysis_page() -> None:
             "cap_y_max": float(st.session_state.get("cycling_cap_y_max", 110.0)),
             "ce_y_min": float(st.session_state.get("cycling_ce_y_min", 90.0)),
             "ce_y_max": float(st.session_state.get("cycling_ce_y_max", 100.5)),
+            "x_major_step": float(st.session_state.get("cycling_x_major_step", 0.0)),
+            "x_minor_step": float(st.session_state.get("cycling_x_minor_step", 0.0)),
+            "cap_y_major_step": float(st.session_state.get("cycling_cap_y_major_step", 0.0)),
+            "cap_y_minor_step": float(st.session_state.get("cycling_cap_y_minor_step", 0.0)),
+            "ce_y_major_step": float(st.session_state.get("cycling_ce_y_major_step", 0.0)),
+            "ce_y_minor_step": float(st.session_state.get("cycling_ce_y_minor_step", 0.0)),
             "palette_name": st.session_state.get("cycling_palette_name", "Set2 + Dark2 + tab20"),
             "plot_mode": normalize_cycling_plot_mode(st.session_state.get("cycling_plot_mode", CYCLING_PLOT_MODE_SINGLE)),
             "compare_repeat": st.session_state.get("cycling_compare_repeat", ""),
@@ -3362,10 +4230,13 @@ def render_cycling_analysis_page() -> None:
     def current_sample_colors(style: dict[str, object]) -> dict[str, str]:
         colors = palette_to_hex_colors(str(style["palette_name"]), len(sample_names))
         palette_color_map = {sample: colors[i] for i, sample in enumerate(sample_names)}
+        saved_colors = style.get("sample_colors", {})
+        if not isinstance(saved_colors, dict):
+            saved_colors = {}
         return {
             sample: st.session_state.get(
                 f"cycling_color_{safe_filename(sample)}",
-                palette_color_map[sample],
+                saved_colors.get(sample, palette_color_map[sample]),
             )
             for sample in selected_samples
         }
@@ -3955,12 +4826,19 @@ def render_cycling_analysis_page() -> None:
                 disabled=not compare_mode_enabled,
                 help="In comparison mode, preview and final output combine all selected files from these samples into one figure.",
             )
+            cycling_axis_id = "selected_sample_comparison" if compare_mode_enabled else preview_sample
+            cycling_axis_label = "Selected sample comparison" if compare_mode_enabled else preview_sample
+            cycling_axis_ids = ["selected_sample_comparison"] if compare_mode_enabled else list(selected_samples)
 
-            control_tab_1, control_tab_2, control_tab_3, control_tab_4 = st.tabs(
-                ["Text", "Legend", "Axes", "Style"]
+            cycling_style_section = st.radio(
+                "Style controls",
+                ["Text", "Legend", "Axes", "Style"],
+                horizontal=True,
+                key="cycling_style_section",
+                label_visibility="collapsed",
             )
 
-            with control_tab_1:
+            if cycling_style_section == "Text":
                 st.text_input(
                     "Plot title",
                     key="cycling_plot_title",
@@ -3971,12 +4849,12 @@ def render_cycling_analysis_page() -> None:
                 st.text_input("Left Y-axis label", key="cycling_cap_y_label", placeholder="Capacity Retention (%)")
                 st.text_input("Right Y-axis label", key="cycling_ce_y_label", placeholder="Coulombic Efficiency (%)")
 
-            with control_tab_2:
+            if cycling_style_section == "Legend":
                 st.checkbox("Show legend", key="cycling_show_legend")
                 show_legend = bool(st.session_state.get("cycling_show_legend", True))
                 legend_position = st.selectbox(
                     "Legend position",
-                    ["Top", "Right", "Inside", "Hide"],
+                    ["Top", "Right", "Inside"],
                     key="cycling_legend_position",
                     disabled=not show_legend,
                 )
@@ -3998,24 +4876,10 @@ def render_cycling_analysis_page() -> None:
                     disabled=(not show_legend or legend_position != "Top"),
                 )
 
-            with control_tab_3:
-                st.checkbox("Auto X-axis range", key="cycling_auto_x_range")
-                auto_x_range = bool(st.session_state.get("cycling_auto_x_range", True))
-                x1, x2 = st.columns(2)
-                with x1:
-                    st.number_input("X min", step=10.0, key="cycling_x_min", disabled=auto_x_range)
-                with x2:
-                    st.number_input("X max", step=10.0, key="cycling_x_max", disabled=auto_x_range)
+            if cycling_style_section == "Axes":
+                render_capacity_axis_editor(cycling_axis_id, cycling_axis_label, cycling_axis_ids, current_style_values())
 
-                y1, y2 = st.columns(2)
-                with y1:
-                    st.number_input("Cap. Y min", step=1.0, key="cycling_cap_y_min")
-                    st.number_input("CE Y min", step=0.5, key="cycling_ce_y_min")
-                with y2:
-                    st.number_input("Cap. Y max", step=1.0, key="cycling_cap_y_max")
-                    st.number_input("CE Y max", step=0.5, key="cycling_ce_y_max")
-
-            with control_tab_4:
+            if cycling_style_section == "Style":
                 st.selectbox(
                     "Default color palette",
                     ["Set2 + Dark2 + tab20", "Set2", "Dark2", "tab10", "tab20", "tab20 + tab20b"],
@@ -4050,6 +4914,12 @@ def render_cycling_analysis_page() -> None:
                 on_click=save_cycling_style_and_go_final,
                 args=(selected_samples, sample_names),
             )
+            remember_style_state("cycling", cycling_style_keys)
+            style_snapshot = style_with_latest_legend_overrides(current_style_values(), "cycling")
+            persist_registered_plot_axis_widgets("cycling")
+            style_snapshot["axis_overrides"] = plot_axis_overrides_from_style("cycling")
+            style_snapshot["sample_colors"] = current_sample_colors(style_snapshot)
+            st.session_state["cycling_saved_style"] = style_snapshot
 
         with style_preview_col:
             st.markdown("### Live style preview")
@@ -4107,55 +4977,70 @@ def render_cycling_analysis_page() -> None:
             elif preview_df is None:
                 st.warning("No valid cycling data found for this preview.")
             else:
+                highlighted_layer = (
+                    st.session_state.get("cycling_highlight_layer_raw")
+                    if cycling_style_section == "Legend"
+                    else None
+                )
+                label_overrides = collect_legend_label_overrides("cycling")
+                layers = []
+                if cycling_style_section == "Legend":
+                    layers = capacity_legend_layers(preview_df, plot_mode, sample_colors, sample_colors.get(preview_sample, "#4E79A7"))
+                style["legend_label_overrides"] = label_overrides
+                plot_style = style_with_plot_axis_overrides("cycling", style, cycling_axis_id)
                 if is_cycling_compare_mode(plot_mode):
                     preview_fig = make_capacity_sample_comparison_figure(
                         plot_df=preview_df,
                         repeat_name="Selected sample comparison",
                         sample_colors=sample_colors,
-                        plot_title=str(style["plot_title"]),
-                        x_label=str(style["x_label"]),
-                        cap_y_label=str(style["cap_y_label"]),
-                        ce_y_label=str(style["ce_y_label"]),
-                        legend_title=str(style["legend_title"]),
-                        show_legend=bool(style["show_legend"]),
-                        legend_position=str(style["legend_position"]),
-                        legend_label_max_len=int(style["legend_label_max_len"]),
-                        legend_columns=int(style["legend_columns"]),
-                        auto_x_range=bool(style["auto_x_range"]),
-                        x_min=float(style["x_min"]),
-                        x_max=float(style["x_max"]),
-                        cap_y_min=float(style["cap_y_min"]),
-                        cap_y_max=float(style["cap_y_max"]),
-                        ce_y_min=float(style["ce_y_min"]),
-                        ce_y_max=float(style["ce_y_max"]),
-                        marker_size=int(style["marker_size"]),
-                        fig_width=float(style["fig_width"]),
-                        fig_height=float(style["fig_height"]),
+                        plot_title=str(plot_style["plot_title"]),
+                        x_label=str(plot_style["x_label"]),
+                        cap_y_label=str(plot_style["cap_y_label"]),
+                        ce_y_label=str(plot_style["ce_y_label"]),
+                        legend_title=str(plot_style["legend_title"]),
+                        show_legend=bool(plot_style["show_legend"]),
+                        legend_position=str(plot_style["legend_position"]),
+                        legend_label_max_len=int(plot_style["legend_label_max_len"]),
+                        legend_columns=int(plot_style["legend_columns"]),
+                        auto_x_range=bool(plot_style["auto_x_range"]),
+                        x_min=float(plot_style["x_min"]),
+                        x_max=float(plot_style["x_max"]),
+                        cap_y_min=float(plot_style["cap_y_min"]),
+                        cap_y_max=float(plot_style["cap_y_max"]),
+                        ce_y_min=float(plot_style["ce_y_min"]),
+                        ce_y_max=float(plot_style["ce_y_max"]),
+                        marker_size=int(plot_style["marker_size"]),
+                        fig_width=float(plot_style["fig_width"]),
+                        fig_height=float(plot_style["fig_height"]),
+                        **capacity_custom_figure_options(plot_style),
+                        highlight_label_raw=highlighted_layer,
                     )
                 else:
                     preview_fig = make_capacity_figure(
                         plot_df=preview_df,
                         sample_name=preview_sample,
                         color_hex=sample_colors[preview_sample],
-                        plot_title=str(style["plot_title"]),
-                        x_label=str(style["x_label"]),
-                        cap_y_label=str(style["cap_y_label"]),
-                        ce_y_label=str(style["ce_y_label"]),
-                        legend_title=str(style["legend_title"]),
-                        show_legend=bool(style["show_legend"]),
-                        legend_position=str(style["legend_position"]),
-                        legend_label_max_len=int(style["legend_label_max_len"]),
-                        legend_columns=int(style["legend_columns"]),
-                        auto_x_range=bool(style["auto_x_range"]),
-                        x_min=float(style["x_min"]),
-                        x_max=float(style["x_max"]),
-                        cap_y_min=float(style["cap_y_min"]),
-                        cap_y_max=float(style["cap_y_max"]),
-                        ce_y_min=float(style["ce_y_min"]),
-                        ce_y_max=float(style["ce_y_max"]),
-                        marker_size=int(style["marker_size"]),
-                        fig_width=float(style["fig_width"]),
-                        fig_height=float(style["fig_height"]),
+                        plot_title=str(plot_style["plot_title"]),
+                        x_label=str(plot_style["x_label"]),
+                        cap_y_label=str(plot_style["cap_y_label"]),
+                        ce_y_label=str(plot_style["ce_y_label"]),
+                        legend_title=str(plot_style["legend_title"]),
+                        show_legend=bool(plot_style["show_legend"]),
+                        legend_position=str(plot_style["legend_position"]),
+                        legend_label_max_len=int(plot_style["legend_label_max_len"]),
+                        legend_columns=int(plot_style["legend_columns"]),
+                        auto_x_range=bool(plot_style["auto_x_range"]),
+                        x_min=float(plot_style["x_min"]),
+                        x_max=float(plot_style["x_max"]),
+                        cap_y_min=float(plot_style["cap_y_min"]),
+                        cap_y_max=float(plot_style["cap_y_max"]),
+                        ce_y_min=float(plot_style["ce_y_min"]),
+                        ce_y_max=float(plot_style["ce_y_max"]),
+                        marker_size=int(plot_style["marker_size"]),
+                        fig_width=float(plot_style["fig_width"]),
+                        fig_height=float(plot_style["fig_height"]),
+                        **capacity_custom_figure_options(plot_style),
+                        highlight_label_raw=highlighted_layer,
                     )
                 st.pyplot(preview_fig, clear_figure=True)
                 plt.close(preview_fig)
@@ -4164,13 +5049,19 @@ def render_cycling_analysis_page() -> None:
                 c1.metric("Preview files", preview_df["relative_path"].nunique() if "relative_path" in preview_df else preview_df["source_file"].nunique())
                 c2.metric("Preview points", len(preview_df))
                 c3.metric("Max cycle", _fmt_num(preview_df["cycle_index"].max()))
+                if cycling_style_section == "Legend":
+                    label_overrides, _highlighted_layer = render_legend_layer_editor("cycling", layers)
         return
 
     # Final output step
     st.markdown("### Final output")
     st.caption("Generating, saving, previewing, and packaging the selected sample plots. Output figures are shown two per row for compact review.")
 
-    style = current_style_values()
+    saved_cycling_style = st.session_state.get("cycling_saved_style")
+    style_source = dict(saved_cycling_style) if isinstance(saved_cycling_style, dict) else current_style_values()
+    style = style_with_latest_legend_overrides(style_source, "cycling")
+    persist_registered_plot_axis_widgets("cycling")
+    style["axis_overrides"] = plot_axis_overrides_from_style("cycling", style)
     sample_colors = current_sample_colors(style)
     selected_paths_by_sample = {sample: selected_paths_for_output(sample) for sample in selected_samples}
     final_signature = hashlib.sha1(
@@ -4192,7 +5083,7 @@ def render_cycling_analysis_page() -> None:
                 "top_n_value": top_n_value,
                 "style": style,
                 "sample_colors": sample_colors,
-                "implementation": "cycling_compare_all_bulk_v2",
+                "implementation": "cycling_per_plot_axis_final_v8",
             }
         ).encode("utf-8")
     ).hexdigest()
@@ -4304,21 +5195,22 @@ def render_cycling_analysis_page() -> None:
                 csv_path = output_dir / f"{safe_name}_plot_data.csv"
                 png_path = output_dir / f"{safe_name}_capacity_summary.png"
                 plot_df.to_csv(csv_path, index=False)
-                effective_limits, numeric_plot_df, adjusted_limits = capacity_figure_limits(plot_df, style)
+                plot_style = style_with_plot_axis_overrides("cycling", style, "selected_sample_comparison")
+                effective_limits, numeric_plot_df, adjusted_limits = capacity_figure_limits(plot_df, plot_style)
 
                 figure_kwargs = dict(
                     plot_df=plot_df,
                     repeat_name="Selected sample comparison",
                     sample_colors=sample_colors,
-                    plot_title=str(style["plot_title"]),
-                    x_label=str(style["x_label"]),
-                    cap_y_label=str(style["cap_y_label"]),
-                    ce_y_label=str(style["ce_y_label"]),
-                    legend_title=str(style["legend_title"]),
-                    show_legend=bool(style["show_legend"]),
-                    legend_position=str(style["legend_position"]),
-                    legend_label_max_len=int(style["legend_label_max_len"]),
-                    legend_columns=int(style["legend_columns"]),
+                    plot_title=str(plot_style["plot_title"]),
+                    x_label=str(plot_style["x_label"]),
+                    cap_y_label=str(plot_style["cap_y_label"]),
+                    ce_y_label=str(plot_style["ce_y_label"]),
+                    legend_title=str(plot_style["legend_title"]),
+                    show_legend=bool(plot_style["show_legend"]),
+                    legend_position=str(plot_style["legend_position"]),
+                    legend_label_max_len=int(plot_style["legend_label_max_len"]),
+                    legend_columns=int(plot_style["legend_columns"]),
                     auto_x_range=bool(effective_limits["auto_x_range"]),
                     x_min=float(effective_limits["x_min"]),
                     x_max=float(effective_limits["x_max"]),
@@ -4326,11 +5218,13 @@ def render_cycling_analysis_page() -> None:
                     cap_y_max=float(effective_limits["cap_y_max"]),
                     ce_y_min=float(effective_limits["ce_y_min"]),
                     ce_y_max=float(effective_limits["ce_y_max"]),
-                    marker_size=int(style["marker_size"]),
-                    fig_width=float(style["fig_width"]),
-                    fig_height=float(style["fig_height"]),
+                    marker_size=int(plot_style["marker_size"]),
+                    fig_width=float(plot_style["fig_width"]),
+                    fig_height=float(plot_style["fig_height"]),
+                    **capacity_custom_figure_options(plot_style),
                 )
 
+                figure_kwargs = without_preview_highlight(figure_kwargs)
                 save_fig = make_capacity_sample_comparison_figure(**figure_kwargs)
                 save_fig.canvas.draw()
                 save_fig.savefig(png_path, dpi=int(style["dpi"]), bbox_inches="tight")
@@ -4441,21 +5335,22 @@ def render_cycling_analysis_page() -> None:
             png_path = sample_output_dir / f"{safe_name}_capacity_summary.png"
 
             plot_df.to_csv(csv_path, index=False)
-            effective_limits, numeric_plot_df, adjusted_limits = capacity_figure_limits(plot_df, style)
+            plot_style = style_with_plot_axis_overrides("cycling", style, sample_name)
+            effective_limits, numeric_plot_df, adjusted_limits = capacity_figure_limits(plot_df, plot_style)
 
             figure_kwargs = dict(
                 plot_df=plot_df,
                 sample_name=sample_name,
                 color_hex=sample_colors[sample_name],
-                plot_title=str(style["plot_title"]),
-                x_label=str(style["x_label"]),
-                cap_y_label=str(style["cap_y_label"]),
-                ce_y_label=str(style["ce_y_label"]),
-                legend_title=str(style["legend_title"]),
-                show_legend=bool(style["show_legend"]),
-                legend_position=str(style["legend_position"]),
-                legend_label_max_len=int(style["legend_label_max_len"]),
-                legend_columns=int(style["legend_columns"]),
+                plot_title=str(plot_style["plot_title"]),
+                x_label=str(plot_style["x_label"]),
+                cap_y_label=str(plot_style["cap_y_label"]),
+                ce_y_label=str(plot_style["ce_y_label"]),
+                legend_title=str(plot_style["legend_title"]),
+                show_legend=bool(plot_style["show_legend"]),
+                legend_position=str(plot_style["legend_position"]),
+                legend_label_max_len=int(plot_style["legend_label_max_len"]),
+                legend_columns=int(plot_style["legend_columns"]),
                 auto_x_range=bool(effective_limits["auto_x_range"]),
                 x_min=float(effective_limits["x_min"]),
                 x_max=float(effective_limits["x_max"]),
@@ -4463,13 +5358,15 @@ def render_cycling_analysis_page() -> None:
                 cap_y_max=float(effective_limits["cap_y_max"]),
                 ce_y_min=float(effective_limits["ce_y_min"]),
                 ce_y_max=float(effective_limits["ce_y_max"]),
-                marker_size=int(style["marker_size"]),
-                fig_width=float(style["fig_width"]),
-                fig_height=float(style["fig_height"]),
+                marker_size=int(plot_style["marker_size"]),
+                fig_width=float(plot_style["fig_width"]),
+                fig_height=float(plot_style["fig_height"]),
+                **capacity_custom_figure_options(plot_style),
             )
 
             # Render once to PNG and use the same bytes for preview/download.
             # This avoids Streamlit/Matplotlib figure-clear timing issues.
+            figure_kwargs = without_preview_highlight(figure_kwargs)
             save_fig = make_capacity_figure(**figure_kwargs)
             save_fig.canvas.draw()
             save_fig.savefig(png_path, dpi=int(style["dpi"]), bbox_inches="tight")
@@ -4675,6 +5572,7 @@ def reset_stripping_visual_style_defaults() -> None:
         x_label = "Capacity (mAh)"
 
     defaults = {
+        "stripping_style_section": "Text",
         "stripping_plot_title": "{sample}",
         "stripping_x_label": x_label,
         "stripping_y_label": "Voltage (V)",
@@ -4683,6 +5581,7 @@ def reset_stripping_visual_style_defaults() -> None:
         "stripping_legend_title": "Repeats",
         "stripping_legend_label_max_len": 28,
         "stripping_legend_columns": 3,
+        "stripping_legend_label_overrides": "",
         "stripping_auto_x_range": True,
         "stripping_x_min": -0.5,
         "stripping_x_max": 7.5,
@@ -4690,6 +5589,10 @@ def reset_stripping_visual_style_defaults() -> None:
         "stripping_large_capacity_limit": 7.5,
         "stripping_y_min": -1.0,
         "stripping_y_max": 0.2,
+        "stripping_x_major_step": 0.0,
+        "stripping_x_minor_step": 0.0,
+        "stripping_y_major_step": 0.0,
+        "stripping_y_minor_step": 0.0,
         "stripping_palette_name": "Set2 + Dark2 + tab20",
         "stripping_linewidth": 2.2,
         "stripping_fig_width": 6.0,
@@ -4698,6 +5601,7 @@ def reset_stripping_visual_style_defaults() -> None:
     }
     for key, value in defaults.items():
         st.session_state[key] = value
+    remember_style_state("stripping", list(defaults.keys()))
 
 
 def stripping_style_defaults_signature(selected_samples: list[str]) -> str:
@@ -5108,6 +6012,12 @@ def make_stripping_figure(
     legend_position: str = "Top",
     legend_label_max_len: int = 28,
     legend_columns: int = 3,
+    legend_label_overrides: dict[str, str] | None = None,
+    x_major_step: float | None = None,
+    x_minor_step: float | None = None,
+    y_major_step: float | None = None,
+    y_minor_step: float | None = None,
+    highlight_label_raw: str | None = None,
 ):
     apply_common_plot_style()
     df = clean_stripping_plot_df(plot_df)
@@ -5127,17 +6037,28 @@ def make_stripping_figure(
             label_raw = sample
         else:
             label_raw = repeat if repeat == file_stem else f"{repeat} | {file_stem}"
-        legend_label = shorten_label(label_raw, legend_label_max_len)
+        legend_label = legend_label_from_override(label_raw, legend_label_overrides, legend_label_max_len)
         if is_stripping_compare_mode(plot_mode) and label_raw in seen_labels:
             legend_label = "_nolegend_"
         seen_labels.add(label_raw)
+        is_highlighted = highlight_label_raw is not None and str(label_raw) == str(highlight_label_raw)
+        if is_highlighted:
+            ax.plot(
+                group["Plot x"].to_numpy(float),
+                group["Plot y"].to_numpy(float),
+                color="#ffb000",
+                linewidth=float(linewidth) + 5.0,
+                alpha=0.45,
+                zorder=4,
+            )
         ax.plot(
             group["Plot x"].to_numpy(float),
             group["Plot y"].to_numpy(float),
             color=color,
-            linewidth=float(linewidth),
-            alpha=0.9,
+            linewidth=float(linewidth) * (1.45 if is_highlighted else 1.0),
+            alpha=1.0 if is_highlighted else 0.9,
             label=legend_label,
+            zorder=5 if is_highlighted else 3,
         )
 
     title = plot_title.replace("{sample}", title_name).replace("{repeat}", title_name)
@@ -5149,8 +6070,15 @@ def make_stripping_figure(
     ax.set_ylabel(y_label, fontsize=17, labelpad=8)
     ax.tick_params(axis="both", which="major", direction="in", labelsize=14, length=6, width=1.4, pad=6)
     ax.tick_params(axis="both", which="minor", direction="in", length=3.5, width=1.0)
-    ax.xaxis.set_minor_locator(AutoMinorLocator(2))
-    ax.yaxis.set_minor_locator(AutoMinorLocator(2))
+    apply_axis_tick_spacing(
+        ax,
+        x_major_step=x_major_step,
+        x_minor_step=x_minor_step,
+        y_major_step=y_major_step,
+        y_minor_step=y_minor_step,
+        default_x_minor_subdivisions=2,
+        default_y_minor_subdivisions=2,
+    )
     for spine in ax.spines.values():
         spine.set_linewidth(1.4)
 
@@ -5167,7 +6095,15 @@ def make_stripping_figure(
             fig.legend(handles, labels, loc="center right", bbox_to_anchor=(0.985, 0.53), ncol=1, title=legend_title, fontsize=10, title_fontsize=12, frameon=False)
         else:
             fig.subplots_adjust(left=0.12, right=0.96, bottom=0.15, top=0.90)
-            ax.legend(loc="best", title=legend_title, fontsize=10, title_fontsize=12, frameon=False)
+            ax.legend(
+                loc="lower left",
+                bbox_to_anchor=(0.02, 0.03),
+                title=legend_title,
+                fontsize=10,
+                title_fontsize=12,
+                frameon=False,
+                borderaxespad=0.0,
+            )
     else:
         fig.subplots_adjust(left=0.12, right=0.96, bottom=0.15, top=0.90)
     return fig
@@ -5421,6 +6357,7 @@ def render_stripping_analysis_page() -> None:
                 st.session_state[key] = bool(saved.get(rel, True))
 
     style_defaults = {
+        "stripping_style_section": "Text",
         "stripping_plot_mode": STRIPPING_PLOT_MODE_SINGLE,
         "stripping_compare_repeat": "",
         "stripping_compare_samples": selected_samples,
@@ -5432,6 +6369,7 @@ def render_stripping_analysis_page() -> None:
         "stripping_legend_title": "Repeats",
         "stripping_legend_label_max_len": 28,
         "stripping_legend_columns": 3,
+        "stripping_legend_label_overrides": "",
         "stripping_auto_x_range": True,
         "stripping_x_min": -0.5,
         "stripping_x_max": 7.5,
@@ -5439,14 +6377,23 @@ def render_stripping_analysis_page() -> None:
         "stripping_large_capacity_limit": 7.5,
         "stripping_y_min": -1.0,
         "stripping_y_max": 0.2,
+        "stripping_x_major_step": 0.0,
+        "stripping_x_minor_step": 0.0,
+        "stripping_y_major_step": 0.0,
+        "stripping_y_minor_step": 0.0,
         "stripping_palette_name": "Set2 + Dark2 + tab20",
         "stripping_linewidth": 2.2,
         "stripping_fig_width": 6.0,
         "stripping_fig_height": 4.6,
         "stripping_dpi": 300,
     }
-    for key, value in style_defaults.items():
-        st.session_state.setdefault(key, value)
+    stripping_style_keys = restore_style_state(
+        "stripping",
+        style_defaults,
+        [f"stripping_color_{safe_filename(sample)}" for sample in sample_names],
+    )
+    coerce_style_section("stripping", ["Text", "Legend", "Axes", "Style"])
+    coerce_bool_state("stripping_auto_x_range", True)
     st.session_state["stripping_plot_mode"] = normalize_stripping_plot_mode(
         st.session_state.get("stripping_plot_mode", STRIPPING_PLOT_MODE_SINGLE)
     )
@@ -5466,6 +6413,8 @@ def render_stripping_analysis_page() -> None:
     for key, value in text_style_defaults.items():
         if not str(st.session_state.get(key, "")).strip():
             st.session_state[key] = value
+    coerce_legend_control_defaults("stripping", "Top", "Repeats", 28, 3)
+    remember_style_state("stripping", stripping_style_keys)
 
     if float(st.session_state.get("stripping_x_max", 7.5)) <= float(st.session_state.get("stripping_x_min", -0.5)):
         st.session_state["stripping_x_min"] = -0.5
@@ -5490,6 +6439,7 @@ def render_stripping_analysis_page() -> None:
             "legend_title": st.session_state.get("stripping_legend_title", "Repeats"),
             "legend_label_max_len": int(st.session_state.get("stripping_legend_label_max_len", 28)),
             "legend_columns": int(st.session_state.get("stripping_legend_columns", 3)),
+            "legend_label_overrides": collect_legend_label_overrides("stripping"),
             "auto_x_range": bool(st.session_state.get("stripping_auto_x_range", True)),
             "x_min": float(st.session_state.get("stripping_x_min", -0.5)),
             "x_max": float(st.session_state.get("stripping_x_max", 7.5)),
@@ -5497,6 +6447,10 @@ def render_stripping_analysis_page() -> None:
             "large_capacity_limit": float(st.session_state.get("stripping_large_capacity_limit", 7.5)),
             "y_min": float(st.session_state.get("stripping_y_min", -1.0)),
             "y_max": float(st.session_state.get("stripping_y_max", 0.2)),
+            "x_major_step": float(st.session_state.get("stripping_x_major_step", 0.0)),
+            "x_minor_step": float(st.session_state.get("stripping_x_minor_step", 0.0)),
+            "y_major_step": float(st.session_state.get("stripping_y_major_step", 0.0)),
+            "y_minor_step": float(st.session_state.get("stripping_y_minor_step", 0.0)),
             "palette_name": st.session_state.get("stripping_palette_name", "Set2 + Dark2 + tab20"),
             "linewidth": float(st.session_state.get("stripping_linewidth", 2.2)),
             "fig_width": float(st.session_state.get("stripping_fig_width", 6.0)),
@@ -5507,8 +6461,11 @@ def render_stripping_analysis_page() -> None:
     def current_stripping_colors(style: dict[str, object]) -> dict[str, str]:
         colors = palette_to_hex_colors(str(style["palette_name"]), len(sample_names))
         palette_color_map = {sample: colors[i] for i, sample in enumerate(sample_names)}
+        saved_colors = style.get("sample_colors", {})
+        if not isinstance(saved_colors, dict):
+            saved_colors = {}
         return {
-            sample: st.session_state.get(f"stripping_color_{safe_filename(sample)}", palette_color_map[sample])
+            sample: st.session_state.get(f"stripping_color_{safe_filename(sample)}", saved_colors.get(sample, palette_color_map[sample]))
             for sample in selected_samples
         }
 
@@ -5924,32 +6881,31 @@ def render_stripping_analysis_page() -> None:
                 disabled=not compare_mode_enabled,
                 help="In comparison mode, preview and final output combine all selected files from these samples into one figure.",
             )
+            stripping_axis_id = "selected_sample_comparison" if compare_mode_enabled else preview_sample
+            stripping_axis_label = "Selected sample comparison" if compare_mode_enabled else preview_sample
+            stripping_axis_ids = ["selected_sample_comparison"] if compare_mode_enabled else list(selected_samples)
 
-            tab_text, tab_legend, tab_axes, tab_style = st.tabs(["Text", "Legend", "Axes", "Style"])
-            with tab_text:
+            stripping_style_section = st.radio(
+                "Style controls",
+                ["Text", "Legend", "Axes", "Style"],
+                horizontal=True,
+                key="stripping_style_section",
+                label_visibility="collapsed",
+            )
+            if stripping_style_section == "Text":
                 st.text_input("Plot title", key="stripping_plot_title", help='Use "{sample}" or "{repeat}".')
                 st.text_input("X-axis label", key="stripping_x_label")
                 st.text_input("Y-axis label", key="stripping_y_label")
-            with tab_legend:
+            if stripping_style_section == "Legend":
                 st.checkbox("Show legend", key="stripping_show_legend")
                 show_legend = bool(st.session_state.get("stripping_show_legend", True))
                 st.selectbox("Legend position", ["Top", "Right", "Inside"], key="stripping_legend_position", disabled=not show_legend)
                 st.text_input("Legend title", key="stripping_legend_title", disabled=not show_legend)
                 st.slider("Label length", min_value=8, max_value=80, key="stripping_legend_label_max_len", disabled=not show_legend)
                 st.slider("Top legend columns", min_value=1, max_value=6, key="stripping_legend_columns", disabled=not show_legend)
-            with tab_axes:
-                st.checkbox("Auto X-axis upper limit", key="stripping_auto_x_range")
-                auto_x = bool(st.session_state.get("stripping_auto_x_range", True))
-                a1, a2 = st.columns(2)
-                with a1:
-                    st.number_input("X min", step=0.1, key="stripping_x_min")
-                    st.number_input("X max", step=0.5, key="stripping_x_max", disabled=auto_x)
-                    st.number_input("Y min", step=0.1, key="stripping_y_min")
-                with a2:
-                    st.number_input("Small capacity limit", step=0.5, key="stripping_small_capacity_limit", disabled=not auto_x)
-                    st.number_input("Large capacity limit", step=0.5, key="stripping_large_capacity_limit", disabled=not auto_x)
-                    st.number_input("Y max", step=0.1, key="stripping_y_max")
-            with tab_style:
+            if stripping_style_section == "Axes":
+                render_xy_axis_editor("stripping", stripping_axis_id, stripping_axis_label, stripping_axis_ids, current_stripping_style(), include_auto_limits=True)
+            if stripping_style_section == "Style":
                 st.selectbox("Default color palette", ["Set2 + Dark2 + tab20", "Set2", "Dark2", "tab10", "tab20", "tab20 + tab20b"], key="stripping_palette_name")
                 st.slider("Line width", min_value=0.5, max_value=5.0, step=0.1, key="stripping_linewidth")
                 f1, f2 = st.columns(2)
@@ -5964,13 +6920,28 @@ def render_stripping_analysis_page() -> None:
                 with st.expander("Sample colors", expanded=False):
                     for i, sample in enumerate(selected_samples, start=1):
                         st.color_picker(compact_widget_label("Color", i, sample, max_len=18), value=st.session_state.get(f"stripping_color_{safe_filename(sample)}", palette_color_map[sample]), key=f"stripping_color_{safe_filename(sample)}")
+
+            def save_stripping_style_and_go_final() -> None:
+                remember_style_state("stripping", stripping_style_keys)
+                persist_registered_plot_axis_widgets("stripping")
+                style_snapshot = style_with_latest_legend_overrides(current_stripping_style(), "stripping")
+                style_snapshot["axis_overrides"] = plot_axis_overrides_from_style("stripping")
+                style_snapshot["sample_colors"] = current_stripping_colors(style_snapshot)
+                st.session_state["stripping_saved_style"] = style_snapshot
+                st.session_state["stripping_workflow_step"] = "3. Final output"
+
             st.button(
                 "Generate final outputs",
                 type="primary",
                 use_container_width=True,
-                on_click=set_stripping_workflow_step,
-                args=("3. Final output",),
+                on_click=save_stripping_style_and_go_final,
             )
+            remember_style_state("stripping", stripping_style_keys)
+            style_snapshot = style_with_latest_legend_overrides(current_stripping_style(), "stripping")
+            persist_registered_plot_axis_widgets("stripping")
+            style_snapshot["axis_overrides"] = plot_axis_overrides_from_style("stripping")
+            style_snapshot["sample_colors"] = current_stripping_colors(style_snapshot)
+            st.session_state["stripping_saved_style"] = style_snapshot
 
         with style_preview_col:
             st.markdown("### Live style preview")
@@ -5991,37 +6962,56 @@ def render_stripping_analysis_page() -> None:
             if preview_plot_df is None:
                 st.warning("No valid stripping data found for this preview.")
             else:
-                effective_limits, _numeric_df, adjusted = stripping_figure_limits(preview_plot_df, style)
+                highlighted_layer = (
+                    st.session_state.get("stripping_highlight_layer_raw")
+                    if stripping_style_section == "Legend"
+                    else None
+                )
+                label_overrides = collect_legend_label_overrides("stripping")
+                layers = []
+                if stripping_style_section == "Legend":
+                    layers = stripping_legend_layers(preview_plot_df, str(style["plot_mode"]), sample_colors)
+                style["legend_label_overrides"] = label_overrides
+                plot_style = style_with_plot_axis_overrides("stripping", style, stripping_axis_id)
+                effective_limits, _numeric_df, adjusted = stripping_figure_limits(preview_plot_df, plot_style)
                 fig = make_stripping_figure(
                     plot_df=preview_plot_df,
                     title_name=title_name,
                     sample_colors=sample_colors,
-                    plot_mode=str(style["plot_mode"]),
-                    plot_title=str(style["plot_title"]),
-                    x_label=str(style["x_label"]),
-                    y_label=str(style["y_label"]),
-                    legend_title=str(style["legend_title"]),
-                    show_legend=bool(style["show_legend"]),
+                    plot_mode=str(plot_style["plot_mode"]),
+                    plot_title=str(plot_style["plot_title"]),
+                    x_label=str(plot_style["x_label"]),
+                    y_label=str(plot_style["y_label"]),
+                    legend_title=str(plot_style["legend_title"]),
+                    show_legend=bool(plot_style["show_legend"]),
                     x_min=float(effective_limits["x_min"]),
                     x_max=float(effective_limits["x_max"]),
                     y_min=float(effective_limits["y_min"]),
                     y_max=float(effective_limits["y_max"]),
-                    linewidth=float(style["linewidth"]),
-                    fig_width=float(style["fig_width"]),
-                    fig_height=float(style["fig_height"]),
-                    legend_position=str(style["legend_position"]),
-                    legend_label_max_len=int(style["legend_label_max_len"]),
-                    legend_columns=int(style["legend_columns"]),
+                    linewidth=float(plot_style["linewidth"]),
+                    fig_width=float(plot_style["fig_width"]),
+                    fig_height=float(plot_style["fig_height"]),
+                    legend_position=str(plot_style["legend_position"]),
+                    legend_label_max_len=int(plot_style["legend_label_max_len"]),
+                    legend_columns=int(plot_style["legend_columns"]),
+                    **xy_custom_figure_options(plot_style),
+                    highlight_label_raw=highlighted_layer,
                 )
                 st.pyplot(fig, clear_figure=True)
                 plt.close(fig)
                 if adjusted:
                     st.caption("Axis range was expanded to keep data visible.")
                 st.dataframe(preview_summary, use_container_width=True, hide_index=True)
+                if stripping_style_section == "Legend":
+                    label_overrides, _highlighted_layer = render_legend_layer_editor("stripping", layers)
         return
 
     st.markdown("### Final output")
-    style = current_stripping_style()
+    saved_stripping_style = st.session_state.get("stripping_saved_style")
+    style_source = dict(saved_stripping_style) if isinstance(saved_stripping_style, dict) else current_stripping_style()
+    style = style_with_latest_legend_overrides(style_source, "stripping")
+    persist_registered_plot_axis_widgets("stripping")
+    style["axis_overrides"] = plot_axis_overrides_from_style("stripping", style)
     sample_colors = current_stripping_colors(style)
     signature = hashlib.sha1(
         repr(
@@ -6037,7 +7027,7 @@ def render_stripping_analysis_page() -> None:
                 "settings": [area, operator, normalization, step_type, valley_window, short_capacity_threshold],
                 "style": style,
                 "colors": sample_colors,
-                "implementation": "stripping_compare_bulk_v2",
+                "implementation": "stripping_per_plot_axis_final_v8",
             }
         ).encode("utf-8")
     ).hexdigest()
@@ -6101,28 +7091,32 @@ def render_stripping_analysis_page() -> None:
             summary_path = data_dir / f"{safe_name}_summary.csv"
             plot_df.to_csv(csv_path, index=False)
             summary_df.to_csv(summary_path, index=False)
-            effective_limits, numeric_df, adjusted = stripping_figure_limits(plot_df, style)
+            axis_id = "selected_sample_comparison" if title == "Selected sample comparison" else title
+            plot_style = style_with_plot_axis_overrides("stripping", style, axis_id)
+            effective_limits, numeric_df, adjusted = stripping_figure_limits(plot_df, plot_style)
             figure_kwargs = dict(
                 plot_df=plot_df,
                 title_name=title_name,
                 sample_colors=sample_colors,
-                plot_mode=str(style["plot_mode"]),
-                plot_title=str(style["plot_title"]),
-                x_label=str(style["x_label"]),
-                y_label=str(style["y_label"]),
-                legend_title=str(style["legend_title"]),
-                show_legend=bool(style["show_legend"]),
+                plot_mode=str(plot_style["plot_mode"]),
+                plot_title=str(plot_style["plot_title"]),
+                x_label=str(plot_style["x_label"]),
+                y_label=str(plot_style["y_label"]),
+                legend_title=str(plot_style["legend_title"]),
+                show_legend=bool(plot_style["show_legend"]),
                 x_min=float(effective_limits["x_min"]),
                 x_max=float(effective_limits["x_max"]),
                 y_min=float(effective_limits["y_min"]),
                 y_max=float(effective_limits["y_max"]),
-                linewidth=float(style["linewidth"]),
-                fig_width=float(style["fig_width"]),
-                fig_height=float(style["fig_height"]),
-                legend_position=str(style["legend_position"]),
-                legend_label_max_len=int(style["legend_label_max_len"]),
-                legend_columns=int(style["legend_columns"]),
+                linewidth=float(plot_style["linewidth"]),
+                fig_width=float(plot_style["fig_width"]),
+                fig_height=float(plot_style["fig_height"]),
+                legend_position=str(plot_style["legend_position"]),
+                legend_label_max_len=int(plot_style["legend_label_max_len"]),
+                legend_columns=int(plot_style["legend_columns"]),
+                **xy_custom_figure_options(plot_style),
             )
+            figure_kwargs = without_preview_highlight(figure_kwargs)
             fig = make_stripping_figure(**figure_kwargs)
             fig.canvas.draw()
             fig.savefig(png_path, dpi=int(style["dpi"]), bbox_inches="tight")
@@ -6294,6 +7288,7 @@ def save_all_dqdv_selections_and_go_style(
 
 def reset_dqdv_visual_style_defaults() -> None:
     defaults = {
+        "dqdv_style_section": "Text",
         "dqdv_plot_title": "{sample} - {repeat}",
         "dqdv_x_label": "Capacity (mAh cm$^{-2}$)",
         "dqdv_y_label": "Voltage (V)",
@@ -6302,11 +7297,16 @@ def reset_dqdv_visual_style_defaults() -> None:
         "dqdv_legend_title": "Cycle Index",
         "dqdv_legend_label_max_len": 28,
         "dqdv_legend_columns": 4,
+        "dqdv_legend_label_overrides": "",
         "dqdv_auto_x_range": True,
         "dqdv_x_min": -0.25,
         "dqdv_x_max": 5.0,
         "dqdv_y_min": 2.5,
         "dqdv_y_max": 4.5,
+        "dqdv_x_major_step": 0.0,
+        "dqdv_x_minor_step": 0.0,
+        "dqdv_y_major_step": 0.0,
+        "dqdv_y_minor_step": 0.0,
         "dqdv_palette_name": "Set2 + Dark2 + tab20",
         "dqdv_linewidth": 2.1,
         "dqdv_fig_width": 8.2,
@@ -6315,6 +7315,7 @@ def reset_dqdv_visual_style_defaults() -> None:
     }
     for key, value in defaults.items():
         st.session_state[key] = value
+    remember_style_state("dqdv", list(defaults.keys()))
 
 
 def dqdv_style_defaults_signature(selected_samples: list[str]) -> str:
@@ -6620,6 +7621,12 @@ def make_dqdv_figure(
     legend_position: str = "Inside",
     legend_label_max_len: int = 28,
     legend_columns: int = 4,
+    legend_label_overrides: dict[str, str] | None = None,
+    x_major_step: float | None = None,
+    x_minor_step: float | None = None,
+    y_major_step: float | None = None,
+    y_minor_step: float | None = None,
+    highlight_label_raw: str | None = None,
 ):
     apply_common_plot_style()
     df = clean_dqdv_plot_df(plot_df)
@@ -6638,16 +7645,33 @@ def make_dqdv_figure(
         for (_, cycle, step_type), group in df.groupby(["source_file", "cycle_index", "step_type"], sort=True):
             group = group.sort_values("point_index")
             cycle_int = int(cycle)
-            label = shorten_label(str(cycle_int), legend_label_max_len) if cycle_int not in seen_cycles else "_nolegend_"
+            cycle_raw = str(cycle_int)
+            label = (
+                legend_label_from_override(cycle_raw, legend_label_overrides, legend_label_max_len)
+                if cycle_int not in seen_cycles
+                else "_nolegend_"
+            )
             seen_cycles.add(cycle_int)
+            is_highlighted = highlight_label_raw is not None and cycle_raw == str(highlight_label_raw)
+            if is_highlighted:
+                ax.plot(
+                    group["areal_capacity_mAh_cm2"].to_numpy(float),
+                    group["voltage_V"].to_numpy(float),
+                    color="#ffb000",
+                    linestyle="-",
+                    linewidth=float(linewidth) + 5.0,
+                    alpha=0.45,
+                    zorder=4,
+                )
             ax.plot(
                 group["areal_capacity_mAh_cm2"].to_numpy(float),
                 group["voltage_V"].to_numpy(float),
                 color=cycle_colors.get(cycle_int, base_color),
                 linestyle="-",
-                linewidth=float(linewidth),
-                alpha=0.92,
+                linewidth=float(linewidth) * (1.45 if is_highlighted else 1.0),
+                alpha=1.0 if is_highlighted else 0.92,
                 label=label,
+                zorder=5 if is_highlighted else 3,
             )
 
     title = (
@@ -6663,6 +7687,15 @@ def make_dqdv_figure(
     ax.set_xlim(float(x_min), float(x_max))
     ax.set_ylim(float(y_min), float(y_max))
     dqdv.apply_axis_style(ax)
+    apply_axis_tick_spacing(
+        ax,
+        x_major_step=x_major_step,
+        x_minor_step=x_minor_step,
+        y_major_step=y_major_step,
+        y_minor_step=y_minor_step,
+        default_x_minor_subdivisions=5,
+        default_y_minor_subdivisions=4,
+    )
 
     legend_position = legend_position if show_legend else "Hide"
     handles, labels = ax.get_legend_handles_labels()
@@ -6692,7 +7725,15 @@ def make_dqdv_figure(
         fig.legend(handles, labels, loc="center right", bbox_to_anchor=(0.985, 0.53), ncol=1, title=legend_title, frameon=False)
     elif legend_position == "Inside" and labels:
         fig.subplots_adjust(left=0.13, right=0.96, bottom=0.13, top=0.90)
-        ax.legend(handles, labels, loc="best", title=legend_title, frameon=False)
+        ax.legend(
+            handles,
+            labels,
+            loc="lower left",
+            bbox_to_anchor=(0.02, 0.03),
+            title=legend_title,
+            frameon=False,
+            borderaxespad=0.0,
+        )
     else:
         fig.subplots_adjust(left=0.13, right=0.96, bottom=0.13, top=0.90)
     return fig
@@ -6898,6 +7939,7 @@ def render_dqdv_analysis_page() -> None:
                 st.session_state[key] = bool(saved.get(rel, True))
 
     style_defaults = {
+        "dqdv_style_section": "Text",
         "dqdv_plot_title": "{sample} - {repeat}",
         "dqdv_x_label": "Capacity (mAh cm$^{-2}$)",
         "dqdv_y_label": "Voltage (V)",
@@ -6906,19 +7948,31 @@ def render_dqdv_analysis_page() -> None:
         "dqdv_legend_title": "Cycle Index",
         "dqdv_legend_label_max_len": 28,
         "dqdv_legend_columns": 4,
+        "dqdv_legend_label_overrides": "",
         "dqdv_auto_x_range": True,
         "dqdv_x_min": -0.25,
         "dqdv_x_max": 5.0,
         "dqdv_y_min": 2.5,
         "dqdv_y_max": 4.5,
+        "dqdv_x_major_step": 0.0,
+        "dqdv_x_minor_step": 0.0,
+        "dqdv_y_major_step": 0.0,
+        "dqdv_y_minor_step": 0.0,
         "dqdv_palette_name": "Set2 + Dark2 + tab20",
         "dqdv_linewidth": 2.1,
         "dqdv_fig_width": 8.2,
         "dqdv_fig_height": 6.2,
         "dqdv_dpi": 300,
     }
-    for key, value in style_defaults.items():
-        st.session_state.setdefault(key, value)
+    dqdv_style_keys = restore_style_state(
+        "dqdv",
+        style_defaults,
+        [f"dqdv_color_{safe_filename(sample)}" for sample in sample_names],
+    )
+    coerce_style_section("dqdv", ["Text", "Legend", "Axes", "Style"])
+    coerce_bool_state("dqdv_auto_x_range", True)
+    coerce_legend_control_defaults("dqdv", "Inside", "Cycle Index", 28, 4, max_columns=8)
+    remember_style_state("dqdv", dqdv_style_keys)
     if float(st.session_state.get("dqdv_x_max", 5.0)) <= float(st.session_state.get("dqdv_x_min", -0.25)):
         st.session_state["dqdv_x_min"] = -0.25
         st.session_state["dqdv_x_max"] = 5.0
@@ -6936,11 +7990,16 @@ def render_dqdv_analysis_page() -> None:
             "legend_title": st.session_state.get("dqdv_legend_title", "Cycle Index"),
             "legend_label_max_len": int(st.session_state.get("dqdv_legend_label_max_len", 28)),
             "legend_columns": int(st.session_state.get("dqdv_legend_columns", 4)),
+            "legend_label_overrides": collect_legend_label_overrides("dqdv"),
             "auto_x_range": bool(st.session_state.get("dqdv_auto_x_range", True)),
             "x_min": float(st.session_state.get("dqdv_x_min", -0.25)),
             "x_max": float(st.session_state.get("dqdv_x_max", 5.0)),
             "y_min": float(st.session_state.get("dqdv_y_min", 2.5)),
             "y_max": float(st.session_state.get("dqdv_y_max", 4.5)),
+            "x_major_step": float(st.session_state.get("dqdv_x_major_step", 0.0)),
+            "x_minor_step": float(st.session_state.get("dqdv_x_minor_step", 0.0)),
+            "y_major_step": float(st.session_state.get("dqdv_y_major_step", 0.0)),
+            "y_minor_step": float(st.session_state.get("dqdv_y_minor_step", 0.0)),
             "palette_name": st.session_state.get("dqdv_palette_name", "Set2 + Dark2 + tab20"),
             "linewidth": float(st.session_state.get("dqdv_linewidth", 2.1)),
             "fig_width": float(st.session_state.get("dqdv_fig_width", 8.2)),
@@ -6951,8 +8010,11 @@ def render_dqdv_analysis_page() -> None:
     def current_dqdv_colors(style: dict[str, object]) -> dict[str, str]:
         colors = palette_to_hex_colors(str(style["palette_name"]), len(sample_names))
         palette_color_map = {sample: colors[i] for i, sample in enumerate(sample_names)}
+        saved_colors = style.get("sample_colors", {})
+        if not isinstance(saved_colors, dict):
+            saved_colors = {}
         return {
-            sample: st.session_state.get(f"dqdv_color_{safe_filename(sample)}", palette_color_map[sample])
+            sample: st.session_state.get(f"dqdv_color_{safe_filename(sample)}", saved_colors.get(sample, palette_color_map[sample]))
             for sample in selected_samples
         }
 
@@ -7215,30 +8277,35 @@ def render_dqdv_analysis_page() -> None:
                 str(record["relative_path"]) for record in preview_records_for_sample
             ]
             preview_rel = st.selectbox("Preview file/repeat", options=preview_options, key="dqdv_preview_relative_path") if preview_options else None
+            dqdv_axis_id = str(preview_rel or "preview")
+            dqdv_axis_label = shorten_label(dqdv_axis_id, 48)
+            dqdv_axis_ids = [
+                str(record["relative_path"])
+                for sample in selected_samples
+                for record in selected_dqdv_records(sample)
+            ] or ([dqdv_axis_id] if dqdv_axis_id else [])
 
-            tab_text, tab_legend, tab_axes, tab_style = st.tabs(["Text", "Legend", "Axes", "Style"])
-            with tab_text:
+            dqdv_style_section = st.radio(
+                "Style controls",
+                ["Text", "Legend", "Axes", "Style"],
+                horizontal=True,
+                key="dqdv_style_section",
+                label_visibility="collapsed",
+            )
+            if dqdv_style_section == "Text":
                 st.text_input("Plot title", key="dqdv_plot_title", help='Use "{sample}", "{repeat}", or "{file}".')
                 st.text_input("X-axis label", key="dqdv_x_label")
                 st.text_input("Y-axis label", key="dqdv_y_label")
-            with tab_legend:
+            if dqdv_style_section == "Legend":
                 st.checkbox("Show legend", key="dqdv_show_legend")
                 show_legend = bool(st.session_state.get("dqdv_show_legend", True))
                 st.selectbox("Legend position", ["Top", "Right", "Inside"], key="dqdv_legend_position", disabled=not show_legend)
                 st.text_input("Legend title", key="dqdv_legend_title", disabled=not show_legend)
                 st.slider("Label length", min_value=8, max_value=80, key="dqdv_legend_label_max_len", disabled=not show_legend)
                 st.slider("Top legend columns", min_value=1, max_value=8, key="dqdv_legend_columns", disabled=not show_legend)
-            with tab_axes:
-                st.checkbox("Auto X-axis upper limit", key="dqdv_auto_x_range")
-                auto_x = bool(st.session_state.get("dqdv_auto_x_range", True))
-                a1, a2 = st.columns(2)
-                with a1:
-                    st.number_input("X min", step=0.1, key="dqdv_x_min", disabled=auto_x)
-                    st.number_input("Y min", step=0.1, key="dqdv_y_min")
-                with a2:
-                    st.number_input("X max", step=0.5, key="dqdv_x_max", disabled=auto_x)
-                    st.number_input("Y max", step=0.1, key="dqdv_y_max")
-            with tab_style:
+            if dqdv_style_section == "Axes":
+                render_xy_axis_editor("dqdv", dqdv_axis_id, dqdv_axis_label, dqdv_axis_ids, current_dqdv_style(), include_auto_limits=False)
+            if dqdv_style_section == "Style":
                 st.selectbox("Default color palette", ["Set2 + Dark2 + tab20", "Set2", "Dark2", "tab10", "tab20", "tab20 + tab20b"], key="dqdv_palette_name")
                 st.slider("Line width", min_value=0.5, max_value=5.0, step=0.1, key="dqdv_linewidth")
                 f1, f2 = st.columns(2)
@@ -7253,7 +8320,23 @@ def render_dqdv_analysis_page() -> None:
                 with st.expander("Sample colors", expanded=False):
                     for i, sample in enumerate(selected_samples, start=1):
                         st.color_picker(compact_widget_label("Color", i, sample, max_len=18), value=st.session_state.get(f"dqdv_color_{safe_filename(sample)}", palette_color_map[sample]), key=f"dqdv_color_{safe_filename(sample)}")
-            st.button("Generate final outputs", type="primary", use_container_width=True, on_click=set_dqdv_workflow_step, args=("3. Final output",))
+
+            def save_dqdv_style_and_go_final() -> None:
+                remember_style_state("dqdv", dqdv_style_keys)
+                persist_registered_plot_axis_widgets("dqdv")
+                style_snapshot = style_with_latest_legend_overrides(current_dqdv_style(), "dqdv")
+                style_snapshot["axis_overrides"] = plot_axis_overrides_from_style("dqdv")
+                style_snapshot["sample_colors"] = current_dqdv_colors(style_snapshot)
+                st.session_state["dqdv_saved_style"] = style_snapshot
+                st.session_state["dqdv_workflow_step"] = "3. Final output"
+
+            st.button("Generate final outputs", type="primary", use_container_width=True, on_click=save_dqdv_style_and_go_final)
+            remember_style_state("dqdv", dqdv_style_keys)
+            style_snapshot = style_with_latest_legend_overrides(current_dqdv_style(), "dqdv")
+            persist_registered_plot_axis_widgets("dqdv")
+            style_snapshot["axis_overrides"] = plot_axis_overrides_from_style("dqdv")
+            style_snapshot["sample_colors"] = current_dqdv_colors(style_snapshot)
+            st.session_state["dqdv_saved_style"] = style_snapshot
 
         with style_preview_col:
             st.markdown("### Live style preview")
@@ -7268,28 +8351,42 @@ def render_dqdv_analysis_page() -> None:
                     st.warning("No valid dQ/dV data found for this preview.")
                     st.dataframe(preview_summary, use_container_width=True, hide_index=True)
                 else:
-                    effective_limits, _numeric_df, adjusted = dqdv_figure_limits(preview_plot_df, style)
+                    preview_color = sample_colors.get(str(preview_record["sample"]), "#4E79A7")
+                    highlighted_layer = (
+                        st.session_state.get("dqdv_highlight_layer_raw")
+                        if dqdv_style_section == "Legend"
+                        else None
+                    )
+                    label_overrides = collect_legend_label_overrides("dqdv")
+                    layers = []
+                    if dqdv_style_section == "Legend":
+                        layers = dqdv_legend_layers(preview_plot_df, preview_color)
+                    style["legend_label_overrides"] = label_overrides
+                    plot_style = style_with_plot_axis_overrides("dqdv", style, dqdv_axis_id)
+                    effective_limits, _numeric_df, adjusted = dqdv_figure_limits(preview_plot_df, plot_style)
                     fig = make_dqdv_figure(
                         plot_df=preview_plot_df,
                         sample_name=str(preview_record["sample"]),
                         repeat_name=str(preview_record["repeat"]),
                         source_file=str(preview_record["source_file"]),
-                        color_hex=sample_colors.get(str(preview_record["sample"]), "#4E79A7"),
-                        plot_title=str(style["plot_title"]),
-                        x_label=str(style["x_label"]),
-                        y_label=str(style["y_label"]),
-                        legend_title=str(style["legend_title"]),
-                        show_legend=bool(style["show_legend"]),
+                        color_hex=preview_color,
+                        plot_title=str(plot_style["plot_title"]),
+                        x_label=str(plot_style["x_label"]),
+                        y_label=str(plot_style["y_label"]),
+                        legend_title=str(plot_style["legend_title"]),
+                        show_legend=bool(plot_style["show_legend"]),
                         x_min=float(effective_limits["x_min"]),
                         x_max=float(effective_limits["x_max"]),
                         y_min=float(effective_limits["y_min"]),
                         y_max=float(effective_limits["y_max"]),
-                        linewidth=float(style["linewidth"]),
-                        fig_width=float(style["fig_width"]),
-                        fig_height=float(style["fig_height"]),
-                        legend_position=str(style["legend_position"]),
-                        legend_label_max_len=int(style["legend_label_max_len"]),
-                        legend_columns=int(style["legend_columns"]),
+                        linewidth=float(plot_style["linewidth"]),
+                        fig_width=float(plot_style["fig_width"]),
+                        fig_height=float(plot_style["fig_height"]),
+                        legend_position=str(plot_style["legend_position"]),
+                        legend_label_max_len=int(plot_style["legend_label_max_len"]),
+                        legend_columns=int(plot_style["legend_columns"]),
+                        **xy_custom_figure_options(plot_style),
+                        highlight_label_raw=highlighted_layer,
                     )
                     st.pyplot(fig, clear_figure=True)
                     plt.close(fig)
@@ -7299,10 +8396,16 @@ def render_dqdv_analysis_page() -> None:
                     if not preview_cycles.empty:
                         with st.expander("Cycle summary", expanded=False):
                             st.dataframe(preview_cycles, use_container_width=True, hide_index=True)
+                    if dqdv_style_section == "Legend":
+                        label_overrides, _highlighted_layer = render_legend_layer_editor("dqdv", layers)
         return
 
     st.markdown("### Final output")
-    style = current_dqdv_style()
+    saved_dqdv_style = st.session_state.get("dqdv_saved_style")
+    style_source = dict(saved_dqdv_style) if isinstance(saved_dqdv_style, dict) else current_dqdv_style()
+    style = style_with_latest_legend_overrides(style_source, "dqdv")
+    persist_registered_plot_axis_widgets("dqdv")
+    style["axis_overrides"] = plot_axis_overrides_from_style("dqdv", style)
     sample_colors = current_dqdv_colors(style)
     selected_paths = {s: selected_dqdv_paths_for_sample(s, records_by_sample[s]) for s in selected_samples}
     signature = hashlib.sha1(
@@ -7322,7 +8425,7 @@ def render_dqdv_analysis_page() -> None:
                 "stop_at_retention_cutoff": bool(stop_at_retention_cutoff),
                 "style": style,
                 "colors": sample_colors,
-                "implementation": "dqdv_final_v1",
+                "implementation": "dqdv_per_plot_axis_final_v8",
             }
         ).encode("utf-8")
     ).hexdigest()
@@ -7381,29 +8484,33 @@ def render_dqdv_analysis_page() -> None:
             plot_df.to_csv(csv_path, index=False)
             summary_df.to_csv(summary_path, index=False)
             cycle_summary.to_csv(cycles_path, index=False)
-            effective_limits, numeric_df, adjusted = dqdv_figure_limits(plot_df, style)
+            axis_id = str(record["relative_path"])
+            plot_style = style_with_plot_axis_overrides("dqdv", style, axis_id)
+            effective_limits, numeric_df, adjusted = dqdv_figure_limits(plot_df, plot_style)
             figure_kwargs = dict(
                 plot_df=plot_df,
                 sample_name=str(record["sample"]),
                 repeat_name=str(record["repeat"]),
                 source_file=str(record["source_file"]),
                 color_hex=sample_colors.get(str(record["sample"]), "#4E79A7"),
-                plot_title=str(style["plot_title"]),
-                x_label=str(style["x_label"]),
-                y_label=str(style["y_label"]),
-                legend_title=str(style["legend_title"]),
-                show_legend=bool(style["show_legend"]),
+                plot_title=str(plot_style["plot_title"]),
+                x_label=str(plot_style["x_label"]),
+                y_label=str(plot_style["y_label"]),
+                legend_title=str(plot_style["legend_title"]),
+                show_legend=bool(plot_style["show_legend"]),
                 x_min=float(effective_limits["x_min"]),
                 x_max=float(effective_limits["x_max"]),
                 y_min=float(effective_limits["y_min"]),
                 y_max=float(effective_limits["y_max"]),
-                linewidth=float(style["linewidth"]),
-                fig_width=float(style["fig_width"]),
-                fig_height=float(style["fig_height"]),
-                legend_position=str(style["legend_position"]),
-                legend_label_max_len=int(style["legend_label_max_len"]),
-                legend_columns=int(style["legend_columns"]),
+                linewidth=float(plot_style["linewidth"]),
+                fig_width=float(plot_style["fig_width"]),
+                fig_height=float(plot_style["fig_height"]),
+                legend_position=str(plot_style["legend_position"]),
+                legend_label_max_len=int(plot_style["legend_label_max_len"]),
+                legend_columns=int(plot_style["legend_columns"]),
+                **xy_custom_figure_options(plot_style),
             )
+            figure_kwargs = without_preview_highlight(figure_kwargs)
             fig = make_dqdv_figure(**figure_kwargs)
             fig.canvas.draw()
             fig.savefig(png_path, dpi=int(style["dpi"]), bbox_inches="tight")
