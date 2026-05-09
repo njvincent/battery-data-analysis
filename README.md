@@ -52,7 +52,15 @@ The project uses:
 
 ## Interactive Dashboard
 
-Start the Streamlit app:
+The Streamlit web app is deployed at:
+
+https://battery-data-analysis.streamlit.app/
+
+The web app is convenient for quick access, demos, and small uploaded datasets. It runs on Streamlit Community Cloud, so it can only see files uploaded through the browser or files bundled with the deployed app. Browser upload is not recommended for large raw datasets.
+
+Run the app locally when you need direct access to data folders on your computer, OneDrive, an external drive, or a lab server. Local mode is better for large datasets, recursive folder processing, long batch jobs, and saving outputs next to the source data.
+
+Start the Streamlit app locally:
 
 ```bash
 streamlit run streamlit_app.py
