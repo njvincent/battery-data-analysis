@@ -55,6 +55,23 @@ import dqdv_batch as dqdv
 
 EIS_INPUT_SUFFIXES = {".mpr", ".csv", ".txt"}
 
+APP_DIR = Path(__file__).resolve().parent
+
+
+def legend_layer_editor_component():
+    """Declare and register the local component during an active Streamlit run."""
+    component = components.declare_component(
+        "legend_layer_editor",
+        path=str(APP_DIR / "components" / "legend_layer_editor"),
+    )
+    try:
+        from streamlit.runtime import get_instance
+
+        get_instance().component_registry.register_component(component)
+    except Exception:
+        pass
+    return component
+
 
 # -----------------------------------------------------------------------------
 # Data containers and wrappers around eis_fit.py
@@ -726,16 +743,17 @@ def render_eis_fit_page() -> None:
 
     tab_plot, tab_params, tab_metrics, tab_data = st.tabs(["Preview", "Fit parameters", "Arc/fusion metrics", "Data"])
     with tab_plot:
-        label_overrides = collect_legend_label_overrides("eis")
+        plot_slot = st.container()
+        label_overrides, _highlighted_layer = render_legend_layer_editor("eis", eis_legend_layers(file_bundles))
         highlighted_layer = st.session_state.get("eis_highlight_layer_raw")
         plot_options["legend_label_overrides"] = label_overrides
         plot_options["highlight_label_raw"] = highlighted_layer
-        c1, c2 = st.columns([1.25, 1.0])
-        with c1:
-            st.pyplot(make_nyquist_figure(df, file_bundles, show_low_freq_labels, plot_options=plot_options), clear_figure=True)
-        with c2:
-            st.pyplot(make_low_freq_figure(df, file_bundles, low_freq_cutoff, plot_options=plot_options), clear_figure=True)
-        label_overrides, _highlighted_layer = render_legend_layer_editor("eis", eis_legend_layers(file_bundles))
+        with plot_slot:
+            c1, c2 = st.columns([1.25, 1.0])
+            with c1:
+                st.pyplot(make_nyquist_figure(df, file_bundles, show_low_freq_labels, plot_options=plot_options), clear_figure=True)
+            with c2:
+                st.pyplot(make_low_freq_figure(df, file_bundles, low_freq_cutoff, plot_options=plot_options), clear_figure=True)
 
     with tab_params:
         selected_weight = st.selectbox("Select weighting", [b.weight for b in file_bundles], key="eis_preview_params_weight")
@@ -2355,23 +2373,17 @@ def collect_legend_label_overrides(prefix: str) -> dict[str, str]:
 
 
 def keep_legend_section_open(prefix: str) -> None:
-    """A layer click should not bounce the style radio away from Legend."""
-    style_section_key = f"{prefix}_style_section"
-    if style_section_key in st.session_state:
-        st.session_state[style_section_key] = "Legend"
+    """Deprecated compatibility hook for older layer callbacks."""
+    return None
 
 
 def keep_legend_visible_for_layer_edit(prefix: str) -> None:
-    """Selecting a legend layer should preserve the current legend visibility."""
-    show_key = f"{prefix}_show_legend"
-    if show_key in st.session_state:
-        st.session_state[show_key] = st.session_state[show_key]
+    """Deprecated compatibility hook for older layer callbacks."""
+    return None
 
 
 def set_highlight_layer(prefix: str, raw_label: object) -> None:
     st.session_state[f"{prefix}_highlight_layer_raw"] = str(raw_label)
-    keep_legend_visible_for_layer_edit(prefix)
-    keep_legend_section_open(prefix)
 
 
 def sync_legend_label_input(prefix: str, raw_label: object, input_key: str) -> None:
@@ -2808,71 +2820,72 @@ def render_legend_layer_editor(
     prefix: str,
     layers: list[dict[str, object]],
 ) -> tuple[dict[str, str], str | None]:
-    """Render an intuitive layer list for custom legend labels and preview highlighting."""
+    """Render an inline legend layer editor with focus-to-highlight behavior."""
     layers = unique_legend_layers(layers)
+    registry_key = f"{prefix}_legend_label_registry"
+    st.session_state[registry_key] = {}
     if not layers:
         return collect_legend_label_overrides(prefix), None
 
     st.markdown("#### Legend layers")
-    st.caption("Click a layer row to highlight it; edit the field to rename it in the legend.")
+    st.caption("Click a layer name field to highlight it; press Enter to apply a legend rename.")
 
-    registry_key = f"{prefix}_legend_label_registry"
     highlight_key = f"{prefix}_highlight_layer_raw"
     existing_overrides = collect_legend_label_overrides(prefix)
-    registry: dict[str, str] = {}
     raw_labels = [str(layer["raw"]) for layer in layers]
     selected = st.session_state.get(highlight_key)
     if selected not in raw_labels:
-        selected = None
+        selected = ""
         st.session_state[highlight_key] = ""
 
-    for layer in layers:
-        raw = str(layer["raw"])
-        input_key = legend_label_state_key(prefix, raw)
-        registry[input_key] = raw
-        if input_key not in st.session_state:
-            st.session_state[input_key] = existing_overrides.get(raw, "")
-    st.session_state[registry_key] = registry
+    component_layers = [
+        {
+            "raw": str(layer.get("raw", "")),
+            "color": str(layer.get("color", "#4E79A7")),
+            "kind": str(layer.get("kind", "marker")),
+        }
+        for layer in layers
+    ]
+    component_height = max(64, 58 * len(component_layers) + 8)
+    initial_component_value = {
+        "selected": str(selected or ""),
+        "labels": existing_overrides,
+        "eventType": "initial",
+        "raw": "",
+        "eventSeq": 0,
+    }
+    component_value = legend_layer_editor_component()(
+        layers=component_layers,
+        selected=str(selected or ""),
+        labels=existing_overrides,
+        height=component_height,
+        key=f"{prefix}_legend_layer_editor",
+        default=initial_component_value,
+    )
 
-    for idx, layer in enumerate(layers, start=1):
-        raw = str(layer["raw"])
-        color = str(layer.get("color", "#4E79A7"))
-        kind = str(layer.get("kind", "marker"))
-        input_key = legend_label_state_key(prefix, raw)
-        try:
-            row_ctx = st.container(border=(raw == selected))
-        except TypeError:
-            row_ctx = st.container()
-        with row_ctx:
-            swatch_html = (
-                f"<span style='display:inline-block;width:34px;height:0;border-top:4px solid {html.escape(color)};vertical-align:middle;'></span>"
-                if kind == "line"
-                else f"<span style='display:inline-block;width:16px;height:16px;border-radius:50%;background:{html.escape(color)};border:2px solid white;box-shadow:0 0 0 1px rgba(0,0,0,.25);vertical-align:middle;'></span>"
-            )
-            current_custom = str(st.session_state.get(input_key, "") or "").strip()
-            layer_icon = "-" if kind == "line" else "o"
-            raw_display = raw if not current_custom else f"{raw} -> {current_custom}"
-            row_label = f"{layer_icon}  {raw_display}"
-            c0, c1, c2 = st.columns([0.10, 1.35, 1.0])
-            with c0:
-                st.markdown(swatch_html, unsafe_allow_html=True)
-            with c1:
-                st.button(
-                    shorten_label(row_label, 64),
-                    key=f"{prefix}_layer_row_{stable_key_part(raw)}",
-                    on_click=set_highlight_layer,
-                    args=(prefix, raw),
-                    use_container_width=True,
-                )
-            with c2:
-                st.text_input(
-                    f"Layer {idx} legend name",
-                    key=input_key,
-                    placeholder=raw,
-                    label_visibility="collapsed",
-                    on_change=sync_legend_label_input,
-                    args=(prefix, raw, input_key),
-                )
+    if component_value is None:
+        highlighted = str(selected) if selected in raw_labels else None
+        return collect_legend_label_overrides(prefix), highlighted
+
+    if isinstance(component_value, dict):
+        next_selected = str(component_value.get("selected", "") or "")
+        event_type = str(component_value.get("eventType", "") or "")
+        next_labels_raw = component_value.get("labels", {})
+        next_labels = {
+            str(raw): str(custom).strip()
+            for raw, custom in next_labels_raw.items()
+            if str(raw) in raw_labels and str(custom).strip()
+        } if isinstance(next_labels_raw, dict) else existing_overrides
+
+        if event_type == "commit" and next_labels != existing_overrides:
+            existing_overrides = persist_legend_label_overrides(prefix, next_labels)
+
+        selection_events = {"input-pointer", "row", "commit"}
+        if next_selected in raw_labels and (next_selected != selected or event_type in selection_events):
+            st.session_state[highlight_key] = next_selected
+            set_highlight_layer(prefix, next_selected)
+            selected = next_selected
+
     highlighted = str(selected) if selected in raw_labels else None
     return collect_legend_label_overrides(prefix), highlighted
 
@@ -4903,6 +4916,8 @@ def render_cycling_analysis_page() -> None:
 
         with style_preview_col:
             st.markdown("### Live style preview")
+            preview_plot_slot = st.container()
+            preview_meta_slot = st.container()
             style = current_style_values()
             sample_colors = current_sample_colors(style)
             selected_preview_paths = selected_paths_for_output(preview_sample)
@@ -4953,19 +4968,22 @@ def render_cycling_analysis_page() -> None:
                         )
 
             if preview_file_count == 0:
-                st.warning("No selected Excel files found for preview.")
+                with preview_plot_slot:
+                    st.warning("No selected Excel files found for preview.")
             elif preview_df is None:
-                st.warning("No valid cycling data found for this preview.")
+                with preview_plot_slot:
+                    st.warning("No valid cycling data found for this preview.")
             else:
+                label_overrides = collect_legend_label_overrides("cycling")
+                layers = []
+                if cycling_style_section == "Legend":
+                    layers = capacity_legend_layers(preview_df, plot_mode, sample_colors, sample_colors.get(preview_sample, "#4E79A7"))
+                    label_overrides, _highlighted_layer = render_legend_layer_editor("cycling", layers)
                 highlighted_layer = (
                     st.session_state.get("cycling_highlight_layer_raw")
                     if cycling_style_section == "Legend"
                     else None
                 )
-                label_overrides = collect_legend_label_overrides("cycling")
-                layers = []
-                if cycling_style_section == "Legend":
-                    layers = capacity_legend_layers(preview_df, plot_mode, sample_colors, sample_colors.get(preview_sample, "#4E79A7"))
                 style["legend_label_overrides"] = label_overrides
                 plot_style = style_with_plot_axis_overrides("cycling", style, cycling_axis_id)
                 if is_cycling_compare_mode(plot_mode):
@@ -5022,15 +5040,15 @@ def render_cycling_analysis_page() -> None:
                         **capacity_custom_figure_options(plot_style),
                         highlight_label_raw=highlighted_layer,
                     )
-                st.pyplot(preview_fig, clear_figure=True)
+                with preview_plot_slot:
+                    st.pyplot(preview_fig, clear_figure=True)
                 plt.close(preview_fig)
 
-                c1, c2, c3 = st.columns(3)
-                c1.metric("Preview files", preview_df["relative_path"].nunique() if "relative_path" in preview_df else preview_df["source_file"].nunique())
-                c2.metric("Preview points", len(preview_df))
-                c3.metric("Max cycle", _fmt_num(preview_df["cycle_index"].max()))
-                if cycling_style_section == "Legend":
-                    label_overrides, _highlighted_layer = render_legend_layer_editor("cycling", layers)
+                with preview_meta_slot:
+                    c1, c2, c3 = st.columns(3)
+                    c1.metric("Preview files", preview_df["relative_path"].nunique() if "relative_path" in preview_df else preview_df["source_file"].nunique())
+                    c2.metric("Preview points", len(preview_df))
+                    c3.metric("Max cycle", _fmt_num(preview_df["cycle_index"].max()))
         return
 
     # Final output step
@@ -6922,6 +6940,8 @@ def render_stripping_analysis_page() -> None:
 
         with style_preview_col:
             st.markdown("### Live style preview")
+            preview_plot_slot = st.container()
+            preview_meta_slot = st.container()
             style = current_stripping_style()
             sample_colors = current_stripping_colors(style)
             if is_stripping_compare_mode(style["plot_mode"]):
@@ -6937,17 +6957,19 @@ def render_stripping_analysis_page() -> None:
                 title_name = preview_sample
             preview_plot_df, preview_summary = load_stripping_records_for_plot(preview_records)
             if preview_plot_df is None:
-                st.warning("No valid stripping data found for this preview.")
+                with preview_plot_slot:
+                    st.warning("No valid stripping data found for this preview.")
             else:
+                label_overrides = collect_legend_label_overrides("stripping")
+                layers = []
+                if stripping_style_section == "Legend":
+                    layers = stripping_legend_layers(preview_plot_df, str(style["plot_mode"]), sample_colors)
+                    label_overrides, _highlighted_layer = render_legend_layer_editor("stripping", layers)
                 highlighted_layer = (
                     st.session_state.get("stripping_highlight_layer_raw")
                     if stripping_style_section == "Legend"
                     else None
                 )
-                label_overrides = collect_legend_label_overrides("stripping")
-                layers = []
-                if stripping_style_section == "Legend":
-                    layers = stripping_legend_layers(preview_plot_df, str(style["plot_mode"]), sample_colors)
                 style["legend_label_overrides"] = label_overrides
                 plot_style = style_with_plot_axis_overrides("stripping", style, stripping_axis_id)
                 effective_limits, _numeric_df, adjusted = stripping_figure_limits(preview_plot_df, plot_style)
@@ -6974,13 +6996,13 @@ def render_stripping_analysis_page() -> None:
                     **xy_custom_figure_options(plot_style),
                     highlight_label_raw=highlighted_layer,
                 )
-                st.pyplot(fig, clear_figure=True)
+                with preview_plot_slot:
+                    st.pyplot(fig, clear_figure=True)
                 plt.close(fig)
-                if adjusted:
-                    st.caption("Axis range was expanded to keep data visible.")
-                st.dataframe(preview_summary, use_container_width=True, hide_index=True)
-                if stripping_style_section == "Legend":
-                    label_overrides, _highlighted_layer = render_legend_layer_editor("stripping", layers)
+                with preview_meta_slot:
+                    if adjusted:
+                        st.caption("Axis range was expanded to keep data visible.")
+                    st.dataframe(preview_summary, use_container_width=True, hide_index=True)
         return
 
     st.markdown("### Final output")
@@ -8358,27 +8380,33 @@ def render_dqdv_analysis_page() -> None:
 
         with style_preview_col:
             st.markdown("### Live style preview")
+            preview_plot_slot = st.container()
+            preview_meta_slot = st.container()
             style = current_dqdv_style()
             sample_colors = current_dqdv_colors(style)
             preview_record = next((record for record in preview_records_for_sample if str(record["relative_path"]) == str(preview_rel)), None)
             if preview_record is None:
-                st.warning("No selected dQ/dV file found for this preview.")
+                with preview_plot_slot:
+                    st.warning("No selected dQ/dV file found for this preview.")
             else:
                 preview_plot_df, preview_summary, preview_cycles = load_dqdv_records_for_plot([preview_record])
                 if preview_plot_df is None:
-                    st.warning("No valid dQ/dV data found for this preview.")
-                    st.dataframe(preview_summary, use_container_width=True, hide_index=True)
+                    with preview_plot_slot:
+                        st.warning("No valid dQ/dV data found for this preview.")
+                    with preview_meta_slot:
+                        st.dataframe(preview_summary, use_container_width=True, hide_index=True)
                 else:
                     preview_color = sample_colors.get(str(preview_record["sample"]), "#4E79A7")
+                    label_overrides = collect_legend_label_overrides("dqdv")
+                    layers = []
+                    if dqdv_style_section == "Legend":
+                        layers = dqdv_legend_layers(preview_plot_df, preview_color)
+                        label_overrides, _highlighted_layer = render_legend_layer_editor("dqdv", layers)
                     highlighted_layer = (
                         st.session_state.get("dqdv_highlight_layer_raw")
                         if dqdv_style_section == "Legend"
                         else None
                     )
-                    label_overrides = collect_legend_label_overrides("dqdv")
-                    layers = []
-                    if dqdv_style_section == "Legend":
-                        layers = dqdv_legend_layers(preview_plot_df, preview_color)
                     style["legend_label_overrides"] = label_overrides
                     plot_style = style_with_plot_axis_overrides("dqdv", style, dqdv_axis_id)
                     effective_limits, _numeric_df, adjusted = dqdv_figure_limits(preview_plot_df, plot_style)
@@ -8406,16 +8434,16 @@ def render_dqdv_analysis_page() -> None:
                         **xy_custom_figure_options(plot_style),
                         highlight_label_raw=highlighted_layer,
                     )
-                    st.pyplot(fig, clear_figure=True)
+                    with preview_plot_slot:
+                        st.pyplot(fig, clear_figure=True)
                     plt.close(fig)
-                    if adjusted:
-                        st.caption("Axis range was expanded to keep data visible.")
-                    st.dataframe(preview_summary, use_container_width=True, hide_index=True)
-                    if not preview_cycles.empty:
-                        with st.expander("Cycle summary", expanded=False):
-                            st.dataframe(preview_cycles, use_container_width=True, hide_index=True)
-                    if dqdv_style_section == "Legend":
-                        label_overrides, _highlighted_layer = render_legend_layer_editor("dqdv", layers)
+                    with preview_meta_slot:
+                        if adjusted:
+                            st.caption("Axis range was expanded to keep data visible.")
+                        st.dataframe(preview_summary, use_container_width=True, hide_index=True)
+                        if not preview_cycles.empty:
+                            with st.expander("Cycle summary", expanded=False):
+                                st.dataframe(preview_cycles, use_container_width=True, hide_index=True)
         return
 
     st.markdown("### Final output")
