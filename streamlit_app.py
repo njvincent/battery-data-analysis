@@ -2849,20 +2849,20 @@ def render_legend_layer_editor(
                 if kind == "line"
                 else f"<span style='display:inline-block;width:16px;height:16px;border-radius:50%;background:{html.escape(color)};border:2px solid white;box-shadow:0 0 0 1px rgba(0,0,0,.25);vertical-align:middle;'></span>"
             )
-            c0, c1, c2, c3 = st.columns([0.10, 1.15, 1.0, 0.32])
+            current_custom = str(st.session_state.get(input_key, "") or "").strip()
+            layer_icon = "-" if kind == "line" else "o"
+            raw_display = raw if not current_custom else f"{raw} -> {current_custom}"
+            row_label = f"{layer_icon}  {raw_display}"
+            c0, c1, c2 = st.columns([0.10, 1.35, 1.0])
             with c0:
                 st.markdown(swatch_html, unsafe_allow_html=True)
             with c1:
-                st.markdown(
-                    (
-                        "<div title='{title}' style='white-space:nowrap;overflow:hidden;"
-                        "text-overflow:ellipsis;font-size:0.92rem;line-height:2.35rem;'>"
-                        "{label}</div>"
-                    ).format(
-                        title=html.escape(raw, quote=True),
-                        label=html.escape(raw),
-                    ),
-                    unsafe_allow_html=True,
+                st.button(
+                    shorten_label(row_label, 64),
+                    key=f"{prefix}_layer_row_{stable_key_part(raw)}",
+                    on_click=set_highlight_layer,
+                    args=(prefix, raw),
+                    use_container_width=True,
                 )
             with c2:
                 st.text_input(
@@ -2872,14 +2872,6 @@ def render_legend_layer_editor(
                     label_visibility="collapsed",
                     on_change=sync_legend_label_input,
                     args=(prefix, raw, input_key),
-                )
-            with c3:
-                st.button(
-                    "Select",
-                    key=f"{prefix}_layer_row_{stable_key_part(raw)}",
-                    on_click=set_highlight_layer,
-                    args=(prefix, raw),
-                    use_container_width=True,
                 )
     highlighted = str(selected) if selected in raw_labels else None
     return collect_legend_label_overrides(prefix), highlighted
