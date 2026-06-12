@@ -1620,6 +1620,7 @@ def cycling_style_defaults_signature(selected_samples: list[str]) -> str:
 
 def apply_cycling_style_defaults_for_preview(selected_samples: list[str]) -> None:
     reset_cycling_visual_style_defaults()
+    st.session_state["cycling_compare_samples"] = list(selected_samples)
     st.session_state["cycling_style_defaults_signature"] = cycling_style_defaults_signature(selected_samples)
 
 
@@ -4793,6 +4794,11 @@ def render_cycling_analysis_page() -> None:
         style_controls_col, style_preview_col = st.columns([0.9, 1.55], gap="large")
 
         with style_controls_col:
+            def reset_cycling_style_for_plot_mode_change() -> None:
+                reset_cycling_visual_style_defaults()
+                if is_cycling_compare_mode(st.session_state.get("cycling_plot_mode")):
+                    st.session_state["cycling_compare_samples"] = list(selected_samples)
+
             compare_mode_enabled = is_cycling_compare_mode(st.session_state.get("cycling_plot_mode"))
             preview_sample = st.selectbox(
                 "Preview sample",
@@ -4808,7 +4814,7 @@ def render_cycling_analysis_page() -> None:
                 "Plot mode",
                 [CYCLING_PLOT_MODE_SINGLE, CYCLING_PLOT_MODE_COMPARE],
                 key="cycling_plot_mode",
-                on_change=reset_cycling_visual_style_defaults,
+                on_change=reset_cycling_style_for_plot_mode_change,
                 help="Changing mode resets visual style to the same default so only the plotted data grouping changes.",
             )
             compare_mode_enabled = is_cycling_compare_mode(st.session_state.get("cycling_plot_mode"))
@@ -5616,6 +5622,7 @@ def stripping_style_defaults_signature(selected_samples: list[str]) -> str:
 
 def apply_stripping_style_defaults_for_preview(selected_samples: list[str]) -> None:
     reset_stripping_visual_style_defaults()
+    st.session_state["stripping_compare_samples"] = list(selected_samples)
     st.session_state["stripping_style_defaults_signature"] = stripping_style_defaults_signature(selected_samples)
 
 
@@ -6850,6 +6857,11 @@ def render_stripping_analysis_page() -> None:
             apply_stripping_style_defaults_for_preview(selected_samples)
         style_controls_col, style_preview_col = st.columns([0.9, 1.55], gap="large")
         with style_controls_col:
+            def reset_stripping_style_for_plot_mode_change() -> None:
+                reset_stripping_visual_style_defaults()
+                if is_stripping_compare_mode(st.session_state.get("stripping_plot_mode")):
+                    st.session_state["stripping_compare_samples"] = list(selected_samples)
+
             compare_mode_enabled = is_stripping_compare_mode(st.session_state.get("stripping_plot_mode"))
             preview_sample = st.selectbox(
                 "Preview sample",
@@ -6865,7 +6877,7 @@ def render_stripping_analysis_page() -> None:
                 "Plot mode",
                 [STRIPPING_PLOT_MODE_SINGLE, STRIPPING_PLOT_MODE_COMPARE],
                 key="stripping_plot_mode",
-                on_change=reset_stripping_visual_style_defaults,
+                on_change=reset_stripping_style_for_plot_mode_change,
                 help="Changing mode resets visual style to the same default so only the plotted data grouping changes.",
             )
             compare_mode_enabled = is_stripping_compare_mode(st.session_state.get("stripping_plot_mode"))
