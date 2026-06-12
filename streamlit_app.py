@@ -2974,6 +2974,15 @@ def apply_common_plot_style() -> None:
     plt.rcParams.update(COMMON_PLOT_RCPARAMS)
 
 
+def top_legend_axes_top(fig_height: float, has_title: bool) -> float:
+    """Reserve a consistent physical top band for figure-level legends."""
+    reference_height = 4.6
+    reference_top = 0.74 if has_title else 0.80
+    reserved_inches = reference_height * (1.0 - reference_top)
+    height = max(float(fig_height), 1.0)
+    return max(0.58, min(0.86, 1.0 - reserved_inches / height))
+
+
 def keep_twin_axes_points_visible(ax1, ax2) -> None:
     """Keep twin-axis backgrounds from covering scatter points."""
     ax1.set_zorder(2)
@@ -3284,7 +3293,7 @@ def make_capacity_figure(
     # Avoid tight_layout here. It often cannot correctly reserve space for a
     # figure-level legend together with a twinx right y-axis.
     if legend_position == "Top":
-        top = 0.74 if title.strip() else 0.80
+        top = top_legend_axes_top(fig_height, bool(title.strip()))
         fig.subplots_adjust(left=0.11, right=0.88, bottom=0.14, top=top)
 
         # Put title inside the axes area and legend above it. This creates a
@@ -3492,7 +3501,7 @@ def make_capacity_sample_comparison_figure(
     ncol = max(1, min(int(legend_columns), n_labels))
 
     if legend_position == "Top":
-        top = 0.74 if title.strip() else 0.80
+        top = top_legend_axes_top(fig_height, bool(title.strip()))
         fig.subplots_adjust(left=0.11, right=0.88, bottom=0.14, top=top)
         fig.legend(
             handles,
@@ -6092,7 +6101,7 @@ def make_stripping_figure(
         n_labels = max(1, len(labels))
         ncol = max(1, min(int(legend_columns), n_labels))
         if legend_position == "Top":
-            top = 0.74 if title.strip() else 0.80
+            top = top_legend_axes_top(fig_height, bool(title.strip()))
             fig.subplots_adjust(left=0.12, right=0.96, bottom=0.15, top=top)
             fig.legend(handles, labels, loc="upper center", bbox_to_anchor=(0.5, 0.985), ncol=ncol, title=legend_title, fontsize=10, title_fontsize=12, frameon=False)
         elif legend_position == "Right":
@@ -7717,7 +7726,7 @@ def make_dqdv_figure(
     ncol = max(1, min(int(legend_columns), n_labels))
 
     if legend_position == "Top" and labels:
-        top = 0.74 if title.strip() else 0.80
+        top = top_legend_axes_top(fig_height, bool(title.strip()))
         fig.subplots_adjust(left=0.13, right=0.96, bottom=0.13, top=top)
         fig.legend(
             handles,
