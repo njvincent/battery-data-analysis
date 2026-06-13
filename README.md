@@ -9,6 +9,8 @@ Python tools for battery electrochemistry data analysis. The repository includes
 - Analyze cycling capacity retention and coulombic efficiency from Excel cycling data.
 - Analyze stripping-cell overpotential and capacity-normalized voltage profiles.
 - Generate V-Q / dQ/dV style voltage-capacity profiles from cycling Excel files.
+- Use local/server folder paths or small demo ZIP uploads from the Streamlit dashboard.
+- Preview loaded samples, customize plot style, and export batch outputs from the dashboard.
 - Export publication-ready figures and CSV summaries for downstream plotting or reporting.
 
 ## Repository Structure
@@ -22,6 +24,7 @@ Python tools for battery electrochemistry data analysis. The repository includes
 ├── stripping_batch.py     # Batch stripping-cell analysis
 ├── dqdv_batch.py          # Batch V-Q / dQ/dV profile analysis
 ├── requirements.txt       # Python dependencies
+├── assets/                # README demo GIFs
 └── eis_fit_results/       # Example or generated EIS output files
 ```
 
@@ -75,6 +78,16 @@ The dashboard contains four main analysis pages:
 
 For large datasets, use the local/server folder path mode. Browser upload is best for small demo files only.
 
+### Short Demos
+
+Cycling Analysis:
+
+![Cycling Analysis demo](assets/demo_cycling_analysis.gif)
+
+dQ/dV Analysis:
+
+![dQ/dV Analysis demo](assets/demo_dqdv_analysis.gif)
+
 ## Expected Data Layout
 
 Most batch tools expect one first-level folder per sample:
@@ -92,6 +105,8 @@ root_directory/
 ```
 
 Files directly under a sample folder are treated as individual repeats or file-level records. Files inside repeat folders inherit the repeat name from the folder.
+
+In the dashboard, choose **Local/server folder path** for real datasets and enter this root directory. For dQ/dV Analysis, leave **Output directory** blank to save results to `<root_directory>/dqdv_analysis_outputs`. Use **Demo ZIP upload** only for small zipped folders with the same structure.
 
 ## Command-Line Usage
 
@@ -222,7 +237,7 @@ Common generated folders include:
 - `eis_fit_results/`
 - `capacity_batch_results/`
 - `stripping_outputs/`
-- `VQ_analysis_outputs/`
+- `dqdv_analysis_outputs/`
 
 ## Troubleshooting
 
