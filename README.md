@@ -2,7 +2,9 @@
 
 Python tools for battery electrochemistry data analysis. The repository includes a Streamlit dashboard for interactive workflows and standalone command-line scripts for batch processing.
 
-![Battery Data Analysis demo](assets/demo_battery_analysis.gif)
+<video src="assets/demo_battery_analysis.mp4" controls muted playsinline width="100%" aria-label="Battery Data Analysis demo"></video>
+
+[Watch the Battery Data Analysis demo](assets/demo_battery_analysis.mp4)
 
 ## Features
 
@@ -26,7 +28,7 @@ Python tools for battery electrochemistry data analysis. The repository includes
 ├── stripping_batch.py     # Batch stripping-cell analysis
 ├── dqdv_batch.py          # Batch V-Q / dQ/dV profile analysis
 ├── requirements.txt       # Python dependencies
-├── assets/                # README demo GIFs
+├── assets/                # README demo media
 └── eis_fit_results/       # Example or generated EIS output files
 ```
 
