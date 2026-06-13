@@ -2,6 +2,8 @@
 
 Python tools for battery electrochemistry data analysis. The repository includes a Streamlit dashboard for interactive workflows and standalone command-line scripts for batch processing.
 
+![Battery Data Analysis demo](assets/demo_battery_analysis.gif)
+
 ## Features
 
 - Fit EIS data from BioLogic/EC-Lab `.mpr` files or exported `.csv`/`.txt` files.
@@ -77,16 +79,6 @@ The dashboard contains four main analysis pages:
 - `dQ/dV Analysis`
 
 For large datasets, use the local/server folder path mode. Browser upload is best for small demo files only.
-
-### Short Demos
-
-Cycling Analysis:
-
-![Cycling Analysis demo](assets/demo_cycling_analysis.gif)
-
-dQ/dV Analysis:
-
-![dQ/dV Analysis demo](assets/demo_dqdv_analysis.gif)
 
 ## Expected Data Layout
 
