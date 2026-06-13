@@ -2,9 +2,7 @@
 
 Python tools for battery electrochemistry data analysis. The repository includes a Streamlit dashboard for interactive workflows and standalone command-line scripts for batch processing.
 
-<video src="assets/demo_battery_analysis.mp4" controls width="800"></video>
-
-[Watch the Battery Data Analysis demo](assets/demo_battery_analysis.mp4)
+![Battery Data Analysis demo](assets/demo_battery_analysis.gif)
 
 ## Features
 
